@@ -183,6 +183,10 @@ void install_switch2_hle() {
         hle_register(it.name, it.fn);
         module_override_symbol(it.name);
     }
+    // SDK 22 links its own nvnBootstrapLoader (the console driver shim: it loads the driver's proc table and jumps to entry 0, null
+    // here). Fortune's Weave imports it from sdk, so without the override the import binds to the guest copy and the game calls 0x0.
+    // Games whose sdk does not define it already reach the host loader; the override changes nothing for them.
+    module_override_symbol("nvnBootstrapLoader");
     if (!media::video_codec_enabled()) {
         hle_register("_ZN2nn5movie10InitializeEv", movie_initialize_unavailable);
         module_override_symbol("_ZN2nn5movie10InitializeEv");
