@@ -120,6 +120,11 @@ uint32_t thread_create(const ThreadParams& p) {
         NXLOG_E("thread", "handle table full");
         return 0;
     }
+    // ThreadLocalRegion +0x110 (in the kernel-owned 0x104..0x180 range): the thread's own handle. SDK 22's
+    // nn::os::detail::InternalCriticalSection takes the owner from here (Enter: casa 0 -> [tpidrro+0x110]; IsLockedByCurrentThread:
+    // [tpidrro+0x110] == owner & ~0x40000000), so with 0 there an unlocked critical section reads as held by the caller and the first
+    // pthread_mutex_lock aborts (Fortune's Weave, SDK 22.2). Older SDKs do not read this word.
+    *reinterpret_cast<uint32_t*>(t->tls + 0x110) = t->handle;
     AcquireSRWLockExclusive(&g_list_lock);
     // Thread objects of threads that have exited and that nothing else refers to (the game closed the handle, the host thread dropped its
     // own reference) leave the list. Without this the list grew by every thread the game ever made (S34 soak: 60 an hour).
