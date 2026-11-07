@@ -27,3 +27,4 @@ obj/
 .vs/
 .venv/
 __pycache__/
+/refs/
