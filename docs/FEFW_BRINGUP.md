@@ -23,8 +23,9 @@ this repository; you need your own dump of the game (update v131072, main build 
    `tools\zbic_plain\build\zbic_plain.exe game\dump\exefs\main game\dump\main.plain` and copy `main.plain` over `game\dump\exefs\main`.
    It checks the decoded segments against the SHA-256 hashes in the NSO header.
 3. `recomp\scripts\build_game.cmd fefw` — lifts and compiles into `work\lift`, `work\build\fefw`.
-4. `powershell -File game-build\scripts\build.ps1 -Manifest recomp\games\fefw\game.toml`
-5. Run `fefw.exe`; send `fefw.log` back for stage 2/3.
+4. Once: `pwsh -File tools\textures\scripts\fetch_third_party.ps1` then `pwsh -File tools\textures\scripts\build.ps1` (ASTC->BC7 transcoder the runtime links).
+5. `pwsh -File game-build\scripts\build.ps1 -Manifest recomp\games\fefw\game.toml`
+6. Run `fefw.exe`; send `fefw.log` back for stage 2/3.
 
 Module bases: main 0x7100000000, sdk 0x7500000000, subsdk0 0x7600000000, subsdk1 0x7610000000,
 subsdk2 0x7620000000, rtld 0x7700000000 (entry). Unit counts in game.toml are first guesses; raise them if a unit is too big to compile.

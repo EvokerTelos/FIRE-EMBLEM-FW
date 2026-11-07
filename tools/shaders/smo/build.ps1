@@ -6,7 +6,11 @@ $here  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $out   = Join-Path $here '..\build\smo' | ForEach-Object { [System.IO.Path]::GetFullPath($_) }
 $obj   = Join-Path $out 'obj'
 $clang = 'C:\Program Files\LLVM\bin\clang-cl.exe'
-$vcvars = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$vsdir = if (Test-Path $vswhere) { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath }
+if (-not $vsdir) { $vsdir = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools' }
+$vcvars = Join-Path $vsdir 'VC\Auxiliary\Build\vcvars64.bat'
+$env:PATH = $env:PATH -replace '"', ''   # a stray quote in PATH breaks vcvars64.bat
 
 if (-not (Test-Path $clang))   { throw "clang-cl not found at $clang" }
 if (-not (Test-Path $vcvars))  { throw "vcvars64.bat not found at $vcvars" }
