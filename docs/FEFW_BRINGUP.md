@@ -9,9 +9,9 @@ this repository; you need your own dump of the game (update v131072, main build 
 |---|---|---|
 | 0 | Toolchain installed (VS Build Tools 17/18, LLVM clang-cl, CMake, Ninja, Python 3.13 + uv) | user side |
 | 1 | Module skeleton, manifest, hashes | done |
-| 2 | Lift all 6 modules, link, boot to the first log lines | next |
-| 3 | Missing services / NVN2 procs (73 unregistered, 10 new vs Pokopia: Cooperative Vector, WriteDescriptorTableData, Window AcquireTimeout, BootstrapLoader) | |
-| 4 | Graphics: shaders, DLSS path (TaskDLSS / nvnDlss*) → FSR or native | |
+| 2 | Lift all 6 modules, link, boot | done 2026-11-07: 6.7M instructions of main, 0 untranslated; boots into the main loop at 60 fps with audio (XAudio2), input, RomFS (29 GB) |
+| 3 | Missing services / NVN2 procs (fixed so far: TLS +0x110 thread handle, nvnBootstrapLoader override, vi HDR/display queries, IAudioDevice 15-20) (73 unregistered, 10 new vs Pokopia: Cooperative Vector, WriteDescriptorTableData, Window AcquireTimeout, BootstrapLoader) | |
+| 4 | **next**: shader translation (639 blocks missing: on-demand `spirv_harness`, needs Ryubing sources, .NET 10, Vulkan SDK), then DLSS path (TaskDLSS / nvnDlss*) → FSR or native | |
 | 5 | 60 fps: target at `[main+0x21E60D8]+0x1DC`, logic steps by 60/target | |
 
 ## Dev flow (Windows, from the repo root)
@@ -29,3 +29,8 @@ this repository; you need your own dump of the game (update v131072, main build 
 
 Module bases: main 0x7100000000, sdk 0x7500000000, subsdk0 0x7600000000, subsdk1 0x7610000000,
 subsdk2 0x7620000000, rtld 0x7700000000 (entry). Unit counts in game.toml are first guesses; raise them if a unit is too big to compile.
+
+## Quick loop
+
+`powershell -ExecutionPolicy Bypass -File fefw_test.ps1` (pull, rebuild the exe, run 40 s; `-Lift` after lifter changes).
+The RomFS is read in place from the extracted dump (`NXRT_FS_ROMFS`, default in the script).
