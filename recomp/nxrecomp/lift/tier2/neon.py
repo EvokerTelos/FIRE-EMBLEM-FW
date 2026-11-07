@@ -70,6 +70,18 @@ class NeonOps:
         kind = "f" if fp or fp_from_int else ("s" if signed else "u")
         skind = fp_from_int or kind
         d, m = self.regop(i, ops[0]), self.regop(i, ops[1])
+        if kind == "f" and skind == "f" and bits == 16:
+            # half-precision lanes (V128 has no f16 view): FNEG / FABS are sign-bit operations, exact for NaNs as on hardware;
+            # anything else is computed in float and rounded back to half
+            idx = "k" if ops[1].vector_index == -1 else str(ops[1].vector_index)
+            if expr == "-a":
+                e = f"uint16_t(S.u16[{idx}] ^ 0x8000u)"
+            elif expr == "std::fabs(a)":
+                e = f"uint16_t(S.u16[{idx}] & 0x7fffu)"
+            else:
+                e = f"nx::f32_to_f16(float({subst(expr, a=f'nx::f16_to_f32(S.u16[{idx}])')}))"
+            return (f"{{ V128 S = c->v[{m.n}]; V128 r = nx::vzero(); for (int k = 0; k < {n}; k++) "
+                    f"r.u16[k] = {e}; c->v[{d.n}] = r; }}")
         ty = {("f", 32): "float", ("f", 64): "double"}.get((kind, bits), f"{'int' if kind == 's' else 'uint'}{bits}_t")
         src = f"S.{skind}{bits}[k]" if ops[1].vector_index == -1 else f"S.{skind}{bits}[{ops[1].vector_index}]"
         e = subst(expr, a=src)
