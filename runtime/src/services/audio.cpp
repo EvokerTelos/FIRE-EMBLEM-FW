@@ -4,7 +4,7 @@
 //   IAudioRendererManager (audren:u)  0 OpenAudioRenderer, 1 GetWorkBufferSize, 2 GetAudioDeviceService, 3 OpenAudioRendererForManualExecution,
 //                                     4 GetAudioDeviceServiceWithRevisionInfo
 //   IAudioRenderer                    0 GetSampleRate .. 13 GetVoiceDropParameter (RequestUpdate / RequestUpdateAuto run the update protocol)
-//   IAudioDevice                      0 ListAudioDeviceName .. 17 AcquireAudioInputDeviceNotification (virtual output devices)
+//   IAudioDevice                      0 ListAudioDeviceName .. 17 AcquireAudioInputDeviceNotification (virtual output devices), 19/20 volume auto tune
 // Adapted from Ryujinx src/Ryujinx.Horizon/Sdk/Audio/Detail/{AudioRendererManager,AudioRenderer,AudioDevice}.cs (MIT).
 // The renderer DSP runs on its own thread paced by the host clock (5 ms frames) and writes PCM to nxrt::audio::sink().
 #include <array>
@@ -70,6 +70,7 @@ struct AudrenState {
     std::shared_ptr<audren::AudioRendererManager> manager;
     std::array<std::shared_ptr<ServiceEvent>, 3> device_events;   // QueryAudioDeviceSystemEvent / Input / Output (never fire)
     float device_volume[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    bool volume_auto_tune = false;                       // IAudioDevice 19/20 (Switch 2)
 
     std::shared_ptr<audren::AudioRendererManager> get_manager() {
         if (!manager) {
@@ -284,6 +285,19 @@ std::shared_ptr<Service> make_audio_device(uint32_t revision) {
         s.add_cmd(15, "AcquireAudioOutputDeviceNotification", not_implemented);
         s.add_cmd(16, "ReleaseAudioOutputDeviceNotification", not_implemented);
         s.add_cmd(17, "AcquireAudioInputDeviceNotification", not_implemented);
+        // Switch 2 (SDK 22): nn::audio::SetDeviceOutputVolumeAutoTuneModeEnabled(bool) sends 19 (bool, padded, plus the applet resource
+        // user id: 12 bytes) and aborts on an error result (Fortune's Weave at boot). The console's automatic output volume tuning has no
+        // host counterpart: the flag is kept and read back by 20.
+        s.add_cmd(19, "SetDeviceOutputVolumeAutoTuneModeEnabled", [](Request& req, Response&) -> uint32_t {
+            std::lock_guard<std::mutex> lk(st().mu);
+            st().volume_auto_tune = req.arg<uint8_t>(0) != 0;
+            return 0;
+        });
+        s.add_cmd(20, "IsDeviceOutputVolumeAutoTuneModeEnabled", [](Request&, Response& rsp) -> uint32_t {
+            std::lock_guard<std::mutex> lk(st().mu);
+            rsp.push<uint8_t>(st().volume_auto_tune ? 1 : 0);
+            return 0;
+        });
         (void)revision;
     });
 }
