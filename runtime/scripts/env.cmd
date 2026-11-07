@@ -1,5 +1,7 @@
 @echo off
 rem Sets up the MSVC + LLVM + CMake + Ninja environment for the runtime build (call it, then run cmake/ninja).
+rem a stray quote in PATH (e.g. C:\Program Files\dotnet") breaks every later line that expands it: drop all quotes first
+set "PATH=%PATH:"=%"
 set "_VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "_VSDIR="
 if exist "%_VSWHERE%" for /f "usebackq delims=" %%i in (`"%_VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "_VSDIR=%%i"
