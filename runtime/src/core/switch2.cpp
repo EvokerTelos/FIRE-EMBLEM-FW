@@ -146,6 +146,24 @@ void vi_get_display_vsync_event(::Ctx* c) {
     c->x[0] = 0;
 }
 
+// Display queries of SDK 22 (Fortune's Weave): the guest versions compare the Display* with the SDK's own display object and return
+// vi OperationFailed for the host one, so they answer here. BufferMaxResolution is read as {u32 width, u32 height}: the PC output
+// allows 4K. HDR is reported off (SDR swapchain); paper white 203 nits (ITU-R BT.2408). nn::Result 0.
+void vi_query_buffer_max_resolution(::Ctx* c) {
+    if (c->x[0]) { auto* r = reinterpret_cast<uint32_t*>(c->x[0]); r[0] = 3840; r[1] = 2160; }
+    c->x[0] = 0;
+}
+void vi_query_hdr_status(::Ctx* c) {
+    if (c->x[0]) *reinterpret_cast<uint8_t*>(c->x[0]) = 0;
+    if (c->x[1]) *reinterpret_cast<uint32_t*>(c->x[1]) = 0;
+    if (c->x[2]) *reinterpret_cast<uint16_t*>(c->x[2]) = 0;
+    c->x[0] = 0;
+}
+void vi_query_hdr_paper_white(::Ctx* c) {
+    if (c->x[0]) *reinterpret_cast<uint16_t*>(c->x[0]) = 203;
+    c->x[0] = 0;
+}
+
 void streamplay_native_window(::Ctx* c) { c->x[0] = reinterpret_cast<uint64_t>(g_native_window); }
 
 }  // namespace
@@ -178,6 +196,10 @@ void install_switch2_hle() {
         {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", vi_get_display_vsync_event},
         {"_ZN2nn2vi52SetLayerNextHdrExtendedContentLuminanceRangeMetadataEPNS0_5LayerEtt", vi_layer_extended_luminance},
         {"_ZN2nn2vi52SetLayerNextHdrStandardContentLuminanceRangeMetadataEPNS0_5LayerEtt", vi_layer_standard_luminance},
+        {"_ZN2nn2vi35SetLayerNextHdrContentGamutMetadataEPNS0_5LayerENS0_15HdrContentGamutE", vi_ok},
+        {"_ZN2nn2vi31QueryDisplayBufferMaxResolutionEPNS0_19BufferMaxResolutionEPKNS0_7DisplayE", vi_query_buffer_max_resolution},
+        {"_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE", vi_query_hdr_status},
+        {"_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", vi_query_hdr_paper_white},
     };
     for (const auto& it : items) {
         hle_register(it.name, it.fn);
