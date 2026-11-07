@@ -17,8 +17,11 @@ this repository; you need your own dump of the game (update v131072, main build 
 ## Dev flow (Windows, from the repo root)
 
 1. Put the exefs files (`main`, `sdk`, `subsdk0..2`, `rtld`, `main.npdm`) in `game\dump\exefs\`.
-2. `main` is ZBIC-compressed (NSO flags 0xbf) and the lifter refuses it. Build `tools\extract` and run
-   `nx_extract --plain-nso game\dump\exefs game\dump\plain` (the launcher's setup does the same).
+2. `main` is ZBIC-compressed (NSO flags 0xbf) and the lifter refuses it. `tools\extract` cannot be built from this repository
+   (its readers in `tools/setup` were never published), so use `tools\zbic_plain`:
+   `pwsh -File tools\zbic_plain\build.ps1`, then
+   `tools\zbic_plain\build\zbic_plain.exe game\dump\exefs\main game\dump\main.plain` and copy `main.plain` over `game\dump\exefs\main`.
+   It checks the decoded segments against the SHA-256 hashes in the NSO header.
 3. `recomp\scripts\build_game.cmd fefw` — lifts and compiles into `work\lift`, `work\build\fefw`.
 4. `powershell -File game-build\scripts\build.ps1 -Manifest recomp\games\fefw\game.toml`
 5. Run `fefw.exe`; send `fefw.log` back for stage 2/3.
