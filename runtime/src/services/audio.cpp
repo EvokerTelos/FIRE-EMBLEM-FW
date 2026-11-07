@@ -281,10 +281,14 @@ std::shared_ptr<Service> make_audio_device(uint32_t revision) {
         s.add_cmd(12, "QueryAudioDeviceOutputEvent", event_cmd(2));
         s.add_cmd(13, "GetActiveAudioOutputDeviceName", active_name);
         s.add_cmd(14, "ListAudioOutputDeviceName", list_names);
-        auto not_implemented = [](Request&, Response&) -> uint32_t { return kResultNotImplemented; };
-        s.add_cmd(15, "AcquireAudioOutputDeviceNotification", not_implemented);
-        s.add_cmd(16, "ReleaseAudioOutputDeviceNotification", not_implemented);
-        s.add_cmd(17, "AcquireAudioInputDeviceNotification", not_implemented);
+        // Device change notifications: an event (copy handle) that the SDK attaches to the caller's SystemEvent. Fortune's Weave ignores
+        // an error result here and later TryWaitSystemEvent()s the never-initialised event, which aborts; so they answer with the same
+        // never-signalled output / input events as 12 / 11 (the host output device does not change under the game).
+        auto ok = [](Request&, Response&) -> uint32_t { return 0; };
+        s.add_cmd(15, "AcquireAudioOutputDeviceNotification", event_cmd(2));
+        s.add_cmd(16, "ReleaseAudioOutputDeviceNotification", ok);
+        s.add_cmd(17, "AcquireAudioInputDeviceNotification", event_cmd(1));
+        s.add_cmd(18, "ReleaseAudioInputDeviceNotification", ok);
         // Switch 2 (SDK 22): nn::audio::SetDeviceOutputVolumeAutoTuneModeEnabled(bool) sends 19 (bool, padded, plus the applet resource
         // user id: 12 bytes) and aborts on an error result (Fortune's Weave at boot). The console's automatic output volume tuning has no
         // host counterpart: the flag is kept and read back by 20.
