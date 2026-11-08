@@ -90,6 +90,10 @@ void set_guard_handler(GuardHandler fn);
 // Owner: guards pages [first, first + count). False when a page is not armed (written since, never armed, banned) or a file read is
 // in progress there: nothing is guarded then. Pages already guarded stay so.
 bool guard(Region* r, uint64_t first, uint64_t count);
+
+// Crash reports: every region holding addr and that page's bits (prot guard valid ban written), plus the releasing count. Lock-free reads,
+// so it can run from an exception handler. Writes at most n bytes into out (NUL-terminated); returns the number of regions found.
+int describe(uint64_t addr, char* out, size_t n);
 // Any thread: the guarded pages among [first, first + count) become read-only (armed) again.
 void unguard(Region* r, uint64_t first, uint64_t count);
 // Owner: true when every page of the run is still armed (read-only or guarded: the CPU did not write it since it was armed).

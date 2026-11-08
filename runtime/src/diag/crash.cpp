@@ -20,6 +20,7 @@
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
 #include "nxrt/symbols.h"
+#include "nxrt/write_watch.h"
 #include "stackwalk.h"
 
 namespace nxrt {
@@ -159,6 +160,15 @@ std::string build_report(const EXCEPTION_RECORD* rec, const CONTEXT* cx, DWORD t
         const ULONG_PTR kind = rec->ExceptionInformation[0];
         const char* what = kind == 0 ? "reading" : kind == 1 ? "writing" : kind == 8 ? "executing" : "accessing";
         appendf(out, "  %s address 0x%llx\n", what, static_cast<unsigned long long>(rec->ExceptionInformation[1]));
+        // the page as the OS sees it now: tells a missing page from a protection (write tracking, a guard) that nobody handled
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(rec->ExceptionInformation[1]), &mbi, sizeof mbi) == sizeof mbi)
+            appendf(out, "  page: state 0x%lx protect 0x%lx type 0x%lx, region %p + 0x%llx\n", static_cast<unsigned long>(mbi.State),
+                    static_cast<unsigned long>(mbi.Protect), static_cast<unsigned long>(mbi.Type), mbi.BaseAddress,
+                    static_cast<unsigned long long>(mbi.RegionSize));
+        char ww[512];
+        if (mem::ww::describe(static_cast<uint64_t>(rec->ExceptionInformation[1]), ww, sizeof ww)) appendf(out, "  write watch: %s\n", ww);
+        else appendf(out, "  write watch: no region holds the address\n");
     }
 
     // Last guest function: the lifted function whose host code contains the faulting instruction.

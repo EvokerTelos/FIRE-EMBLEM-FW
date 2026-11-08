@@ -153,6 +153,12 @@ DWORD page_protect(uint64_t addr) {
 bool release_page(Region* r, uint64_t page) {
     const uint64_t b = bit(page);
     const uint64_t w = page >> 6;
+    // Guarded by this region since the fault was taken (guard() holds the lock exclusive, so this cannot change while we hold it shared):
+    // leave the page alone and let the access retry, which takes the guard path. Releasing it here cleared the prot bit under a guard;
+    // seen with overlapping regions (the heap-wide texture tracker had already made the page writable, so the pool copy's guard() still
+    // found it armed): the page then stayed guarded but unarmed, and once the guard went, the next write found no region to claim it and
+    // crashed as an access violation (FEFW: a worker thread writing a compute result pool right after its copy was made).
+    if (r->guard[w].load(std::memory_order_acquire) & b) return true;
     // Announce the release before the bit goes: whoever finds the bit already clear can then tell "somebody is making this page writable"
     // (the count is up from before the bit went until after the VirtualProtect) from "nobody is": a foreign read-only page.
     std::atomic<uint16_t>& rel = r->releasing[page];
@@ -512,6 +518,28 @@ bool guard(Region* r, uint64_t first, uint64_t count) {
         return false;
     }
     return true;
+}
+
+int describe(uint64_t addr, char* out, size_t n) {
+    if (!out || !n) return 0;
+    out[0] = 0;
+    int found = 0;
+    size_t used = 0;
+    const int hi = g_hi.load(std::memory_order_seq_cst);
+    for (int i = 0; i < hi; ++i) {
+        Region* r = g_slots[i].load(std::memory_order_seq_cst);
+        if (!r || addr < r->base || addr >= r->base + r->npages * kPage) continue;
+        const uint64_t p = (addr - r->base) / kPage;
+        const int k = std::snprintf(out + used, n - used, "%sregion %d base %llx page %llu: prot %d guard %d valid %d ban %d written %d releasing %u",
+                                    found ? "; " : "", i, static_cast<unsigned long long>(r->base), static_cast<unsigned long long>(p),
+                                    test(r->prot.get(), p) ? 1 : 0, test(r->guard.get(), p) ? 1 : 0, test(r->valid.get(), p) ? 1 : 0,
+                                    test(r->ban.get(), p) ? 1 : 0, test(r->written.get(), p) ? 1 : 0,
+                                    static_cast<unsigned>(r->releasing[p].load(std::memory_order_relaxed)));
+        ++found;
+        if (k < 0 || static_cast<size_t>(k) >= n - used) break;
+        used += static_cast<size_t>(k);
+    }
+    return found;
 }
 
 void unguard(Region* r, uint64_t first, uint64_t count) {
