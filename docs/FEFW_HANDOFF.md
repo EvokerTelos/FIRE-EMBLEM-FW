@@ -7,7 +7,7 @@ Read this first, then `docs/FEFW_BRINGUP.md`. Repository: EvokerTelos/FIRE-EMBLE
 Game files or anything derived from them: `game/`, `work/`, `refs/` (Ryubing checkout), shader caches/dumps, NSOs, RomFS. GPL-3.0.
 Commits: author EvokerTelos <lepatoh@gmail.com>, AI disclosure + Co-Authored-By trailer.
 
-## State (2026-11-07)
+## State (2026-11-08: gameplay at native 4K, ~55-58 fps, real 60 fps logic)
 - All 6 modules lifted and compiled (`recomp\scripts\build_game.cmd fefw`), `fefw.exe` links (`game-build\scripts\build.ps1`).
 - The game boots into its main loop: 60 fps steady, audio (XAudio2), input, RomFS read in place from
   `C:\Users\Patricio\Desktop\SWITCH 2\FEFW ROM\FEFW ROM\131072\romfs`.
@@ -71,13 +71,21 @@ extents at 0x90/0x98 relative to .rodata, segments LZ4).
   (also dumps blocks sent to the on-demand translator; remove a hash's results.tsv row + .spv to get its code dumped).
   Note: paths under C:\FEFW-port cannot be deleted by the agent's shell; move files to a scratch folder instead.
 
+## Done 2026-11-08: native 4K
+- The game picks one of 4 resolution profiles (main+0x223e0b0, {out w, h, render w, h, shadow size}); stock renders 1280x720 and its
+  DLSS step scales to 2560x1440. fefw_game.cpp rewrites the profiles (and the renderer's pending sizes at +0x3408) to [fefw]
+  render_width x render_height (default 3840x2160, native) and shadow_size (default 4096).
+- The render-target pool (f_7100646b20, 0x3f000000 = 1008 MB) does not hold that: `nvnTextureInitialize: storage does not fit in the
+  pool`, black screen. `recomp/games/fefw/main.sites` patches the size at 0x7100646f88 to 0xbf000000 (3056 MB); 2 GB fit 4K but not the
+  4096 shadows. Result: 3840x2160 + 4096 shadows, 0 pool failures, 54..58 fps in the tutorial map (GPU ~92% busy).
+- The generic `NXRT_GFX_RENDER_SCALE` is not needed (and mixes scales: storage images stay 1x).
+- GPU profile at 4K (`NXRT_PROF_TRACE=<file> NXRT_PROF_GPU_PASSES=1`, sum `gp:` zones): the big ones are full-screen passes
+  (c1:43, c1:122, c1:97, c5:43 ~ 80..110 ms/s each), probe filter cs 8ab94383 (73 ms/s, runs every frame), the runtime's compute
+  buffer shadow copies ("shadow in"/"shadow out", ~97 ms/s) and cs a840b7d9 (53 ms/s). To hold a locked 60: cut the shadow copies
+  (compute_shadows_on, nvn_replay.cpp) or skip probe refiltering when the sky did not change.
+
 ## Next for "4K 60 fps, max quality"
-- Internal resolution: the 3D scene renders at 1280x720, post at 2560x1440, output 3840x2160. Generic Ryujinx-style scaling
-  (`NXRT_GFX_RENDER_SCALE`, nvn_gpu_texture.cpp attachment_scale) holds 60 fps at 1.5 and 2.0 on the RX 9070 XT but at 2.0 one pass
-  draws a quarter-size copy in the top-left quadrant (a pass with unscaled coordinates). Either find that pass (trace at scale 2,
-  compare targets) or make the game itself render at 4K (find where it sizes its scene targets / dynamic resolution, then poke it from
-  fefw_game.cpp on_present like the fps target). DLSS: the game's own TaskDLSS path (render size 2560x1440 in the log) is not run;
-  replace with FSR or a good upscale.
+- Perf headroom at 4K (above). DLSS: the TaskDLSS path is now a same-size copy; FSR/TAA-style AA would be the quality step.
 - Remaining visual issues: some falling-leaf particles are black (layer t500, fs 67a08fc6 / c2bc1273 / b1918ad5); the unit portrait
   ("T", the custom avatar) may be drawn upside down (user report; not confirmed: the map icon shows the same orientation).
 - AV1 movies: decode (dav1d or Media Foundation, the AV1 extension is installed) and feed nvnNativeImage textures; until then

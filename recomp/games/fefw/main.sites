@@ -1,1 +1,4 @@
-# hook sites of main (none yet: bring-up)
+# hook sites of main
+# Render-target memory pool (f_7100646b20: desc {size, flags 0xa1} -> f_7100053b30, kept at renderer+360). Stock size 0x3f000000
+# (1008 MB) is sized for 2560x1440 output from 1280x720; native 3840x2160 with 4096 shadows needs more: 0xbf000000 (3056 MB).
+patch 7100646f88 52a7e009 52b7e009   # mov w9, #0x3f000000 -> #0xbf000000
