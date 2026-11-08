@@ -90,8 +90,13 @@ Defaults now: 3840x2160 native, 4096 shadows, 3 GB RT pool (main.sites), fps_tar
    `NXRT_PROF_TRACE` + `NXRT_PROF_GPU_PASSES=1` and compare the gp: zones of a slow window with a fast one.
 6. AV1 movies (opening, story scenes): decode with dav1d or Media Foundation (AV1 extension installed) into the nvnNativeImage
    textures the movie player samples ([media] av1_decoder, video_codec.cpp); then drop NXRT_MEDIA_MOVIE_SKIP from the defaults.
-7. Quality: the game's DLSS call is now a same-size copy; the runtime already has [upscale] mode fsr3/dlaa (do_evaluate_dlss):
-   try DLAA/FSR-native AA at 4K for anti-aliasing. HDR later.
+7. Upscaling / AA, AMD only (user: RX 9070 XT + AMD CPU, port for personal use, no DLSS needed). The runtime already has FSR 3.1
+   through the FidelityFX API on Vulkan (gfx/extras/temporal_ffx.cpp): drop the FidelityFX SDK v2.x Vulkan DLLs
+   (amd_fidelityfx_loader_vk.dll + amd_fidelityfx_upscaler_vk.dll, MIT) into upscalerssr3\, set [upscale] mode = fsr3; it picks
+   the newest upscaler the DLL offers for the GPU, so FSR 4 (ML, RDNA4) comes for free if AMD's Vulkan DLL exposes it (check what
+   version it reports in the log; FSR 4 was DX12-first). Feed: the game's own DLSS call (do_evaluate_dlss) gives colour, depth and
+   motion vectors. Modes to offer: native AA (render 3840x2160, FSR as AA) and Quality (render 2560x1440 -> 4K, frees GPU time).
+   Check the jitter: the game only jitters when its DLSS path is on; FSR needs the jitter offsets (find them in the DLSS params).
 9. In-game settings menu (user's choice: own ImGui overlay like TotK Recomp's, opened with Esc; also a pad combo). Base:
    runtime/src/gfx/overlay.cpp (Dear ImGui). Tabs Screen / Game / Sound / Controls / Advanced; each option saved to fefw.ini and
    marked "after restart" when it cannot apply live. Options: game resolution ([fefw] render_width/height; live change needs the
