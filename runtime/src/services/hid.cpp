@@ -1247,7 +1247,9 @@ namespace nxrt::hid {
 Jc2MouseMode jc2_mouse_mode() {
     int m = services::g_jc2_mode.load();
     if (m < 0) {
-        std::string v = config_get_str("input", "jc2_mouse", "auto");
+        // default off in this port: offered the PC mouse as a Joy-Con 2 mouse, Fortune's Weave switches its camera and UI to mouse mode on any
+        // mouse movement (also from taking a screenshot); [input] jc2_mouse = auto or on brings it back
+        std::string v = config_get_str("input", "jc2_mouse", "off");
         for (char& c : v) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         m = v == "off" ? 0 : (v == "on" ? 2 : 1);
         if (v != "off" && v != "on" && v != "auto") NXLOG_W("hid", "[input] jc2_mouse = %s: not auto, on or off; using auto", v.c_str());

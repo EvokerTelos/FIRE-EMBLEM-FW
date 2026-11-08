@@ -554,10 +554,11 @@ void resolution_group(Menu& m) {
     if (ow > 0 && oh > 0) {
         int rw = ratio > 0 ? 2 * static_cast<int>(std::lround(ow * std::clamp(ratio, 0.25, 1.0) / 2)) : (ow + 1) / 2;
         int rh = ratio > 0 ? 2 * static_cast<int>(std::lround(oh * std::clamp(ratio, 0.25, 1.0) / 2)) : (oh + 1) / 2;
-        const bool capped = static_cast<int64_t>(ow) * oh > 2560 * 1440 && (rw > (ow + 1) / 2 || rh > (oh + 1) / 2);
+        const bool capped = static_cast<int64_t>(ow) * oh > 3840 * 2160 &&   // the patched 3 GB pool (main.sites) holds 4K at full size
+             (rw > (ow + 1) / 2 || rh > (oh + 1) / 2);
         if (capped) rw = (ow + 1) / 2, rh = (oh + 1) / 2;
         ImGui::TextDisabled("Next start: %d x %d rendered into %d x %d%s", rw, rh, ow, oh,
-                            capped ? " (above 1440p the game's render-target pool holds half per side at most)" : "");
+                            capped ? " (above 4K the game's render-target pool holds half per side at most)" : "");
     }
 }
 
