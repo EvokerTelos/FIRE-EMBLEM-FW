@@ -11,11 +11,12 @@ Commits: author EvokerTelos <lepatoh@gmail.com>, AI disclosure + Co-Authored-By 
 - All 6 modules lifted and compiled (`recomp\scripts\build_game.cmd fefw`), `fefw.exe` links (`game-build\scripts\build.ps1`).
 - The game boots into its main loop: 60 fps steady, audio (XAudio2), input, RomFS read in place from
   `C:\Users\Patricio\Desktop\SWITCH 2\FEFW ROM\FEFW ROM\131072\romfs`.
-- Screen is mostly black: shader translation is the current work (stage 4).
+- Shader translation (stage 4): every block the game uses so far translates. The boot screens (autosave notice) draw; gameplay
+  was not reached in the 90 s test runs, so the material / light-probe shaders are not checked on screen yet.
 - On-demand translator built: `tools\shaders\build\bin\Release\net10.0\spirv_harness.exe` (fefw_shaders_setup.ps1;
   Ryubing at `refs\ryubing`, staged to `tools\shaders\third_party\ryubing`, patches in `tools\shaders\harness\translator\*.patch`).
-- Cache `work\shader_cache\spirv\results.tsv`: 638 blocks, 602 ok, 36 unsupported, 0 exception (was 375 ok / 227 exception
-  before the c[24] fix). The menu frame and the save indicator draw.
+- Cache `work\shader_cache\spirv\results.tsv`: 638 blocks, 638 ok (was 375 ok / 227 exception / 36 unsupported).
+  `NX_HARNESS_STACK=1` makes the harness print a translator exception's whole stack.
 
 ## Dev loop
 `powershell -ExecutionPolicy Bypass -File fefw_test.ps1 [-Seconds 90] [-DumpShaders] [-Lift]`
@@ -31,8 +32,23 @@ the gamut matrix. Workflow that worked: `sassdecode --dump code ctrl` (tools\sha
 the harness on the single block, then `--batch` on the dump. When a patch replaces a whole file, also move it from the
 `<Compile Include="$(ShaderSrc)...">` Exclude list to a `$(PatchedDir)` Compile item in the csproj.
 
-## Task 1 (next, was task 2): 36 unsupported
-Mostly `TEX.SCR.B` / `TXQ.B` bindless texture forms, plus `IMAD.WIDE.U32` carry out, `TEX.SCR.F16.RN`, `ATOMS.CAS`, `.UNKNOWN_f60`.
+## Done: the 36 unsupported (was task 2)
+- Bindless TEX.B / TXQ.B / TLD4.B (AmpereEmit.cs `IsBindlessTex`, by opcode: TLD4's `.B` is also the blue component). The .SCR
+  parameter list is `[array, coords..., handle, dc, lod, offsets, ms]`, split two in Ra and the rest in Rb; TXQ.B Ra = [handle, lod];
+  opcode 0xf60 takes the handle from a uniform register. They become Ryujinx bindless ops: a handle loaded from a uniform block with
+  a dynamic index turns into a texture array (`texTextureCube[c6:0x256]` = c[6], 256 handles 8 bytes apart from word 0), which the
+  runtime now fills element by element (`resolve_texture_element`, nvn_replay.cpp).
+- IMAD.WIDE.U32 carry out, TEX.F16.RN (fp16 packed results), ATOMS.CAST.SPIN (0x38d with bits 87..88 = 3, returns 1 on success).
+  The 0xf60 and CAST.SPIN decodes are inferred from how the code uses them, not checked against nvdisasm.
+
+## Task 1 (next): bindless samples that read 0
+51 blocks (the material shaders with TXQ.B, and 1e1e3f3b) have bindless samples Ryujinx cannot resolve, so they read 0
+(translator message "Failed to find handle source for bindless access"): (a) the handle is the constant 0 (`MOV Rb, RZ` before
+`TEX.SCR.B`, 1e1e3f3b: no patch table in the control section, so 0 is the real value: find what texture/sampler id 0 is in the
+game's pools), (b) the handle comes from memory (`LDG.E.64.CONSTANT R114, [R114.U32+UR4]`, 23b2a51d family: a per-material handle
+table). (b) needs texture/sampler pool descriptor arrays in the runtime (Ryujinx `GenerateBindlessAccess`, enabled by
+`QueryHostSupportsSeparateSampler` in tools\shaders\harness\StaticGpuAccessor.cs, currently false). Check on screen first, once
+gameplay is reached, whether the missing terms are visible (reflections / probes look most likely).
 
 ## Later
 - 73 NVN procs not in the runtime table (ray tracing, mesh tasks, cooperative vectors, AcquireTimeout, WriteDescriptorTableData...):
