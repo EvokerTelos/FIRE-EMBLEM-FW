@@ -58,19 +58,30 @@ Fixed on the way: PAC register forms and `br x30` returns in the lifter (setjmp 
 names, ILibraryAppletAccessor cmd 170. Symbolize sdk addresses with the .dynsym of game\dump\exefs\sdk (NSO header: dynstr/dynsym
 extents at 0x90/0x98 relative to .rodata, segments LZ4).
 
-## Overexposed 3D (battle map white, characters cyan): where it stands (paused 2026-11-07)
-Gameplay is reached now (tutorial battle map). Frame trace (`NXRT_NVN_TRACE_SEC=165`, PNGs + stats of every target): the G-buffer
-albedo (t439) and normals are right; the lit HDR scene has mean ~15 (max ~50) and the tonemap (fs aa98bfc2 -> t504) saturates it.
-Cause: auto-exposure. Compute 98acab99 reads a luminance histogram from the storage buffer at c[0]+0x90, takes the 10..90 % percentile
-mean and writes the exposure image t54 (R16F 3x1, log2 values) that the lighting reads; 4393e0d5 and 09b66614 also use that buffer.
-- Those NVN2 compute blocks have a 0x80-byte c[0] table header (not 0x10): table size u16 +0xba = header + slots. The runtime fix is
-  in apply_nvn2_compute_table but gated by env NXRT_TEST_C0HDR=1: with it the buffers bind, t54 goes to about -13.6 (its lower
-  clamp, i.e. "the scene is dark") and the lighting saturates at 65000. Next: find who writes the histogram (buffer 7a4cf14600, 1 KiB,
-  all zero in the trace; probably a per-pixel luminance pass earlier in the frame) and why it stays empty; check SULD/SUST formats on
-  t54 (the shader reads its previous value back).
-- Fixed: square 2D images of 6n layers are created cube-compatible (texture 138, RG8 cube, was the dummy for ~20 lighting shaders).
-- The crash report now prints the page state and write-watch bits; a write-watch race (guard vs release on overlapping regions) is
-  fixed (the intermittent 265 s / boot crash).
+## Fixed 2026-11-08: real 60 fps and the white-out
+- 60 fps: [fefw] fps_target (default 60) keeps the frame-rate target at [main+0x21E60D8]+0x1DC at 60; the game steps its logic by
+  60/target, so it is one step per frame at real speed. Without it the gameplay ran at 2x (the game asks present interval 2 with its
+  30, and the host ignores the interval). Runs now reach the battle map at real speed (~75 s on a save that continues the tutorial).
+- White-out / cyan: NVN2 compute push constants live in c[0] + 0x10..0x80 (head of the 0x80-byte compute c[0] table); the runtime
+  now binds a per-dispatch c[0] with them, the table offsets come from its size (+0xba), and TEX/TXQ on an image slot read that
+  image's texture (from_image). Sky cube -> probe cubes -> auto-exposure all work; battle map and dialogue scenes look right.
+- Debug aids that found it: `NXRT_NVN_TRACE_SEC` / `TRACE_AFTER_FS` (frame trace + PNGs of targets), `NXRT_NVN_TRACE_DUMP_IDS=45,47`
+  (dump textures by id), `NXRT_NVN_TRACE_BINDINGS=<hash prefixes>` (what each sampled binding resolves to),
+  `NXRT_NVN_TRACE_TEX_EVENTS=<ids>` (init / upload / storage binds with the writing shader / GPU writes), `NXRT_NVN_DUMP_MISSING`
+  (also dumps blocks sent to the on-demand translator; remove a hash's results.tsv row + .spv to get its code dumped).
+  Note: paths under C:\FEFW-port cannot be deleted by the agent's shell; move files to a scratch folder instead.
+
+## Next for "4K 60 fps, max quality"
+- Internal resolution: the 3D scene renders at 1280x720, post at 2560x1440, output 3840x2160. Generic Ryujinx-style scaling
+  (`NXRT_GFX_RENDER_SCALE`, nvn_gpu_texture.cpp attachment_scale) holds 60 fps at 1.5 and 2.0 on the RX 9070 XT but at 2.0 one pass
+  draws a quarter-size copy in the top-left quadrant (a pass with unscaled coordinates). Either find that pass (trace at scale 2,
+  compare targets) or make the game itself render at 4K (find where it sizes its scene targets / dynamic resolution, then poke it from
+  fefw_game.cpp on_present like the fps target). DLSS: the game's own TaskDLSS path (render size 2560x1440 in the log) is not run;
+  replace with FSR or a good upscale.
+- Remaining visual issues: some falling-leaf particles are black (layer t500, fs 67a08fc6 / c2bc1273 / b1918ad5); the unit portrait
+  ("T", the custom avatar) may be drawn upside down (user report; not confirmed: the map icon shows the same orientation).
+- AV1 movies: decode (dav1d or Media Foundation, the AV1 extension is installed) and feed nvnNativeImage textures; until then
+  `NXRT_MEDIA_MOVIE_SKIP=1` and PLUS skips the scenes waiting for them.
 
 ## Task 1 (next): bindless samples that read 0
 51 blocks (the material shaders with TXQ.B, and 1e1e3f3b) have bindless samples Ryujinx cannot resolve, so they read 0
