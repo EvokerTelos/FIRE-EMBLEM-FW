@@ -20,3 +20,10 @@ output 2160p, render_ratio 0.67 (2560x1440 -> FSR 3.1.4 -> 3840x2160), shadow_si
 ## Open
 - Title text drawn as barcode bars (user screenshot from `fefw`): check on this base.
 - Dark red patch along a wall in the desert battle map: check against the user's emulator.
+
+## Shaders compiled ahead (whole game)
+`fefw.exe --prepare-shaders --programs work\shaders\programs.bin` (run in the run folder, with --ini): compiles the vertex/fragment parts of
+all 9988 BNSH programs into pipeline_cache.bin (16 MB -> 140 MB, 231 s on the RX 9070 XT), so first attacks no longer wait for
+"Preparing shaders". The list: `extract_corpus.py --romfs ... --out work\shaders\corpus` then
+`tools\shaders\ampere\programs_bin.py work\shaders\corpus\programs.tsv work\shaders\programs.bin`. Run it again after a GPU driver update
+(the driver drops the cache); `--if-needed` skips when nothing changed.

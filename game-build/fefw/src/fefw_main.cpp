@@ -229,12 +229,61 @@ int main(int argc, char** argv) {
 #endif
 
 namespace {
+
+// --prepare-shaders [--programs FILE] [--threads N] [--if-needed]: no game, no window. A headless Vulkan device and the NVN back end's
+// pipeline code compile the shader parts of every program in programs.bin (next to the shader cache folder, or --programs; written by
+// tools/shaders/ampere/programs_bin.py from the corpus' programs.tsv), so the pipeline cache holds the whole game before it is played and a
+// first attack no longer waits for "Preparing shaders". Progress: "prepare: <done> <total>"; end: "prepare: done ..." or "prepare: ready".
+// Exit code: 0 done or ready, 1 could not run, 3 cancelled.
+int prepare_shaders_main(bool if_needed, int threads, const std::string& programs) {
+    std::string err;
+    nxrt::gfx::DeviceDesc dd;
+    dd.headless = 1;
+    auto dev = nxrt::gfx::Device::create(dd, &err);
+    if (!dev) { std::printf("prepare: error graphics device: %s\n", err.c_str()); return 1; }
+    nxrt::nvn::BackendDesc bd;
+    bd.device = dev.get();
+    bd.register_entry_points = false;
+    if (!nxrt::nvn::install_backend(bd)) { std::printf("prepare: error the graphics back end did not start\n"); return 1; }
+    nxrt::nvn::ShaderPrepareOptions po;
+    po.only_if_needed = if_needed;
+    po.programs_file = programs;
+    po.threads = threads;
+    DWORD last = 0;
+    po.progress = [&](uint64_t done, uint64_t total) {
+        const DWORD now = GetTickCount();
+        if (done < total && now - last < 1000) return true;
+        last = now;
+        std::printf("prepare: %llu %llu\n", static_cast<unsigned long long>(done), static_cast<unsigned long long>(total));
+        std::fflush(stdout);
+        return true;
+    };
+    nxrt::nvn::ShaderPrepareResult pr;
+    const bool ok = nxrt::nvn::prepare_shaders(po, &pr);
+    int rc = 0;
+    if (!ok) { std::printf("prepare: error %s\n", pr.error.c_str()); rc = 1; }
+    else if (pr.already_ready) std::printf("prepare: ready\n");
+    else std::printf("prepare: done programs=%llu prepared=%llu missing=%llu failed=%llu parts=%llu fast=%llu seconds=%.1f%s\n",
+                     static_cast<unsigned long long>(pr.programs), static_cast<unsigned long long>(pr.prepared),
+                     static_cast<unsigned long long>(pr.missing_shaders), static_cast<unsigned long long>(pr.failed),
+                     static_cast<unsigned long long>(pr.parts), static_cast<unsigned long long>(pr.fast_parts), pr.seconds, pr.cancelled ? " cancelled" : "");
+    std::fflush(stdout);
+    if (ok && pr.cancelled) rc = 3;
+    nxrt::nvn::shutdown_backend();
+    dev.reset();
+    nxrt::shutdown();
+    return rc;
+}
+
 int fefw_run(int argc, char** argv) {
     nxrt_register_game_fefw();           // before anything reads it (nxrt::init, the services): docs/GAME_BOUNDARY.md
     std::string exefs_arg, main_arg, romfs_arg;
     const char* ini = nullptr;
     const char* logp = nullptr;
     std::vector<std::pair<std::string, std::string>> boot_opts;   // [boot] keys from the command line, applied after nxrt::init() loads the ini
+    bool prepare = false, prepare_if_needed = false;
+    int prepare_threads = 0;
+    std::string prepare_programs;
     for (int i = 1; i < argc; i++) {
         auto arg = [&](const char* n) { return !std::strcmp(argv[i], n) && i + 1 < argc; };
         if (arg("--exefs")) exefs_arg = argv[++i];
@@ -244,6 +293,10 @@ int fefw_run(int argc, char** argv) {
         else if (arg("--log")) logp = argv[++i];
         else if (arg("--max-seconds")) boot_opts.emplace_back("max_seconds", argv[++i]);
         else if (arg("--link")) boot_opts.emplace_back("link", argv[++i]);
+        else if (!std::strcmp(argv[i], "--prepare-shaders")) { prepare = true; _putenv("NXRT_DIAG_WATCHDOG_SECONDS=0"); }
+        else if (!std::strcmp(argv[i], "--if-needed")) prepare_if_needed = true;
+        else if (arg("--threads")) prepare_threads = std::atoi(argv[++i]);
+        else if (arg("--programs")) prepare_programs = argv[++i];
         else if (!std::strcmp(argv[i], "--no-nvn")) boot_opts.emplace_back("nvn", "0");
         else if (!std::strcmp(argv[i], "--headless")) boot_opts.emplace_back("gfx", "headless");
         else if (!std::strcmp(argv[i], "--window")) boot_opts.emplace_back("gfx", "window");
@@ -255,6 +308,7 @@ int fefw_run(int argc, char** argv) {
     opt.ini_path = ini;
     opt.log_path = logp;
     if (!nxrt::init(opt)) die("runtime start-up failed (address-space layout)");
+    if (prepare) return prepare_shaders_main(prepare_if_needed, prepare_threads, prepare_programs);
     for (const auto& kv : boot_opts) nxrt::config_set("boot", kv.first.c_str(), kv.second.c_str());
     const std::string exefs = fs_path("exefs", exefs_arg, FEFW_EXEFS_DEFAULT);
     const std::string main_nso = fs_path("main", main_arg, FEFW_MAIN_DEFAULT);
