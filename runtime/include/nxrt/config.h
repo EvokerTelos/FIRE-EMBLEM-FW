@@ -20,6 +20,8 @@ void config_load_string(const char* text);
 void config_clear();
 // Programmatic override, as if it were in the ini (tests, command-line options). Env still wins over it.
 void config_set(const char* section, const char* key, const char* value);
+// A game's own default for a key (games/<id>, at registration): used when neither env nor the ini sets it; survives ini reloads.
+void config_set_default(const char* section, const char* key, const char* value);
 
 std::string config_get_str(const char* section, const char* key, const char* def = "");
 int64_t config_get_int(const char* section, const char* key, int64_t def = 0);      // decimal, 0x hex, optional k/m/g suffix not supported

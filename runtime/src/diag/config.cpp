@@ -29,6 +29,8 @@ struct Seen {
 std::mutex g_mu;
 // canonical id ("section" 0x1F "key", lower-case) -> value. config_set values live here too (source "ini").
 std::unordered_map<std::string, std::string> g_ini;
+// config_set_default values: the game's own defaults, under env and ini, kept across ini reloads.
+std::unordered_map<std::string, std::string> g_game_defaults;
 // every key read so far, keyed by canonical id, ordered for a stable dump.
 std::map<std::string, Seen> g_seen;
 
@@ -69,6 +71,8 @@ Found lookup(const std::string& section, const std::string& key) {
     std::lock_guard<std::mutex> g(g_mu);
     auto it = g_ini.find(canon_id(section, key));
     if (it != g_ini.end()) return {true, it->second, "ini"};
+    auto gd = g_game_defaults.find(canon_id(section, key));
+    if (gd != g_game_defaults.end()) return {true, gd->second, "game default"};
     return {false, std::string(), "default"};
 }
 
@@ -220,6 +224,11 @@ bool config_load_file(const char* path) {
     std::fclose(f);
     replace_ini(text);
     return true;
+}
+
+void config_set_default(const char* section, const char* key, const char* value) {
+    std::lock_guard<std::mutex> g(g_mu);
+    g_game_defaults[canon_id(S(section), S(key))] = S(value);
 }
 
 void config_load_string(const char* text) { replace_ini(S(text)); }

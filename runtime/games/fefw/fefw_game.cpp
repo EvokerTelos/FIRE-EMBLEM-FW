@@ -7,6 +7,7 @@
 //   60 (default)  the target is raised to 60 whenever the game sets a lower one
 //   0             the game's own target (30 in gameplay)
 // Every change of the value is logged (fefw: frame-rate target ...) with what was written.
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -43,6 +44,10 @@ void apply_resolution(uint64_t renderer) {
     static const uint32_t w = static_cast<uint32_t>(config_get_int("fefw", "render_width", 3840));
     static const uint32_t h = static_cast<uint32_t>(config_get_int("fefw", "render_height", 2160));
     static const uint32_t shadow = static_cast<uint32_t>(config_get_int("fefw", "shadow_size", 4096));
+    // [fefw] render_scale (percent, default 100): the scene renders at that share of the output size and the game's DLSS step (FSR 3 with
+    // [upscale] mode = fsr3) scales it up: 67 = FSR Quality at 4K (2572x1447), 100 = native (FSR then only anti-aliases).
+    static const int64_t scale = std::clamp<int64_t>(config_get_int("fefw", "render_scale", 100), 25, 100);
+    static const uint32_t rw = static_cast<uint32_t>(w * scale / 100) & ~1u, rh = static_cast<uint32_t>(h * scale / 100) & ~1u;
     if (!w || !h) return;
     static bool done[4] = {};
     for (int k = 0; k < 4; ++k) {
@@ -56,9 +61,9 @@ void apply_resolution(uint64_t renderer) {
             done[k] = true;
             continue;
         }
-        NXLOG_I("fefw", "resolution profile %d: %ux%u <- %ux%u becomes %ux%u <- %ux%u%s", k, p[0], p[1], p[2], p[3], w, h, w, h,
+        NXLOG_I("fefw", "resolution profile %d: %ux%u <- %ux%u becomes %ux%u <- %ux%u%s", k, p[0], p[1], p[2], p[3], w, h, rw, rh,
                 shadow ? (", shadow map " + std::to_string(p[4]) + " -> " + std::to_string(shadow)).c_str() : "");
-        p[0] = w; p[1] = h; p[2] = w; p[3] = h;
+        p[0] = w; p[1] = h; p[2] = rw; p[3] = rh;
         if (shadow) p[4] = shadow;
         done[k] = true;
     }
@@ -66,8 +71,8 @@ void apply_resolution(uint64_t renderer) {
         uint32_t* q = reinterpret_cast<uint32_t*>(renderer + 0x3408);   // render w, h, output w, h
         for (const Res& r : kStock)
             if (q[0] == r.rw && q[1] == r.rh && q[2] == r.ow && q[3] == r.oh) {
-                NXLOG_I("fefw", "renderer pending sizes %ux%u <- %ux%u become %ux%u", q[2], q[3], q[0], q[1], w, h);
-                q[0] = w; q[1] = h; q[2] = w; q[3] = h;
+                NXLOG_I("fefw", "renderer pending sizes %ux%u <- %ux%u become %ux%u <- %ux%u", q[2], q[3], q[0], q[1], w, h, rw, rh);
+                q[0] = rw; q[1] = rh; q[2] = w; q[3] = h;
                 break;
             }
     }
@@ -112,4 +117,11 @@ const game::Info& full_info() {
 
 }  // namespace nxrt::games::fefw
 
-void nxrt_register_game_fefw() { nxrt::game::set_current(&nxrt::games::fefw::full_info()); }
+void nxrt_register_game_fefw() {
+    nxrt::game::set_current(&nxrt::games::fefw::full_info());
+    // FSR 3.1 (FidelityFX API, upscalerssr3\ next to the exe or [upscale] fsr_dll) in place of the game's DLSS step, at FSR Quality
+    // (the scene at 67 % of 3840x2160, then upscaled): 60 fps at 4K with 4096 shadows. Without the DLL the step is a bilinear scale; set
+    // [fefw] render_scale = 100 for native rendering (FSR as anti-aliasing only, ~47 fps on an RX 9070 XT).
+    nxrt::config_set_default("upscale", "mode", "fsr3");
+    nxrt::config_set_default("fefw", "render_scale", "67");
+}
