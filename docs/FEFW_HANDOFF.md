@@ -71,6 +71,29 @@ extents at 0x90/0x98 relative to .rodata, segments LZ4).
   (also dumps blocks sent to the on-demand translator; remove a hash's results.tsv row + .spv to get its code dumped).
   Note: paths under C:\FEFW-port cannot be deleted by the agent's shell; move files to a scratch folder instead.
 
+## ACTION PLAN (next session, 2026-11-08 evening): "fully playable, no graphics / visual / text bugs"
+Goal set by the user. Work continuously, commit on fefw, do not push. Test loop: scratch play.ps1 (launch + NXRT_BOOT_PRESS +
+screenshots), `NXRT_MEDIA_MOVIE_SKIP=1`; A every 3 s from 15 s reaches the tutorial map (~60 s) and the unit panel (~96..150 s).
+Defaults now: 3840x2160 native, 4096 shadows, 3 GB RT pool (main.sites), fps_target 60.
+1. Black falling-leaf particles (layer t500; fs 67a08fc6 / c2bc1273 / b1918ad5): trace a map frame (`NXRT_NVN_TRACE_SEC`),
+   `NXRT_NVN_TRACE_BINDINGS=67a08fc6,c2bc1273,b1918ad5` to see what their samplers resolve to (likely a bindless / texture-array
+   element reading 0 or a wrong view type), then dump the shader (`NXRT_NVN_DUMP_MISSING`) and read the SASS.
+2. Bindless samples that read 0 (Task 1 below, 51 material blocks): check on screen which materials miss terms (reflections,
+   probes); needs texture/sampler pool descriptor arrays (Ryujinx GenerateBindlessAccess, QueryHostSupportsSeparateSampler).
+3. Walk more of the game (past the tutorial: real battles, battle animations, menus, shops, dialogue, the world map) with
+   screenshots every 6 s; list every visual / text bug (missing glyphs, wrong text colours, garbled UI, black / cyan objects,
+   upside-down images: compare with the other emulator the user has). Check unknown-op warnings in nxrt.log:
+   `grep -E "unsupported|note_unsupported|not created|UNKNOWN NVN PROC .*call #"`.
+4. The old crash at ~265 s (guest-84, f_71005bca40+0x1d84 writes an unmapped heap address) after character creation: re-run
+   that path (new save) and see if it still happens.
+5. FPS dips to ~27 fps for 10..20 s (same scene, GPU sync waits ~42 ms a frame, VRAM fine): catch one with
+   `NXRT_PROF_TRACE` + `NXRT_PROF_GPU_PASSES=1` and compare the gp: zones of a slow window with a fast one.
+6. AV1 movies (opening, story scenes): decode with dav1d or Media Foundation (AV1 extension installed) into the nvnNativeImage
+   textures the movie player samples ([media] av1_decoder, video_codec.cpp); then drop NXRT_MEDIA_MOVIE_SKIP from the defaults.
+7. Quality: the game's DLSS call is now a same-size copy; the runtime already has [upscale] mode fsr3/dlaa (do_evaluate_dlss):
+   try DLAA/FSR-native AA at 4K for anti-aliasing. HDR later.
+8. Before shipping: remove debug env from the defaults, a clean 10-minute play run, update docs.
+
 ## Done 2026-11-08: native 4K
 - The game picks one of 4 resolution profiles (main+0x223e0b0, {out w, h, render w, h, shadow size}); stock renders 1280x720 and its
   DLSS step scales to 2560x1440. fefw_game.cpp rewrites the profiles (and the renderer's pending sizes at +0x3408) to [fefw]
