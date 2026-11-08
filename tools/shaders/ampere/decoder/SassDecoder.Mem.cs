@@ -110,9 +110,14 @@ namespace Nx.Shaders.Ampere
                 c.Op = "ATOMS"; c.Mod("POPC"); c.Mod("INC"); c.Mod("32");
                 c.Dst = 1; c.Add(c.R(16), MemOp(c, c.I(24, 8), Stride(c), c.I(64, 6), c.S(40, 24), showUZ: true));
             });
+            // Bits 87..88 = 3: CAST.SPIN (inferred, no oracle line): Rd = 1 when the swap happened, else 0. FEFW bcbd9fdf: the CUDA-style
+            // float atomic add on shared memory "LDS R0, [0x4]; FADD R1, R4, R0; ATOMS.CAS R1, [0x4], R0, R1; ISETP.EQ.U32 P1, R1, 0x1;
+            // @!P1 BRA" loops on Rd == 1, which only a success flag makes terminate.
             Op12(0x38d, c =>
             {
-                c.Op = "ATOMS"; c.Mod("CAS"); c.Mod(73, 3, AtomTypeS);
+                c.Op = "ATOMS";
+                if (c.I(87, 2) == 3) { c.Mod("CAST"); c.Mod("SPIN"); } else c.Mod("CAS");
+                c.Mod(73, 3, AtomTypeS);
                 c.Dst = 1; c.Add(c.R(16), MemOp(c, c.I(24, 8), Stride(c), -1, c.S(40, 24)), c.R(32), c.R(64));
             });
             // ATOMG 0x3a8 / 0x9a8 [NAK]: P dst 81 printed always [oracle], op 87..91, type 73..76

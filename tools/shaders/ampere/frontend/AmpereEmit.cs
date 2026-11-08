@@ -790,10 +790,19 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 if (cop.Neg || cop.Not || cop.Abs) throw Unsup("modified 64-bit addend");
                 IrOperand rlo = ctx.IAdd(lo, clo);
                 IrOperand carry = Bool(ctx, ctx.ICompareLessUnsigned(rlo, lo));
-                IrOperand rhi = ctx.IAdd(ctx.IAdd(hi, chi), carry);
+                IrOperand hsum = ctx.IAdd(hi, chi);
+                IrOperand rhi = ctx.IAdd(hsum, carry);
+                // Pco: carry out of the 64-bit sum a*b + {c+1:c} (bit 64). FEFW's 64-bit division sequences feed it to IMAD.X /
+                // IADD3.X ("IMAD.WIDE.U32 R8, P0, R6, R13, R8 ... IMAD.X R5, R5, 0x1, R7, P0", 09b66614). Only the unsigned form.
+                IrOperand carryOut = null;
+                if (co != null)
+                {
+                    if (!unsigned) throw Unsup("signed carry out");
+                    carryOut = ctx.Add(Instruction.LogicalOr, Local(), ctx.ICompareLessUnsigned(hsum, hi), ctx.ICompareLessUnsigned(rhi, hsum));
+                }
                 DstWord(ctx, o[0], 0, rlo);
                 DstWord(ctx, o[0], 1, rhi);
-                if (co != null) throw Unsup("carry out");
+                if (co != null) Dst(ctx, co, carryOut);
                 return;
             }
             IrOperand c, prod;
@@ -1729,6 +1738,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 Dst(ctx, o[0], r);
                 return;
             }
+            if (Has(i, "CAST") && Has(i, "SPIN") && !Has(i, "64"))
+            {
+                // ATOMS.CAST.SPIN Rd, [addr], Rcmp, Rnew: swap when the word equals Rcmp; Rd = 1 if it did, else 0 (decoder note).
+                IrOperand old = ctx.AtomicCompareAndSwap(StorageKind.SharedMemory, ctx.ResourceManager.SharedMemoryId, offset, Src(ctx, o[2]), Src(ctx, o[3]));
+                Dst(ctx, o[0], ctx.ConditionalSelect(ctx.ICompareEqual(old, Src(ctx, o[2])), Const(1), Const(0)));
+                return;
+            }
             if (Has(i, "CAS") || Has(i, "64")) throw Unsup();
             AtomSize size = Has(i, "S32") ? AtomSize.S32 : AtomSize.U32;
             IrOperand res = EmitAtomicOp(ctx, StorageKind.SharedMemory, AtomOpOf(i), size, Const(ctx.ResourceManager.SharedMemoryId), offset, Src(ctx, o[2]));
@@ -1797,7 +1813,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             List<Op> rest = o.Skip(k).ToList();
             List<Op> imms = rest.Where(x => x.Kind == OperandKind.Imm).ToList();
             string dim = rest.FirstOrDefault(x => x.Kind == OperandKind.Other)?.Text;
-            if (Has(i, "B"))
+            if (IsBindlessTex(i))
             {
                 // Bindless (.B): no bank/handle immediates, only the optional mask; the handle is a register parameter.
                 if (!allowBindless) throw Unsup("bindless form");
@@ -1808,6 +1824,10 @@ namespace Ryujinx.Graphics.Shader.Instructions
             int mask = imms.Count > 2 ? (int)imms[2].ImmBits & 0xf : 0xf;
             return (regs[0], regs[1], regs[2], regs.Count > 3 ? regs[3] : null, (int)imms[0].ImmBits, (int)imms[1].ImmBits, dim, mask);
         }
+
+        /// Bindless texture opcodes (decoder: bound 0xb6x, bindless 0x36x, 0xf60 = TEX with a uniform-register handle). Decided by the
+        /// opcode, not the ".B" modifier: TLD4 also spells its blue component ".B".
+        static bool IsBindlessTex(SassInst i) => (i.Lo & 0xfff) is 0x361 or 0x364 or 0x367 or 0x36a or 0x36d or 0x370 or 0xf60;
 
         static int CbufSlotOf(EmitterContext ctx, int bank) => bank == AmpereTextureBank ? TextureOperation.DefaultCbufSlot : bank;
 
@@ -1832,10 +1852,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
             if (rd.Reg >= 255 && rd2.Reg >= 255) return;
             foreach (string m in i.Mods)
             {
-                if (m is not ("SCR" or "B" or "LZ" or "LL" or "LB" or "DC" or "AOFFI" or "NODEP" or "MS" or "NDV" or "EF" or "EL" or "LU" or "EU" or "NA")) throw Unsup($"modifier {m}");
+                if (m is not ("SCR" or "B" or "F16.RN" or "LZ" or "LL" or "LB" or "DC" or "AOFFI" or "NODEP" or "MS" or "NDV" or "EF" or "EL" or "LU" or "EU" or "NA")) throw Unsup($"modifier {m}");
             }
             bool scr = Has(i, "SCR");
-            bool bindless = Has(i, "B");
+            bool bindless = IsBindlessTex(i);
+            bool f16 = Has(i, "F16.RN");
+            // TEX.B with the handle in a uniform register (opcode 0xf60): no handle among the register parameters
+            Op uHandle = bindless ? i.Operands.FirstOrDefault(x => x.Kind == OperandKind.UReg) : null;
+            bool handleInRegs = bindless && uHandle == null;
             (SamplerType type, bool array) = DimOf(dim);
             bool lz = Has(i, "LZ"), ll = Has(i, "LL"), bias = Has(i, "LB"), dc = Has(i, "DC"), aoffi = Has(i, "AOFFI"), ms = Has(i, "MS");
             TextureFlags flags = fetch ? TextureFlags.IntCoords : TextureFlags.None;
@@ -1849,7 +1873,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 // Same split as Maxwell TEX/TLD: Ra = [array index, coords...], Rb = [lod|bias, offset, dc, ms sample].
                 if (array) raList.Add("arr");
                 for (int c = 0; c < coords; c++) raList.Add("c" + c);
-                if (bindless) rbList.Add("h");   // Maxwell TEX.B: the handle is Rb's first register (inferred for Ampere)
+                if (handleInRegs) rbList.Add("h");   // Maxwell TEX.B: the handle is Rb's first register (inferred for Ampere)
                 if (ll || bias) rbList.Add("lod");
                 if (aoffi) rbList.Add("off");
                 if (dc) rbList.Add("dc");
@@ -1868,7 +1892,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 List<string> all = new();
                 if (array) all.Add("arr");
                 for (int c = 0; c < coords; c++) all.Add("c" + c);
-                if (bindless) all.Add("h");
+                if (handleInRegs) all.Add("h");
                 if (dc) all.Add("dc");
                 if (ll || bias) all.Add("lod");
                 if (aoffi) all.Add("off");
@@ -1895,7 +1919,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             List<IrOperand> sources = new();
             // Bindless: the handle is the first source; Ryujinx's BindlessElimination / BindlessToArray turn it into a bound
             // texture when it comes from a constant buffer, else they drop the sample (results 0) and log it.
-            if (bindless) { sources.Add(p["h"]); flags |= TextureFlags.Bindless; }
+            if (bindless) { sources.Add(handleInRegs ? p["h"] : ctx.Copy(UGpr(uHandle.Reg))); flags |= TextureFlags.Bindless; }
             for (int c = 0; c < coords; c++) sources.Add(p["c" + c]);
             bool is1DTo2D = false;
             if (Sample1DAs2D && (type & SamplerType.Mask) == SamplerType.Texture1D)
@@ -1922,7 +1946,24 @@ namespace Ryujinx.Graphics.Shader.Instructions
             if (Has(i, "NDV") && !fetch) { /* no derivatives across the quad: plain sample on the host */ }
 
             SetBindingPair binding = bindless ? default : ctx.ResourceManager.GetTextureOrImageBinding(Instruction.TextureSample, type, TextureFormat.Unknown, flags, CbufSlotOf(ctx, bank), handle);
-            ctx.TextureSample(type, flags, binding, mask, TexDests(rd, rd2, mask), sources.ToArray());
+            if (!f16)
+            {
+                ctx.TextureSample(type, flags, binding, mask, TexDests(rd, rd2, mask), sources.ToArray());
+                return;
+            }
+            // .F16.RN: the enabled components, packed two per register as fp16 (low half first): the k-th goes to Rd (k < 2) or
+            // Rd2, half k & 1 (FEFW: mask 0x8 read as Rd.H0; full mask as Rd.H0/H1, Rd2.H0/H1, ae4693c6 / 7f55d1b5).
+            int n = BitOperations.PopCount((uint)mask);
+            IrOperand[] vals = new IrOperand[n];
+            for (int c = 0; c < n; c++) vals[c] = Local();
+            ctx.TextureSample(type, flags, binding, mask, vals, sources.ToArray());
+            for (int pair = 0; pair < (n + 1) / 2; pair++)
+            {
+                Op baseReg = pair == 0 ? rd : rd2;
+                if (baseReg.Reg >= 255) continue;
+                IrOperand hiVal = 2 * pair + 1 < n ? vals[2 * pair + 1] : ConstF(0);
+                ctx.Copy(Gpr(baseReg.Reg), ctx.PackHalf2x16(vals[2 * pair], hiVal));
+            }
         }
 
         static void EmitTxdAmpere(EmitterContext ctx, SassInst i)
@@ -2066,7 +2107,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
         {
             // TXQ Rd2, Rd, Ra(lod), TEX_HEADER_DIMENSION, bank, handle, mask
             IReadOnlyList<Op> o = i.Operands;
-            if (Has(i, "B"))
+            if (IsBindlessTex(i))
             {
                 // TXQ.B Rd2, Rd, Ra, TEX_HEADER_DIMENSION[, mask]: Ra = [handle, lod], as Maxwell TXQ.B (23b2a51d: "MOV R25, RZ;
                 // MOV R24, R114; TXQ.B RZ, R25, R24" with R114 the handle its TEX.B use). The type is unknown: 3D when the depth

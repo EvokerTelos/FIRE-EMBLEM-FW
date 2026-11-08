@@ -29,7 +29,7 @@ namespace Nx.Shaders.Ampere
         }
 
         /// TEX / TLD / TLD4 / TMML / TXD common shape: R64, R16, R24, [R32], handle, dim, [mask]
-        static void TexCommon(Ctx c, string op, bool bindless, Action<Ctx> mods, string[]? dims = null)
+        static void TexCommon(Ctx c, string op, bool bindless, Action<Ctx> mods, string[]? dims = null, bool uniformHandle = false)
         {
             c.Op = op;
             c.Mod(c.B(60), "SCR");
@@ -42,6 +42,7 @@ namespace Nx.Shaders.Ampere
             if (!IsPT(c, 81)) { c.Add(c.P(81)); c.Dst++; }
             c.Add(c.R(24, reuse: false));
             if (c.I(32, 8) != 255) c.Add(c.R(32, reuse: false));
+            if (uniformHandle) c.Add(c.UR(40));
             TexHandle(c, bindless);
             c.Add(c.Text((dims ?? TexDim)[c.I(61, 3)]));
             TexMask(c);
@@ -67,6 +68,10 @@ namespace Nx.Shaders.Ampere
             Action<Ctx> txdMods = c => { c.Mod(c.B(76), "AOFFI"); };
             Op12(0xb60, c => TexCommon(c, "TEX", false, texMods));
             Op12(0x361, c => TexCommon(c, "TEX", true, texMods));
+            // 0xf60: bindless TEX whose handle is the uniform register at 40..45 (inferred, no oracle line; printed as TEX.B with the UR
+            // after the registers). FEFW bb2933bb: "ULDC UR4, c[0x6][UR4]" (the light-probe handle table at c[6] + 0x340 + 8i) feeds it,
+            // with Ra = [x, y], Rb = [z] of a CUBE.LZ sample, the same sample the 0x361 form takes with the handle in Rb + 1.
+            Op12(0xf60, c => TexCommon(c, "TEX", true, texMods, uniformHandle: true));
             Op12(0xb66, c => TexCommon(c, "TLD", false, tldMods, TexDimTld));
             Op12(0x367, c => TexCommon(c, "TLD", true, tldMods, TexDimTld));
             Op12(0xb63, c => TexCommon(c, "TLD4", false, tld4Mods));
