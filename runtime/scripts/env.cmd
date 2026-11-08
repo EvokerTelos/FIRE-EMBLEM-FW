@@ -1,4 +1,6 @@
 @echo off
+rem a stray quote in PATH (e.g. C:\Program Files\dotnet") breaks every later line that expands it: drop all quotes first
+set "PATH=%PATH:"=%"
 rem Sets up the MSVC + LLVM + CMake + Ninja environment for the runtime build (call it, then run cmake/ninja).
 rem The tool folders can be set beforehand: NX_VCVARS (vcvars64.bat), NX_LLVM_BIN, NX_CMAKE_BIN, NX_NINJA_BIN. Unset, the local toolchain
 rem folder NX_TOOLCHAIN (llvm\bin, cmakepy\cmake\data\bin under it) is used when it is set and exists, else the usual install

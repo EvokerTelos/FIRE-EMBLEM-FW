@@ -1,4 +1,6 @@
 @echo off
+rem a stray quote in PATH (e.g. C:\Program Files\dotnet") breaks every later line that expands it: drop all quotes first
+set "PATH=%PATH:"=%"
 rem Sets up the build environment: MSVC x64 (vcvars64), LLVM clang-cl 23, CMake, Ninja, sccache.
 rem Usage from cmd:  scripts\nx_env.cmd cmake --build build\x
 rem                  scripts\nx_env.cmd            (no arguments: just prints the tool versions)

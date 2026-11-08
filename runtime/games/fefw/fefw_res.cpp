@@ -136,7 +136,9 @@ void apply(Res& r) {
         // The game's render targets live in one 0x3f000000-byte memory pool (made at 0x646f88). Above 1440p output it holds a render of at
         // most half the output per side: 3840x2160 from 2560x1440 runs out and the game's allocator gives the HUD and post targets
         // offset -1 (a black picture). 2560x1440 at full size fits.
-        if (static_cast<int64_t>(ow) * oh > 2560 * 1440 && (rw > (ow + 1) / 2 || rh > (oh + 1) / 2)) {
+        // main.sites patches that pool to 0xbf000000 (3056 MB): it holds 3840x2160 at full size with 4096 shadows, so only larger outputs
+        // still get the half-size limit.
+        if (static_cast<int64_t>(ow) * oh > 3840 * 2160 && (rw > (ow + 1) / 2 || rh > (oh + 1) / 2)) {
             if (first)
                 NXLOG_W(kTag, "render %dx%d for output %dx%d does not fit the game's render-target pool: %dx%d", rw, rh, ow, oh, (ow + 1) / 2,
                         (oh + 1) / 2);
