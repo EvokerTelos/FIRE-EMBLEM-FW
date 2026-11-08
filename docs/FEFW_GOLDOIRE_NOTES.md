@@ -27,3 +27,9 @@ all 9988 BNSH programs into pipeline_cache.bin (16 MB -> 140 MB, 231 s on the RX
 "Preparing shaders". The list: `extract_corpus.py --romfs ... --out work\shaders\corpus` then
 `tools\shaders\ampere\programs_bin.py work\shaders\corpus\programs.tsv work\shaders\programs.bin`. Run it again after a GPU driver update
 (the driver drops the cache); `--if-needed` skips when nothing changed.
+
+## Textures transcoded ahead (whole game)
+`fefw.exe --ini work\play\fefw.ini --prepare-textures [--romfs DIR] [--threads N]` (src/gfx/nvn/nvn_tex_prepare.cpp): walks the romfs, finds every
+BNTX (also inside bfres / ptcl, zstd or not), builds each ASTC texture as the game does (NVN format, target, size, levels, packaged block height)
+and runs prepare_texture on the file bytes, so the BC7 cache gets the exact entry the game's first use would make, at the high preset.
+Check on a subset: 62 of 121 textures already had the game's own entry (keys match), 0 failed.

@@ -554,6 +554,8 @@ VkFormat cache_entry_format(const Texture& t) {
     return VK_FORMAT_UNDEFINED;
 }
 
+int bc7_high_preset() { return high_preset(); }
+
 bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out) {
     out = PreparedTexture();
     const auto fail = [&out, &t](std::string msg) {

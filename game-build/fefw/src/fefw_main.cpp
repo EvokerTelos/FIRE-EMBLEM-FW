@@ -275,13 +275,36 @@ int prepare_shaders_main(bool if_needed, int threads, const std::string& program
     return rc;
 }
 
+// --prepare-textures: every ASTC texture of the romfs transcoded to BC7 into [nvn] bc7_cache ahead of play (nvn_tex_prepare.cpp), so a first
+// use no longer transcodes on the render thread. Progress: "textures: <files done> <files> astc=<n> made=<n> cached=<n>"; end "textures: done ...".
+int prepare_textures_main(const std::string& romfs, int threads) {
+    nxrt::nvn::TexturePrepareOptions to;
+    to.romfs = romfs;
+    to.threads = threads;
+    to.progress = [](uint64_t fd, uint64_t f, uint64_t a, uint64_t m, uint64_t c) {
+        std::printf("textures: %llu %llu astc=%llu made=%llu cached=%llu\n", (unsigned long long)fd, (unsigned long long)f, (unsigned long long)a,
+                    (unsigned long long)m, (unsigned long long)c);
+        std::fflush(stdout);
+        return true;
+    };
+    nxrt::nvn::TexturePrepareResult tr;
+    const bool ok = nxrt::nvn::prepare_textures(to, &tr);
+    if (!ok) std::printf("textures: error %s\n", tr.error.c_str());
+    else std::printf("textures: done files=%llu bntx=%llu textures=%llu astc=%llu made=%llu cached=%llu failed=%llu seconds=%.1f\n",
+                     (unsigned long long)tr.files, (unsigned long long)tr.bntx, (unsigned long long)tr.textures, (unsigned long long)tr.astc,
+                     (unsigned long long)tr.made, (unsigned long long)tr.cached, (unsigned long long)tr.failed, tr.seconds);
+    std::fflush(stdout);
+    nxrt::shutdown();
+    return ok ? 0 : 1;
+}
+
 int fefw_run(int argc, char** argv) {
     nxrt_register_game_fefw();           // before anything reads it (nxrt::init, the services): docs/GAME_BOUNDARY.md
     std::string exefs_arg, main_arg, romfs_arg;
     const char* ini = nullptr;
     const char* logp = nullptr;
     std::vector<std::pair<std::string, std::string>> boot_opts;   // [boot] keys from the command line, applied after nxrt::init() loads the ini
-    bool prepare = false, prepare_if_needed = false;
+    bool prepare = false, prepare_if_needed = false, prepare_tex = false;
     int prepare_threads = 0;
     std::string prepare_programs;
     for (int i = 1; i < argc; i++) {
@@ -295,6 +318,7 @@ int fefw_run(int argc, char** argv) {
         else if (arg("--link")) boot_opts.emplace_back("link", argv[++i]);
         else if (!std::strcmp(argv[i], "--prepare-shaders")) { prepare = true; _putenv("NXRT_DIAG_WATCHDOG_SECONDS=0"); }
         else if (!std::strcmp(argv[i], "--if-needed")) prepare_if_needed = true;
+        else if (!std::strcmp(argv[i], "--prepare-textures")) { prepare_tex = true; _putenv("NXRT_DIAG_WATCHDOG_SECONDS=0"); }
         else if (arg("--threads")) prepare_threads = std::atoi(argv[++i]);
         else if (arg("--programs")) prepare_programs = argv[++i];
         else if (!std::strcmp(argv[i], "--no-nvn")) boot_opts.emplace_back("nvn", "0");
@@ -309,6 +333,7 @@ int fefw_run(int argc, char** argv) {
     opt.log_path = logp;
     if (!nxrt::init(opt)) die("runtime start-up failed (address-space layout)");
     if (prepare) return prepare_shaders_main(prepare_if_needed, prepare_threads, prepare_programs);
+    if (prepare_tex) return prepare_textures_main(fs_path("romfs", romfs_arg, FEFW_ROMFS_DEFAULT), prepare_threads);
     for (const auto& kv : boot_opts) nxrt::config_set("boot", kv.first.c_str(), kv.second.c_str());
     const std::string exefs = fs_path("exefs", exefs_arg, FEFW_EXEFS_DEFAULT);
     const std::string main_nso = fs_path("main", main_arg, FEFW_MAIN_DEFAULT);

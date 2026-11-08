@@ -59,6 +59,8 @@ struct PreparedTexture {
 // Prepares the data of t for the GPU described by caps. Returns false with out.error set on failure (no storage, bad layout,
 // no Vulkan format, a codec error, ...). Never crashes on a bad texture.
 bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out);
+// The bc7e preset of the high cache entries (kHighPreset, 3 with the C++ build, or [nvn] bc7_quality when higher).
+int bc7_high_preset();
 
 // The format the disk cache entry of an ASTC texture holds when that is not BC7: R8G8B8A8 (UNORM or SRGB as the texture) or BC5_UNORM (a
 // two-channel normal map). VK_FORMAT_UNDEFINED: no entry, or a BC7 entry. The GPU layer makes the image in this format (docs/S4f.md).
