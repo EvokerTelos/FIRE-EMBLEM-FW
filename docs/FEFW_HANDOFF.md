@@ -92,6 +92,12 @@ Defaults now: 3840x2160 native, 4096 shadows, 3 GB RT pool (main.sites), fps_tar
    textures the movie player samples ([media] av1_decoder, video_codec.cpp); then drop NXRT_MEDIA_MOVIE_SKIP from the defaults.
 7. Quality: the game's DLSS call is now a same-size copy; the runtime already has [upscale] mode fsr3/dlaa (do_evaluate_dlss):
    try DLAA/FSR-native AA at 4K for anti-aliasing. HDR later.
+9. In-game settings menu (user's choice: own ImGui overlay like TotK Recomp's, opened with Esc; also a pad combo). Base:
+   runtime/src/gfx/overlay.cpp (Dear ImGui). Tabs Screen / Game / Sound / Controls / Advanced; each option saved to fefw.ini and
+   marked "after restart" when it cannot apply live. Options: game resolution ([fefw] render_width/height; live change needs the
+   RT pool size as a `dynimm` site instead of the fixed `patch`), shadow size, fps target (live), upscale / AA ([upscale] mode
+   fsr3 / dlaa / off, sharpness), presentation (vsync / immediate), window size / fullscreen, scaling to the window, brightness,
+   performance overlay, movie skip. Pause the game while the menu is open.
 8. Before shipping: remove debug env from the defaults, a clean 10-minute play run, update docs.
 
 ## Done 2026-11-08: native 4K
