@@ -1222,12 +1222,18 @@ bool start(const StartOptions& opt) {
     }
     // the frame boundary, then the game's input, camera, lock-on and menu hooks (hooks of one address run in registration order)
     if (gp && gp->frame_update) st.hook_update = hook_add_entry(st.base + gp->frame_update, &update_hook);
-    else NXLOG_W(kTag, "the game (%s) names no frame update: play mode is not pumped", game::info().id);
+    else NXLOG_I(kTag, "the game (%s) names no frame update: play mode is pumped per presented frame (play::frame_boundary)", game::info().id);
     if (gp && gp->install) gp->install(st.base, &g_game_host, st.settings);
     st.started = true;
     NXLOG_I(kTag, "play mode started (%s, overlay %s, base 0x%llx, game %s, frame hook %u)", st.window ? "window" : "no window", st.overlay ? "on" : "off",
             static_cast<unsigned long long>(st.base), game::info().id, st.hook_update);
     return true;
+}
+
+void frame_boundary() {
+    G& st = g();
+    if (!st.started || st.hook_update) return;   // a game with its own frame hook is pumped there
+    update_hook(nullptr, 0, nullptr);
 }
 
 void stop() {

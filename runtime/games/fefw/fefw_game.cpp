@@ -16,6 +16,7 @@
 #include "nxrt/config.h"
 #include "nxrt/log.h"
 #include "nxrt/memory.h"
+#include "nxrt/play.h"
 
 namespace nxrt::games::fefw {
 
@@ -79,6 +80,7 @@ void apply_resolution(uint64_t renderer) {
 }
 
 void on_present() {
+    play::frame_boundary();   // keyboard, mouse and pads (the game has no frame-update hook for the play layer)
     {
         uint64_t renderer = 0;
         if (mem::is_mapped(core_info().main_base + kFpsHolder, 8)) std::memcpy(&renderer, reinterpret_cast<const void*>(core_info().main_base + kFpsHolder), 8);
