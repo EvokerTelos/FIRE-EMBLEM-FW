@@ -90,13 +90,16 @@ Defaults now: 3840x2160 native, 4096 shadows, 3 GB RT pool (main.sites), fps_tar
    `NXRT_PROF_TRACE` + `NXRT_PROF_GPU_PASSES=1` and compare the gp: zones of a slow window with a fast one.
 6. AV1 movies (opening, story scenes): decode with dav1d or Media Foundation (AV1 extension installed) into the nvnNativeImage
    textures the movie player samples ([media] av1_decoder, video_codec.cpp); then drop NXRT_MEDIA_MOVIE_SKIP from the defaults.
-7. Upscaling / AA, AMD only (user: RX 9070 XT + AMD CPU, port for personal use, no DLSS needed). The runtime already has FSR 3.1
-   through the FidelityFX API on Vulkan (gfx/extras/temporal_ffx.cpp): drop the FidelityFX SDK v2.x Vulkan DLLs
-   (amd_fidelityfx_loader_vk.dll + amd_fidelityfx_upscaler_vk.dll, MIT) into upscalerssr3\, set [upscale] mode = fsr3; it picks
-   the newest upscaler the DLL offers for the GPU, so FSR 4 (ML, RDNA4) comes for free if AMD's Vulkan DLL exposes it (check what
-   version it reports in the log; FSR 4 was DX12-first). Feed: the game's own DLSS call (do_evaluate_dlss) gives colour, depth and
-   motion vectors. Modes to offer: native AA (render 3840x2160, FSR as AA) and Quality (render 2560x1440 -> 4K, frees GPU time).
-   Check the jitter: the game only jitters when its DLSS path is on; FSR needs the jitter offsets (find them in the DLSS params).
+7. DONE (2026-11-08): FSR 3.1.4 replaces the game's DLSS step. temporal_ffx.cpp now drives the single-DLL FidelityFX API that games
+   ship (amd_fidelityfx_vk.dll, here copied from the user's Palworld install into game-build\build\release\upscalers\fsr3\; not in git):
+   old backend descriptor first for that DLL, and device functions it asks for resolved by hand (KHR names of core functions, no-op
+   AMD buffer markers / debug names). Game defaults (new `config_set_default`, under env and ini): [upscale] mode = fsr3,
+   [fefw] render_scale = 67 (2572x1446 -> 3840x2160, 60 fps; 100 = native + FSR AA, ~47 fps). FSR 4: needs AMD's FidelityFX SDK 2.x
+   loader + upscaler DLLs (download, ask the user); the code already picks the newest upscaler the DLL offers.
+   Leaf particles (item 1): the black flecks are leaf-shaped (textured), from emitters Dust_Papyrus_Ground / Dust_Small_Sparks /
+   Dust_Small_Ashes, drawn into a 70% particle buffer (t497 RGBA16F, cleared 0,0,0,1, blend src*a + dst*(1-a)) composited as
+   rgb + scene*a; that buffer's alpha reaches -2 (a source alpha of 3). Also hollow white rectangles (papyrus?). Ask the user to
+   compare with their emulator before changing anything (they may be ash and paper scraps by design).
 9. In-game settings menu (user's choice: own ImGui overlay like TotK Recomp's, opened with Esc; also a pad combo). Base:
    runtime/src/gfx/overlay.cpp (Dear ImGui). Tabs Screen / Game / Sound / Controls / Advanced; each option saved to fefw.ini and
    marked "after restart" when it cannot apply live. Options: game resolution ([fefw] render_width/height; live change needs the
