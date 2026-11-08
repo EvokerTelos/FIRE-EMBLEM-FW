@@ -41,6 +41,23 @@ the harness on the single block, then `--batch` on the dump. When a patch replac
 - IMAD.WIDE.U32 carry out, TEX.F16.RN (fp16 packed results), ATOMS.CAST.SPIN (0x38d with bits 87..88 = 3, returns 1 on success).
   The 0xf60 and CAST.SPIN decodes are inferred from how the code uses them, not checked against nvdisasm.
 
+## Reaching gameplay (2026-11-07)
+Runs with `NXRT_MEDIA_MOVIE_SKIP=1 NXRT_APPLET_SWKBD_PROMPT=0 NXRT_APPLET_SWKBD_TEXT=Tester` and scripted presses
+(`NXRT_BOOT_PRESS`, entries are processed in list order, so sort them by time): A at the autosave screen, PLUS to skip the scenes
+whose movie was skipped (date card, a black scene at ~60 s), A for dialogue, RIGHT then A through the character creation.
+It now gets through the prologue, character creation, name entry and into the next 3D scene (~190 s), then:
+- crash at ~265 s on a game worker thread (guest-84): `f_71005bca40+0x1d84` writes an unmapped heap address (0x79f0d4cae0),
+  frames 0x71005bcabc <- 0x71005bc8b0 <- 0x71005b9b00 ... (main is stripped). Not investigated yet.
+Graphics problems seen on the way (to fix next):
+- characters drawn cyan in the character creation (the 2D portrait has white hair and normal skin, the 3D model is cyan).
+  Likely the bindless samples that read 0 (task 1 below: per-material handle tables read with LDG), not checked yet.
+- black screens: the scenes whose AV1 movie is skipped stay black until PLUS (no AV1 decoder; the movie player samples the
+  decoder's images as NVN textures through nvnNativeImage*, not implemented). [media] av1_decoder = black is the start of that.
+- `sampled texture ... (RG8, target 4 cube, 16x16x6) has no view of the shader's type 3` on the bindless material shaders.
+Fixed on the way: PAC register forms and `br x30` returns in the lifter (setjmp trap, hand-written routines), SDK 22 nn::codec
+names, ILibraryAppletAccessor cmd 170. Symbolize sdk addresses with the .dynsym of game\dump\exefs\sdk (NSO header: dynstr/dynsym
+extents at 0x90/0x98 relative to .rodata, segments LZ4).
+
 ## Task 1 (next): bindless samples that read 0
 51 blocks (the material shaders with TXQ.B, and 1e1e3f3b) have bindless samples Ryujinx cannot resolve, so they read 0
 (translator message "Failed to find handle source for bindless access"): (a) the handle is the constant 0 (`MOV Rb, RZ` before
