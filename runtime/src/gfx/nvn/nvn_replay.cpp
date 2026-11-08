@@ -1442,6 +1442,12 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
                     if (buf) bi = {buf, 0, range};
                     break;
                 }
+                case NvnSource::ColorTransform: {
+                    VkDeviceSize range = 0;
+                    VkBuffer buf = color_transform_buffer(&range);
+                    if (buf) bi = {buf, 0, range};
+                    break;
+                }
                 case NvnSource::ConstantData: {
                     VkDeviceSize range = 0;
                     VkBuffer buf = constant_data_buffer(d.shader, &range);

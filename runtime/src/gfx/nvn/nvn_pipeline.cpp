@@ -70,6 +70,8 @@ nxrt::GaugeCounter g_pipeline_count{"nvn.pipelines"};   // live VkPipelines (gra
 std::unordered_map<const ShaderInfo*, std::pair<gfx::Buffer, VkDeviceSize>> g_const_bufs;
 gfx::Buffer g_driver_const;
 bool g_driver_const_made = false;
+gfx::Buffer g_color_transform;
+bool g_color_transform_made = false;
 // Counters mirrored at the sites that change the maps above (they are render thread only, so the gauge reads these instead).
 nxrt::GaugeCounter g_pipes_created{"nvn.pipelines_created"};     // ever; same events as counters().pipelines_created (shader parts included)
 nxrt::GaugeCounter g_gfx_keys{"nvn.pipeline_keys"};              // entries in g_gfx: one per graphics key tried (a failed build keeps its entry)
@@ -797,6 +799,21 @@ VkBuffer driver_constants_buffer(VkDeviceSize* range) {
     return g_driver_const.buffer;
 }
 
+// c[24]: the NVN2 fragment output colour transform (3x3 matrix in std140 rows at 0x00/0x10/0x20, vec3 offset at 0x30) the driver
+// supplies; the translator binds it as "<stage>_c24". The vi queries report an SDR display, so it is the identity.
+VkBuffer color_transform_buffer(VkDeviceSize* range) {
+    if (!g_color_transform_made) {
+        g_color_transform_made = true;
+        if (device().create_buffer(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, gfx::MemoryUse::Upload, &g_color_transform, "nvn c24") == VK_SUCCESS) {
+            std::memset(g_color_transform.mapped, 0, 256);
+            float* m = static_cast<float*>(g_color_transform.mapped);
+            m[0] = m[5] = m[10] = 1.0f;
+        }
+    }
+    *range = 256;
+    return g_color_transform.buffer;
+}
+
 size_t pipeline_count() { return static_cast<size_t>(g_pipeline_count.get()); }
 
 void module_cache_clear() {
@@ -870,6 +887,8 @@ void pipeline_shutdown() {
     g_const_bytes.sub(g_const_bytes.get());
     if (g_driver_const_made) device().destroy_buffer(g_driver_const);
     g_driver_const_made = false;
+    if (g_color_transform_made) device().destroy_buffer(g_color_transform);
+    g_color_transform_made = false;
     if (g_cache) vkDestroyPipelineCache(d, g_cache, nullptr);
     g_cache = VK_NULL_HANDLE;
     g_cache_tried = false;

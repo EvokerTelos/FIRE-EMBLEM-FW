@@ -364,8 +364,9 @@ void derive_meaning(DescriptorBinding& b, ShaderStage stage) {
         else if (b.set == 0 && b.binding >= 1) bank = int(b.binding) - 1 - stage_slot(stage) * 18;  // fallback
         m.bank = bank;
         m.source = bank == 0 ? NvnSource::DriverConstants : bank == 1 ? NvnSource::ConstantData
-                   : bank >= 3 ? NvnSource::UniformBlock : NvnSource::Unknown;
-        m.index = bank >= 3 ? bank - 3 : -1;
+                   : bank == 24 ? NvnSource::ColorTransform
+                   : bank >= 3 && bank <= 16 ? NvnSource::UniformBlock : NvnSource::Unknown;
+        m.index = bank >= 3 && bank <= 16 ? bank - 3 : -1;
         return;
     }
     if (b.type == DescriptorType::StorageBuffer) {
@@ -885,6 +886,7 @@ const char* source_name(NvnSource s) {
     case NvnSource::SamplerBinding: return "sampler binding";
     case NvnSource::ImageBinding: return "image binding";
     case NvnSource::HandleInUniform: return "handle in uniform block";
+    case NvnSource::ColorTransform: return "c[24] output colour transform";
     default: return "unknown";
     }
 }

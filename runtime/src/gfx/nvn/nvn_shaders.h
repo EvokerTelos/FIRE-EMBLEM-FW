@@ -111,6 +111,7 @@ enum class NvnSource : uint8_t {
     SamplerBinding,   // texture whose handle is c[2] byte 0x20 + 8n: nvnCommandBufferBindTexture(stage, n)
     ImageBinding,     // image whose handle is c[2] byte 0x120 + 8n: nvnCommandBufferBindImage(stage, n) (inferred)
     HandleInUniform,  // texture whose handle the game wrote into uniform block `index` (c[bank]), at byte word * 4
+    ColorTransform,   // c[24]: NVN2 fragment output colour transform the driver supplies (nvn2-cbank24-color-transform.patch)
 };
 
 struct NvnMeaning {
