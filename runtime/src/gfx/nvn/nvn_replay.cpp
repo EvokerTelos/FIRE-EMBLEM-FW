@@ -1122,6 +1122,20 @@ bool compute_direct_on() {
     static const bool on = nxrt::config_get_bool("nvn", "compute_direct", true);
     return on;
 }
+// [nvn] compute_shadow_small (default 4 workgroups, 0 = off) and compute_shadow_small_bytes (default 16 KiB): a dispatch of at most that
+// many workgroups binds ranges up to that size straight from the pool. Fortune's Weave updates each particle emitter with its own 1x1x1
+// dispatch over ~10 buffers of 96..1872 bytes (a840b7d9, 256 a frame): the copies in and out of device-local memory and their barriers
+// cost more than the few PCIe reads of one workgroup (about 2 ms a frame at 4K). Large dispatches (histogram atomics) keep their shadows.
+bool g_small_dispatch = false;
+uint64_t g_sh_small = 0;
+bool small_dispatch(uint32_t x, uint32_t y, uint32_t z, bool indirect) {
+    static const uint64_t n = static_cast<uint64_t>(std::max<int64_t>(0, nxrt::config_get_int("nvn", "compute_shadow_small", 4)));
+    return n && !indirect && static_cast<uint64_t>(x) * y * z <= n;
+}
+VkDeviceSize small_bytes() {
+    static const VkDeviceSize b = static_cast<VkDeviceSize>(std::max<int64_t>(0, nxrt::config_get_int("nvn", "compute_shadow_small_bytes", 16384)));
+    return b;
+}
 
 // Every result still only in the pool copy goes back to the pool (in queue order, before what is recorded next).
 void flush_compute_out(int why) {
@@ -1327,6 +1341,7 @@ BufRef shadow_of(uint64_t addr, VkDeviceSize size, const BufRef& host, bool writ
     }
     if (!out_lazy()) compute_out_guard(addr, size, kOutDispatch);
     if (size > kShadowMax) { compute_out_guard(addr, size, kOutDispatch); return host; }
+    if (g_small_dispatch && size <= small_bytes()) { compute_out_guard(addr, size, kOutDispatch); ++g_sh_small; return host; }
     const MirrorSpan ms = mirror_span(addr, size);    // pages holding a compute result count as current there (compute_out_lazy)
     if (ms.buf && compute_direct_on()) {
         bool ok = ms.valid;
@@ -1404,11 +1419,11 @@ void shadows_after_dispatch() {
     if (F->serial - last_sweep > 600) {
         last_sweep = F->serial;
         NXLOG_I("nvn.replay", "compute shadows: %llu bound (%llu from the pool copy, %llu with no copy), in from the copy %llu MiB, in from the pool %llu MiB, out %llu MiB; "
-                "direct to the pool copy %llu (%llu after filling pages, in %llu MiB, out %llu MiB in %llu flushes, %llu writes merged)",
+                "direct to the pool copy %llu (%llu after filling pages, in %llu MiB, out %llu MiB in %llu flushes, %llu writes merged); small dispatch ranges from the pool %llu",
                 (unsigned long long)g_sh_uses, (unsigned long long)g_sh_from_mirror, (unsigned long long)g_sh_no_span, (unsigned long long)(g_sh_bytes_mirror >> 20),
                 (unsigned long long)(g_sh_bytes_pool >> 20), (unsigned long long)(g_sh_bytes_out >> 20), (unsigned long long)g_sh_direct,
                 (unsigned long long)g_sh_direct_filled, (unsigned long long)(g_sh_bytes_fill >> 20), (unsigned long long)(out_bytes_total() >> 20),
-                (unsigned long long)g_sh_flushes, (unsigned long long)g_sh_merged);
+                (unsigned long long)g_sh_flushes, (unsigned long long)g_sh_merged, (unsigned long long)g_sh_small);
         for (auto it = g_shadows.begin(); it != g_shadows.end();) {
             if (F->serial - it->second.last > 600) {
                 gfx::Buffer old = it->second.buf;
@@ -2899,6 +2914,7 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     support_for_draw(*pl, true);
     const BufRef ind = indirect ? held_or_pool(indirect, 12, kOutIndirect, true) : BufRef{};   // arguments a dispatch wrote: from the copy
     g_shadowing = compute_shadows_on();
+    g_small_dispatch = small_dispatch(x, y, z, indirect != 0);
     g_shadow_uses.clear();
     g_sh_barrier = g_sh_copied = false;
     bind_sets(*pl, VK_PIPELINE_BIND_POINT_COMPUTE);

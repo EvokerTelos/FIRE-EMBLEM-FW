@@ -84,6 +84,15 @@ extents at 0x90/0x98 relative to .rodata, segments LZ4).
   buffer shadow copies ("shadow in"/"shadow out", ~97 ms/s) and cs a840b7d9 (53 ms/s). To hold a locked 60: cut the shadow copies
   (compute_shadows_on, nvn_replay.cpp) or skip probe refiltering when the sky did not change.
 
+## Done 2026-11-08: locked 60 fps at 4K
+- Not GPU pixels but two runtime costs: (1) the render thread spent ~20% in new_servable (out_draw_bindings, every draw's buffers
+  checked page by page against the write watch): now word-wise (`ww::all_valid_or_armed`); 1440p went 57.6 -> 60. (2) a840b7d9, the
+  particle emitter update, is 256 dispatches of 1x1x1 a frame over ~10 buffers of 96..1872 bytes; each range was copied to and from
+  device-local memory with barriers. [nvn] compute_shadow_small (4 workgroups) / compute_shadow_small_bytes (16 KiB): such dispatches
+  bind small ranges straight from the pool. 3840x2160 + 4096 shadows now 60.0 fps (1% low ~54) in the tutorial map.
+- Profiling: `NXRT_PROF_SAMPLE_HZ=500 NXRT_PROF_SAMPLE_THREADS=nvn-render,main NXRT_PROF_SAMPLE_OUT=<file>` (folded stacks), GPU passes
+  as above. Some runs dip to ~27 fps for 10..20 s with large GPU sync waits in the same scene (not VRAM: ~7 of 16 GB); not explained yet.
+
 ## Next for "4K 60 fps, max quality"
 - Perf headroom at 4K (above). DLSS: the TaskDLSS path is now a same-size copy; FSR/TAA-style AA would be the quality step.
 - Remaining visual issues: some falling-leaf particles are black (layer t500, fs 67a08fc6 / c2bc1273 / b1918ad5); the unit portrait

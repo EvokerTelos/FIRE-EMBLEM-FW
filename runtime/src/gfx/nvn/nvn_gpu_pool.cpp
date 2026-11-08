@@ -1064,12 +1064,8 @@ void out_register(Mirror* m) {
     std::call_once(once, [] { mem::ww::set_guard_handler([](uint64_t addr) { out_fetch(addr, kPageBytes, true); }); });
 }
 
-bool new_servable(const Mirror& m, uint64_t first, uint64_t last) {
-    for (uint64_t p = first; p <= last; ++p) {
-        if (page_valid(m, p)) continue;
-        if (!new_get(m, p) || !mem::ww::all_armed(m.ww, p, 1)) return false;   // armed: the CPU has not written it since
-    }
-    return true;
+bool new_servable(const Mirror& m, uint64_t first, uint64_t last) {   // per page: valid, or newer in the copy and armed (the CPU has not
+    return mem::ww::all_valid_or_armed(m.ww, m.gpu_new.get(), first, last - first + 1);   // written it since); 64 pages a step
 }
 
 bool overlaps(const OutEntry& e, uint64_t lo, uint64_t hi) {      // page granular: [lo, hi) of addresses

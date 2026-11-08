@@ -14,6 +14,7 @@
 //    (PAGE_NOACCESS, the read guards below). Callers hold an OsReadScope over the source first.
 //  * Granularity is the 4 KiB page.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -98,6 +99,8 @@ int describe(uint64_t addr, char* out, size_t n);
 void unguard(Region* r, uint64_t first, uint64_t count);
 // Owner: true when every page of the run is still armed (read-only or guarded: the CPU did not write it since it was armed).
 bool all_armed(const Region* r, uint64_t first, uint64_t count);
+// Every page of [first, first + count) is valid, or set in `extra` (a caller's bitmap over the same pages) and armed: word by word.
+bool all_valid_or_armed(const Region* r, const std::atomic<uint64_t>* extra, uint64_t first, uint64_t count);
 uint64_t guard_faults();   // accesses that hit a guarded page (statistics)
 
 uint64_t faults();     // write faults handled so far (statistics)
