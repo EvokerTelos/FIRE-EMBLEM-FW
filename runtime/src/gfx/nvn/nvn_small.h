@@ -38,6 +38,9 @@ enum class SmallKind : uint32_t {
 
 constexpr uint32_t kPushStages = 9;        // NVN2 has 9 stage slots (mask 0x1FF, docs/nvn2_abi.md section 5)
 constexpr uint32_t kPushAreaBytes = 256;   // the sdk clamps a push to 256 bytes (0x100) and works in 32-bit words
+constexpr uint32_t kPushCompute = 8;       // the slot of nvnCommandBufferPushComputeConstants (graphics stages use 0..7)
+constexpr uint32_t kComputePushInC0 = 0x10;   // where compute shaders read the push area in c[0]
+constexpr uint32_t kComputePushBytes = 0x70;  // its size (the 0x80-byte table head less 0x10)
 constexpr uint32_t kMaxViewportsSmall = 16;
 
 // The replay's copy of this family's GPU state. It persists across lists like the other GPU state (nvn_replay.cpp GState).

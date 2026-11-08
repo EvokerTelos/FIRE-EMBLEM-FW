@@ -1829,6 +1829,7 @@ void tex_sparse_before_copy(Texture* t, uint32_t layer, uint32_t level) {
 void tex_mark_gpu_written(Texture* t) {
     TexGpu* g = tex_or_null(t);
     if (!g) return;
+    if (!g->gpu_written) tev(t, "gpu_written", 0, 0);
     g->gpu_written = true;
     t->cpu_dirty.store(false);                   // the GPU data is the newer one until the CPU writes again
 }

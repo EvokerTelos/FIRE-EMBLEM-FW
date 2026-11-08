@@ -6,6 +6,8 @@
 #include <cmath>
 
 #include "nvn_core.h"
+#include <atomic>
+#include "nxrt/log.h"
 
 namespace nxrt::nvn::be {
 namespace {

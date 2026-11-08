@@ -78,11 +78,14 @@ void nvnCommandBufferPushGraphicsConstants(NVNcommandBuffer* c, int stage, int o
 void nvnCommandBufferPushGraphicsConstantsDeferred(NVNcommandBuffer* c, int stage, int offset, int size, NVNbufferAddress address) {
     push_deferred(c, static_cast<uint32_t>(stage) & 7u, offset, size, address);
 }
-void nvnCommandBufferPushComputeConstants(NVNcommandBuffer* c, int stage, int offset, int size, const void* data) {
-    push_inline(c, static_cast<uint32_t>(stage), offset, size, data);
+// Compute pushes go to their own slot (kPushCompute): FEFW passes stage 0 to these, the slot vertex pushes use. The translated compute
+// shaders read them in c[0] from byte 0x10 (the 0x80-byte head of the NVN2 compute c[0] table: 0x10 bytes, then the 0x70-byte push
+// area; FEFW's sky cube shader 84885af7 reads its 3x4 matrix at c[0] + 0x10..0x3c, pushed as 0x70 bytes at offset 0), see build_set.
+void nvnCommandBufferPushComputeConstants(NVNcommandBuffer* c, int /*stage*/, int offset, int size, const void* data) {
+    push_inline(c, kPushCompute, offset, size, data);
 }
-void nvnCommandBufferPushComputeConstantsDeferred(NVNcommandBuffer* c, int stage, int offset, int size, NVNbufferAddress address) {
-    push_deferred(c, static_cast<uint32_t>(stage), offset, size, address);
+void nvnCommandBufferPushComputeConstantsDeferred(NVNcommandBuffer* c, int /*stage*/, int offset, int size, NVNbufferAddress address) {
+    push_deferred(c, kPushCompute, offset, size, address);
 }
 
 // ---- variable rate shading ----------------------------------------------------------------------------------------------------------

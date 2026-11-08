@@ -123,6 +123,7 @@ struct NvnMeaning {
     int sb_slot = -1;    // storage buffers: the translator's slot (order found), from the name "<stage>_s<slot>"
     int c0_offset = -1;  // storage buffers: byte offset of the descriptor in c[0]; -1 = not known (see apply_harness)
     bool default_bank = false;  // texture handle bank given by the translator as "the texture bank" (-1), i.e. c[2]
+    bool from_image = false;    // SamplerBinding read from an image slot (NVN2 compute TEX on an image handle): index is an image binding
 };
 
 struct DescriptorBinding {

@@ -679,7 +679,10 @@ TexResolved resolve_texture_handle(uint64_t handle);
 TexResolved resolve_texture(const BindingDesc& d) {
     const DescriptorBinding& b = d.shader->refl.bindings[d.index];
     uint64_t handle = 0;
-    if (b.nvn.source == NvnSource::SamplerBinding) {
+    if (b.nvn.source == NvnSource::SamplerBinding && b.nvn.from_image) {
+        const int idx = b.nvn.index;     // an image binding's handle: the texture id only (its sampler part, 0, picks the default)
+        if (idx >= 0 && idx < 16) handle = S.img[d.nvn_stage][idx];
+    } else if (b.nvn.source == NvnSource::SamplerBinding) {
         const int idx = b.nvn.index;
         if (idx >= 0 && idx < 64) handle = S.tex[d.nvn_stage][idx];
     } else if (b.nvn.source == NvnSource::HandleInUniform) {
@@ -980,6 +983,10 @@ void prepare_textures(const ProgLayout& pl) {
         if (d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
             TexResolved r = resolve_image(d);
             if (!r.tex || !tex_gpu(r.tex) || !tex_has_storage(r.tex)) continue;
+            // [nvn] trace_tex_events: which shader binds the texture as a storage image, and the view (layers / levels) it asks for
+            tev(r.tex, ("storage_bound by " + d.shader->hash).c_str(),
+                r.has_view && r.view.has_layers ? (static_cast<uint64_t>(r.view.min_layer) << 32) | static_cast<uint32_t>(r.view.num_layers) : ~0ull,
+                r.has_view && r.view.has_levels ? (static_cast<uint64_t>(r.view.min_level) << 32) | static_cast<uint32_t>(r.view.num_levels) : ~0ull);
             if (r.tex->cpu_dirty.load() || tex_layout(r.tex) != VK_IMAGE_LAYOUT_GENERAL || tex_scale(r.tex) != 1.0f) need_storage.push_back(r.tex);
             continue;
         }
@@ -1456,6 +1463,19 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
                                         : VkDescriptorBufferInfo{g_support.buffer, g_support.offset, sizeof(SupportBuffer)};
                     break;
                 case NvnSource::DriverConstants: {
+                    if (d.nvn_stage == kCompute) {
+                        // NVN2 compute: c[0] begins with the program's table head, whose bytes 0x10..0x80 are the push constants
+                        // (nvnCommandBufferPushComputeConstants, nvn_small.h kComputePushInC0): a copy per dispatch, zero elsewhere
+                        // (the table's descriptors are read through the translator's storage / texture bindings, not from here)
+                        constexpr VkDeviceSize kBytes = 0x1000;
+                        UploadAlloc u = F->upload(kBytes, std::max<VkDeviceSize>(device().properties().limits.minUniformBufferOffsetAlignment, 256));
+                        if (u) {
+                            std::memset(u.ptr, 0, static_cast<size_t>(kBytes));
+                            std::memcpy(static_cast<uint8_t*>(u.ptr) + kComputePushInC0, S.small.push[kPushCompute], kComputePushBytes);
+                            bi = {u.buffer, u.offset, kBytes};
+                            break;
+                        }
+                    }
                     VkDeviceSize range = 0;
                     VkBuffer buf = driver_constants_buffer(&range);
                     if (buf) bi = {buf, 0, range};
@@ -1570,6 +1590,28 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
           for (uint32_t elem = 0; elem < elems; ++elem) {
             VkDescriptorImageInfo ii = {dummy_sampler(), dummy_view(view_type_for(b), b.image.depth), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             TexResolved r = elems > 1 ? resolve_texture_element(d, elem) : resolve_texture(d);
+            {   // [nvn] trace_bindings = "eaac1801,8ab94383": what each sampled binding of those shaders resolves to (first 8 times each)
+                static const std::string tb = nxrt::config_get_str("nvn", "trace_bindings", "");
+                if (!tb.empty() && elems == 1) {
+                    bool match = false;
+                    for (size_t i = 0; i < tb.size() && !match;) {
+                        size_t j = tb.find(',', i);
+                        if (j == std::string::npos) j = tb.size();
+                        match = j > i && d.shader->hash.compare(0, j - i, tb, i, j - i) == 0;
+                        i = j + 1;
+                    }
+                    static std::unordered_map<std::string, int> n;
+                    if (match && n[d.shader->hash + b.name]++ < 8) {
+                        char buf[96] = "-";
+                        if (r.tex) tex_desc(r.tex, buf, sizeof buf);
+                        NXLOG_I(kTag, "bindings %s %s (src %d idx %d img %d): %s view layers %d+%d levels %d+%d layout %d", d.shader->hash.c_str(), b.name.c_str(),
+                                static_cast<int>(b.nvn.source), b.nvn.index, b.nvn.from_image ? 1 : 0, buf,
+                                r.has_view && r.view.has_layers ? r.view.min_layer : -1, r.has_view && r.view.has_layers ? r.view.num_layers : -1,
+                                r.has_view && r.view.has_levels ? r.view.min_level : -1, r.has_view && r.view.has_levels ? r.view.num_levels : -1,
+                                r.tex ? static_cast<int>(tex_layout(r.tex)) : -1);
+                    }
+                }
+            }
             // array elements are not seen by samples_depth_target / feedback_prepare: the depth target gets the dummy there
             if (elems > 1 && r.tex && shares_image(r.tex, S.depth_tex.get())) r.tex = nullptr;
             if (r.tex) {
@@ -1596,7 +1638,8 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
                 VkImageView v = tex_sampled_view(r.tex, make_request(b, r));
                 if (v) {
                     ii.imageView = v;
-                    ii.imageLayout = tex_sampled_layout(r.tex);
+                    // a texture the same dispatch also writes as a storage image (from_image samplers) is in GENERAL: say so
+                    ii.imageLayout = tex_layout(r.tex) == VK_IMAGE_LAYOUT_GENERAL ? VK_IMAGE_LAYOUT_GENERAL : tex_sampled_layout(r.tex);
                     if (r.has_sampler) ii.sampler = sampler_for(r.smp);
                     if (r.tex == g_su_tex && g_su_view) {            // the upscaled scene replaces the small one for this draw (S14)
                         ii.imageView = g_su_view;
@@ -1625,6 +1668,25 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
             mix(reinterpret_cast<uint64_t>(ii.imageView));
             mix(reinterpret_cast<uint64_t>(ii.sampler));
             mix(static_cast<uint64_t>(ii.imageLayout));
+          }
+          if (elems > 1) {   // what an array of handles resolved to: once per shader binding (and again when the count changes)
+              static std::unordered_map<std::string, int> seen;
+              int resolved = 0, first_k = -1;
+              std::string kinds;
+              for (uint32_t k = 0; k < elems; ++k) {
+                  const TexResolved rk = resolve_texture_element(d, k);
+                  if (!rk.tex) continue;
+                  if (first_k < 0) first_k = static_cast<int>(k);
+                  if (resolved++ < 6) kinds += " " + std::to_string(k) + ":t" + std::to_string(rk.tex->id) + "/tg" + std::to_string(rk.tex->b.target) +
+                                               (iinfo[first_ii + k].imageView == dummy_view(view_type_for(b), b.image.depth) ? "(dummy)" : "");
+              }
+              const std::string key = d.shader->hash + " " + b.name;
+              auto it = seen.find(key);
+              if (it == seen.end() || it->second != resolved) {
+                  seen[key] = resolved;
+                  NXLOG_I(kTag, "texture array %s binding %s (view type %d): %d of %u elements resolve:%s", d.shader->hash.c_str(), b.name.c_str(),
+                          static_cast<int>(view_type_for(b)), resolved, elems, kinds.c_str());
+              }
           }
           w.descriptorCount = elems;
           w.pImageInfo = &iinfo[first_ii];
@@ -3977,6 +4039,29 @@ void trace_dump_targets() {
         NXLOG_I("nvn.trace", "snapshot after draw %d: %s -> %s: %s", sn.draw, sn.desc.c_str(), ok ? sn.name.c_str() : "(not written)", ok ? stats.c_str() : "");
     }
     g_trace_snaps.clear();
+    {   // [nvn] trace_dump_ids = "432,477,54": these textures too (by id, as the logs name them), whatever the frame did with them
+        static const std::string ids = nxrt::config_get_str("nvn", "trace_dump_ids", "");
+        if (!ids.empty() && !g_trace_targets.empty()) {
+            std::vector<uint64_t> want;
+            for (size_t i = 0; i < ids.size();) {
+                size_t j = ids.find(',', i);
+                if (j == std::string::npos) j = ids.size();
+                want.push_back(std::strtoull(ids.substr(i, j - i).c_str(), nullptr, 10));
+                i = j + 1;
+            }
+            auto pred = [](const Texture& t, void* u) {
+                const auto& w = *static_cast<std::vector<uint64_t>*>(u);
+                return std::find(w.begin(), w.end(), static_cast<uint64_t>(t.id)) != w.end();
+            };
+            for (const Ref<Texture>& t : texture_registry_collect(pred, &want)) {
+                char buf[96];
+                std::string stats;
+                const std::string png = std::string("trace_id") + std::to_string(t->id) + "_" + (t->fmt ? t->fmt->name : "x") + ".png";
+                const bool ok = dump_texture(t.get(), png, &stats);
+                NXLOG_I("nvn.trace", "texture %s -> %s: %s", tex_desc(t.get(), buf, sizeof buf), ok ? png.c_str() : "(not dumped)", ok ? stats.c_str() : "");
+            }
+        }
+    }
     if (g_trace_targets.empty()) return;
     std::vector<Ref<Texture>> list;
     list.swap(g_trace_targets);
