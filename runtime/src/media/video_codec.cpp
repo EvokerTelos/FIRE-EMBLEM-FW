@@ -198,7 +198,12 @@ struct Decoder {
     std::vector<uint8_t> last;                            // last decoded picture (NV12) for the end-of-stream buffer
     uint16_t last_w = 0, last_h = 0;
     uint64_t pictures = 0;
+    uint16_t max_w = 0, max_h = 0;                        // the size the game initialised the decoder with
 };
+
+// codec values: 8 VP8, 9 VP9 (libvpx), 1 AV1. AV1 has no host decoder yet: every submitted temporal unit yields one black picture at
+// the decoder's initial size with its pts, so the movie player runs its course (timing, end of stream) and the game goes on.
+constexpr int kCodecAv1 = 1;
 
 std::mutex g_reg_mu;
 std::map<uint32_t, std::shared_ptr<Decoder>> g_decoders;
@@ -219,6 +224,7 @@ bool fence_done(uint64_t w0, uint64_t seq) {
 }
 
 bool vpx_open(Decoder& d) {
+    if (d.codec == kCodecAv1) return true;   // no libvpx context (black pictures, see kCodecAv1)
     vpx_codec_dec_cfg_t cfg{};
     cfg.threads = static_cast<unsigned>(g_threads);
     const vpx_codec_err_t e = vpx_codec_dec_init(&d.vpx, d.codec == 8 ? vpx_codec_vp8_dx() : vpx_codec_vp9_dx(), &cfg, 0);
@@ -325,6 +331,24 @@ void after_change(::Ctx* c, Decoder& d, bool fences) {
 }
 
 void decode_into(Decoder& d, const uint8_t* data, size_t size, int64_t pts) {
+    if (d.codec == kCodecAv1) {
+        if (!size || !data) return;
+        Picture p;
+        p.w = static_cast<uint16_t>((std::max<uint16_t>(d.max_w, 2) + 1) & ~1u);
+        p.h = static_cast<uint16_t>((std::max<uint16_t>(d.max_h, 2) + 1) & ~1u);
+        p.pts = pts;
+        const size_t luma = static_cast<size_t>(p.w) * p.h;
+        p.nv12.assign(luma + luma / 2, 128);
+        std::memset(p.nv12.data(), 16, luma);   // video-range black
+        if (d.pictures++ == 0)
+            NXLOG_W("vcodec", "decoder %u: AV1 has no host decoder yet: the movie plays as black pictures (%ux%u)", d.id, p.w, p.h);
+        d.last = p.nv12;
+        d.last_w = p.w;
+        d.last_h = p.h;
+        d.ready.push_back(std::move(p));
+        s_decoded++;
+        return;
+    }
     if (!d.vpx_ok && !vpx_open(d)) return;
     const vpx_codec_err_t e = vpx_codec_decode(&d.vpx, data, static_cast<unsigned>(size), nullptr, 0);
     if (e != VPX_CODEC_OK)
@@ -452,6 +476,8 @@ void create_decoder(::Ctx* c, int codec, uint32_t w, uint32_t h) {
     const uint64_t g = A(0);
     auto d = std::make_shared<Decoder>();
     d->codec = codec;
+    d->max_w = static_cast<uint16_t>(w);
+    d->max_h = static_cast<uint16_t>(h);
     {
         std::lock_guard<std::mutex> lk(g_reg_mu);
         d->id = g_next_id++;
@@ -461,8 +487,23 @@ void create_decoder(::Ctx* c, int codec, uint32_t w, uint32_t h) {
     wr64(g, d->id);
     wr64(g + 8, kDecMarker);
     s_created++;
-    NXLOG_I("vcodec", "VP%d decoder %u created (%ux%u max) on libvpx %s", codec, d->id, w, h, vpx_codec_version_str());
+    if (codec == kCodecAv1) NXLOG_I("vcodec", "AV1 decoder %u created (%ux%u max), black pictures", d->id, w, h);
+    else NXLOG_I("vcodec", "VP%d decoder %u created (%ux%u max) on libvpx %s", codec, d->id, w, h, vpx_codec_version_str());
     RET(0);
+}
+// SDK 22 *ByTransferMemory(dec, mem, size, work size?, w, h, ...): the same argument positions as the transfer-memory VP9 form
+// [media] av1_decoder = fail (default) | black. fail: AV1 initialisation answers an error, as before (the game's movie player decides
+// what to do). black: a decoder that yields black pictures (needs GPU output through GetDecoderImagePoolNativeImageHandle for
+// players that sample the decoder's images as NVN textures, which is not implemented yet).
+bool g_av1_black = false;
+void unsupported_codec(::Ctx* c);
+void init_av1_tm(::Ctx* c) {
+    if (!g_av1_black) { unsupported_codec(c); return; }
+    create_decoder(c, kCodecAv1, static_cast<uint16_t>(A(4)), static_cast<uint16_t>(A(5)));
+}
+void init_av1_rm(::Ctx* c) {
+    if (!g_av1_black) { unsupported_codec(c); return; }
+    create_decoder(c, kCodecAv1, static_cast<uint16_t>(A(2)), static_cast<uint16_t>(A(3)));
 }
 void init_vp9_tm(::Ctx* c) { create_decoder(c, 9, static_cast<uint16_t>(A(4)), static_cast<uint16_t>(A(5))); }
 void init_vp9_rm(::Ctx* c) { create_decoder(c, 9, static_cast<uint16_t>(A(2)), static_cast<uint16_t>(A(3))); }
@@ -564,6 +605,24 @@ void submission_event(::Ctx* c) {   // (SystemEventType** out, dec)
         if (started) gcall(c, os().signal_sysevent, ev);   // asked for after Start: input is accepted now (else Start signals it)
     }
     if (A(0)) wr64(A(0), ev);
+    RET(0);
+}
+// SDK 22 GetAv1DecoderSubmissionReadyEvent(dec) returns the SystemEventType* instead of writing it through an out pointer.
+void submission_event_ret(::Ctx* c) {
+    uint64_t ev = 0;
+    c->x[1] = c->x[0];
+    c->x[0] = reinterpret_cast<uint64_t>(&ev);
+    submission_event(c);
+    RET(ev);
+}
+void unregister_buffer(::Ctx* c) {   // (dec, index): SDK 22
+    auto d = dec_of(A(0));
+    if (d) {
+        std::lock_guard<std::mutex> lk(d->mu);
+        const uint32_t index = static_cast<uint32_t>(A(1));
+        d->pools.erase(index);
+        d->free.erase(std::remove(d->free.begin(), d->free.end(), index), d->free.end());
+    }
     RET(0);
 }
 void submit(::Ctx* c) {   // (u64* out, dec, data, size, pts, eos)
@@ -799,6 +858,14 @@ void tr_count(::Ctx* c) {
     int32_t k = -1;
     if (out) std::memcpy(&k, reinterpret_cast<const void*>(out), 4);
     if (n <= 8 || r) NXLOG_I("movie.trace", "MediaExtractor::GetTrackCount -> %d tracks, 0x%x", k, r);
+    // [media] movie_skip = 1: every movie reports no track, which the movie players take as "cannot open" and skip (for games whose
+    // movies need a decoder the host does not have yet, e.g. Fortune's Weave's AV1 movies sampled as NVN textures)
+    static const bool skip = config_get_bool("media", "movie_skip", false);
+    if (skip && out && r == 0) {
+        const int32_t zero = 0;
+        std::memcpy(reinterpret_cast<void*>(out), &zero, 4);
+        if (n <= 8) NXLOG_I("movie.trace", "[media] movie_skip: the movie reports 0 tracks (was %d)", k);
+    }
 }
 void tr_props(::Ctx* c) {
     const int32_t track = static_cast<int32_t>(A(2));
@@ -834,6 +901,10 @@ const Import kImports[] = {
     {"_ZN2nn5codec3sdk34MakeDecodeImagePreferenceForCompatEttNS0_24VideoDecoderOutputFormatENS0_9CodecModeE", make_pref},
     {"_ZN2nn5codec31CalculateDecoderImagePoolBufferEPmS1_RKNS0_27VideoDecoderImagePreferenceEj", calc_pool},
     {"_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEjNS0_9CodecModeE", init_pool},
+    // SDK 22: the preference takes an ImageTilingMode where it took a CodecMode, and the pool lost its trailing CodecMode (the handlers
+    // read neither)
+    {"_ZN2nn5codec25MakeDecodeImagePreferenceEttNS0_24VideoDecoderOutputFormatENS0_15ImageTilingModeE", make_pref},
+    {"_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEj", init_pool},
     {"_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeE", fini_pool},
     {"_ZN2nn5codec26ReadDecoderOutputImageNv12EPKNS0_25VideoDecoderImagePoolTypeEjttttPvmmS4_mm", read_nv12},
     {"_ZN2nn5codec26ReadDecoderOutputImageRgbaEPKNS0_25VideoDecoderImagePoolTypeEjttttPvmm", read_rgba},
@@ -873,8 +944,26 @@ const Import kImports[] = {
     // H.264 / AV1: not decoded here (a clear error instead of the console driver path)
     {"_ZN2nn5codec21InitializeH264DecoderEPNS0_15H264DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatEPKvm", unsupported_codec},
     {"_ZN2nn5codec21InitializeH264DecoderEPNS0_15H264DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatEPKvm", unsupported_codec},
-    {"_ZN2nn5codec20InitializeAv1DecoderEPNS0_14Av1DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE", unsupported_codec},
-    {"_ZN2nn5codec20InitializeAv1DecoderEPNS0_14Av1DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE", unsupported_codec},
+    {"_ZN2nn5codec20InitializeAv1DecoderEPNS0_14Av1DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE", init_av1_tm},
+    {"_ZN2nn5codec20InitializeAv1DecoderEPNS0_14Av1DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatE", init_av1_rm},
+    // SDK 22 (Fortune's Weave): AV1 decoders (black pictures, kCodecAv1) and the *ByTransferMemory / *ByRemoteMemory initialisers, whose
+    // extra VideoDecoderOutputMode argument comes after the ones the older forms read
+    {"_ZN2nn5codec36InitializeAv1DecoderByTransferMemoryEPNS0_14Av1DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE", init_av1_tm},
+    {"_ZN2nn5codec34InitializeAv1DecoderByRemoteMemoryEPNS0_14Av1DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE", init_av1_rm},
+    {"_ZN2nn5codec18FinalizeAv1DecoderEPNS0_14Av1DecoderTypeE", finalize_decoder},
+    {"_ZN2nn5codec24RegisterAv1DecoderBufferEPNS0_14Av1DecoderTypeEjPNS0_25VideoDecoderImagePoolTypeEj", register_buffer},
+    {"_ZN2nn5codec26UnregisterAv1DecoderBufferEPNS0_14Av1DecoderTypeEj", unregister_buffer},
+    {"_ZN2nn5codec15StartAv1DecoderEPNS0_14Av1DecoderTypeE", start_decoder},
+    {"_ZN2nn5codec14StopAv1DecoderEPNS0_14Av1DecoderTypeE", stop_decoder},
+    {"_ZN2nn5codec15FlushAv1DecoderEPNS0_14Av1DecoderTypeE", flush_decoder},
+    {"_ZN2nn5codec33GetAv1DecoderSubmissionReadyEventEPNS0_14Av1DecoderTypeE", submission_event_ret},
+    {"_ZN2nn5codec27SubmitAv1DecoderInputBufferEPmPNS0_14Av1DecoderTypeEPKvmNS_8TimeSpanEb", submit},
+    {"_ZN2nn5codec29AcquireAv1DecoderOutputBufferEPjPNS_2gs16NativeSyncHandleEPNS0_14Av1DecoderTypeE", acquire_output},
+    {"_ZN2nn5codec29ReleaseAv1DecoderOutputBufferEPNS0_14Av1DecoderTypeEjNS_2gs16NativeSyncHandleE", release_output},
+    {"_ZN2nn5codec35GetAv1DecoderOutputBufferPropertiesEPtS1_S1_S1_PNS_8TimeSpanEPbPNS0_14Av1DecoderTypeEj", props},
+    {"_ZN2nn5codec36InitializeVp9DecoderByTransferMemoryEPNS0_14Vp9DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE", init_vp9_tm},
+    {"_ZN2nn5codec36InitializeVp8DecoderByTransferMemoryEPNS0_14Vp8DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeE", init_vp8_tm},
+    {"_ZN2nn5codec37InitializeH264DecoderByTransferMemoryEPNS0_15H264DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeEPKvm", unsupported_codec},
     // fences
     {"_ZN2nn6syncpt3sdk20CreateSyncPointEventEPNS1_18SyncPointEventTypeE", sp_create},
     {"_ZN2nn6syncpt3sdk21DestroySyncPointEventEPNS1_18SyncPointEventTypeE", sp_destroy},
@@ -899,6 +988,7 @@ bool install_video_codec_hle() {
         }
         g_log = config_get_bool("media", "video_decoder_log", false);
         g_threads = static_cast<int>(std::clamp<int64_t>(config_get_int("media", "video_decoder_threads", 4), 1, 16));
+        g_av1_black = config_get_str("media", "av1_decoder", "fail") == "black";
         for (const Import& im : kImports) {
             hle_register(im.name, im.fn);
             module_override_symbol(im.name);
