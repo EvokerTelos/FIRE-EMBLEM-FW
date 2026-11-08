@@ -31,6 +31,7 @@ constexpr std::size_t kRing = 8192;         // frame intervals kept for stats()
 
 struct FrameLimiter::Impl {
     std::atomic<double> target_fps{0.0};
+    std::atomic<double> game_fps{0.0};
     std::atomic<FrameLimiter::PreFrameFn> pre_fn{nullptr};
     std::atomic<void*> pre_user{nullptr};
     HANDLE timer = nullptr;  // high-resolution waitable timer; null means the Sleep(1) coarse wait
@@ -120,6 +121,15 @@ void FrameLimiter::set_target_fps(double fps) { impl_->target_fps.store(fps > 0.
 
 double FrameLimiter::target_fps() const { return impl_->target_fps.load(); }
 
+void FrameLimiter::set_game_fps(double fps) { impl_->game_fps.store(fps > 0.0 ? fps : 0.0, std::memory_order_relaxed); }
+
+double FrameLimiter::game_fps() const { return impl_->game_fps.load(std::memory_order_relaxed); }
+
+double FrameLimiter::effective_fps() const {
+    const double t = impl_->target_fps.load(), g = impl_->game_fps.load(std::memory_order_relaxed);
+    return g > 0.0 && !(t > 0.0 && t <= g) ? g : t;
+}
+
 void FrameLimiter::set_pre_frame_hook(PreFrameFn fn, void* user) {
     impl_->pre_user.store(user, std::memory_order_relaxed);
     impl_->pre_fn.store(fn, std::memory_order_release);
@@ -136,14 +146,17 @@ uint64_t FrameLimiter::begin_frame() {
 
 namespace {
 std::atomic<bool> g_unpaced{false};
+std::atomic<double> g_interval_hz{0.0};
 }
 void frame_limiter_set_unpaced(bool on) { g_unpaced.store(on, std::memory_order_relaxed); }
 bool frame_limiter_unpaced() { return g_unpaced.load(std::memory_order_relaxed); }
+void set_present_interval_hz(double hz) { g_interval_hz.store(hz > 0.0 ? hz : 0.0, std::memory_order_relaxed); }
+double present_interval_hz_override() { return g_interval_hz.load(std::memory_order_relaxed); }
 
 uint64_t FrameLimiter::begin_frame_nohook() {
     Impl& s = *impl_;
     const uint64_t entry = now_ns();
-    const double fps = s.target_fps.load();
+    const double fps = effective_fps();
 
     if (!(fps > 0.0) || g_unpaced.load(std::memory_order_relaxed)) {
         std::lock_guard<std::mutex> lk(s.mu);

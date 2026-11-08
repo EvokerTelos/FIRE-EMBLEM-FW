@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // CPU-side texture data preparation (S4d). See nvn_texdata.h for what comes out. No Vulkan calls in this file.
 // Libraries: tegra_tiling (untile) and astc2bc7 (ASTC -> BC7 transcode, ASTC -> RGBA8 decode; tools/textures).
-// Config: [gfx] astc_quality (fast / high / uncompressed, default high; nvn_texdata.h), [nvn] bc7_quality (env NXRT_NVN_BC7_QUALITY, default 3), [nvn] bc7_cache (env NXRT_NVN_BC7_CACHE, default
-// "bc7_cache" in the current directory, "" disables the cache).
+// Config: [gfx] astc_quality (fast / high / uncompressed, default high, fast with the C++ encoder; nvn_texdata.h), [nvn] bc7_quality (env NXRT_NVN_BC7_QUALITY,
+// default 3, 1 with the C++ encoder), [nvn] bc7_cache (env NXRT_NVN_BC7_CACHE, default "bc7_cache" in the current directory, "" disables the cache).
 #include "nvn_texdata.h"
 
 #include <algorithm>
@@ -32,7 +32,13 @@ constexpr uint32_t kCacheVersion = 1;
 constexpr uint8_t kCacheMagic[4] = {'N', 'X', 'B', '7'};
 constexpr size_t kCacheHeadBytes = 4 + 4 + 8 + 4 + 4 + 4;   // magic, version, key hash, VkFormat, level count, layer count
 constexpr size_t kCacheLevelBytes = 3 * 4 + 2 * 8;          // per level: width, height, depth, offset, size
-constexpr int kDefaultQuality = 3;
+
+// The defaults follow the encoder. bc7e's ISPC build makes preset 3 and the background re-encode cheap; its C++ build is about 3 to 4 times
+// slower, so it starts at preset 1 (about 3 times faster than 3, under 1.5 dB lower on the game's ASTC 8x8 textures) in fast mode.
+bool slow_encoder() {
+    static const bool slow = a2b_bc7_encoder(nullptr) == A2B_ENCODER_CPP;
+    return slow;
+}
 
 uint64_t div_up(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
 
@@ -112,15 +118,18 @@ uint64_t get64(const uint8_t* p) { return static_cast<uint64_t>(get32(p)) | (sta
 std::string cache_dir() { return config_get_str("nvn", "bc7_cache", "bc7_cache"); }
 
 int bc7_quality() {
-    const int64_t q = config_get_int("nvn", "bc7_quality", kDefaultQuality);
+    const int def = slow_encoder() ? 1 : 3;
+    const int64_t q = config_get_int("nvn", "bc7_quality", def);
     if (q < 0 || q > 6) {
-        NXLOG_W(kTag, "[nvn] bc7_quality %lld is outside 0..6: using %d", static_cast<long long>(q), kDefaultQuality);
-        return kDefaultQuality;
+        NXLOG_W(kTag, "[nvn] bc7_quality %lld is outside 0..6: using %d", static_cast<long long>(q), def);
+        return def;
     }
     return static_cast<int>(q);
 }
 
-int high_preset() { return std::max(kHighPreset, bc7_quality()); }
+// With the C++ encoder the re-encode of high mode (which the play settings choose by default) uses preset 3: about 1 dB over preset 1 on
+// the game's textures at a third of the cost of preset 5, and the entries are the fast ones of an ISPC build.
+int high_preset() { return std::max(slow_encoder() ? 3 : kHighPreset, bc7_quality()); }
 
 std::string cache_path_in(const std::string& dir, uint64_t hash) {
     if (dir.empty()) return std::string();
@@ -226,6 +235,24 @@ bool cache_read(const std::string& path, uint64_t key, PreparedTexture& out) {
 
 // ---- level geometry --------------------------------------------------------------------------------------------------------
 // One level of the tight linear buffer (the untiled image, or the pitch-linear copy).
+// One BC7 block of a single colour: mode 6, both endpoints the colour (7 bits + a 0 p-bit, so within 1/255), every index 0.
+void bc7_solid_block(const uint8_t* rgba, uint8_t* out) {
+    uint64_t lo = 0, hi = 0;
+    unsigned pos = 0;
+    auto put = [&](uint64_t v, unsigned n) {
+        for (unsigned b = 0; b < n; ++b, ++pos)
+            if ((v >> b) & 1) (pos < 64 ? lo : hi) |= uint64_t{1} << (pos & 63);
+    };
+    put(1u << 6, 7);   // mode 6
+    for (int c = 0; c < 4; ++c) {
+        put(rgba[c] >> 1, 7);
+        put(rgba[c] >> 1, 7);
+    }
+    // p-bits 0, indices 0: the rest of the block stays zero
+    std::memcpy(out, &lo, 8);
+    std::memcpy(out + 8, &hi, 8);
+}
+
 struct LevelGeom {
     uint32_t w = 1, h = 1, d = 1;   // texels
     uint32_t bx = 1, by = 1;        // blocks per row and rows, in the source format's blocks
@@ -316,15 +343,21 @@ bool make_linear(const TexLayout& L, const std::vector<LevelGeom>& geo, const Fo
 
 }  // namespace
 
+AstcQuality astc_quality_default() { return slow_encoder() ? AstcQuality::Fast : AstcQuality::High; }
+
+int bc7_fast_preset() { return bc7_quality(); }
+
 AstcQuality astc_quality() {
-    std::string v = config_get_str("gfx", "astc_quality", "high");
+    std::string v = config_get_str("gfx", "astc_quality", "");
     std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (v.empty()) return astc_quality_default();
     if (v == "fast") return AstcQuality::Fast;
-    if (v == "high" || v.empty()) return AstcQuality::High;
+    if (v == "high") return AstcQuality::High;
     if (v == "uncompressed" || v == "rgba8") return AstcQuality::Uncompressed;
     static std::atomic<bool> warned{false};
-    if (!warned.exchange(true)) NXLOG_W(kTag, "[gfx] astc_quality '%s' is not fast, high or uncompressed: using high", v.c_str());
-    return AstcQuality::High;
+    if (!warned.exchange(true))
+        NXLOG_W(kTag, "[gfx] astc_quality '%s' is not fast, high or uncompressed: using %s", v.c_str(), astc_quality_name(astc_quality_default()));
+    return astc_quality_default();
 }
 
 const char* astc_quality_name(AstcQuality q) {
@@ -740,10 +773,16 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
     }
 
     // ---- transcode or decode, one 2D slice at a time (the library threads inside a slice) ------------------------------
+    static std::atomic<bool> encoder_logged{false};
+    if (!encoder_logged.exchange(true)) {
+        const char* name = "?";
+        a2b_bc7_encoder(&name);
+        NXLOG_I(kTag, "ASTC transcoder: %s; [nvn] bc7_quality %d, [gfx] astc_quality %s", name, bc7_quality(), astc_quality_name(aq));
+    }
     out.data.assign(static_cast<size_t>(out_total), 0);
     a2b_options opt{};
     opt.quality = provisional ? 0 : quality;
-    opt.threads = caps.encode_threads;   // 0: all hardware threads
+    opt.threads = provisional ? 1 : caps.encode_threads;   // 0: all hardware threads; a stand-in is small work: thread start-up per level cost more than the encode
     opt.perceptual = 0;
     opt.allow_opaque_mode6 = 0;
     a2b_input in{};
@@ -785,9 +824,47 @@ bool prepare_texture(const Texture& t, const TexCaps& caps, PreparedTexture& out
                 bc7 ? "BC7" : "RGBA8", geo[0].w, geo[0].h, L.levels, ms);
         return true;
     }
+    // A stand-in only has to look right for the half second until the background job lands: the big levels are filled with
+    // solid BC7 blocks taken from a small level (decoded once per layer) instead of being encoded, so it costs about 1 ms, not 50-150.
+    size_t solid_src = geo.size();
+    if (provisional && geo[0].d == 1 && geo.size() > 1) {
+        static const uint32_t solid_max = static_cast<uint32_t>(std::max<int64_t>(16, config_get_int("nvn", "standin_full_px", 256)));
+        for (size_t i = 0; i < geo.size(); ++i)
+            if (std::max(geo[i].w, geo[i].h) <= solid_max) { solid_src = i; break; }
+        if (solid_src == 0 || solid_src >= geo.size()) solid_src = geo.size();
+    }
+    std::vector<uint8_t> solid_rgba;
+    uint32_t solid_layer = ~0u;
     for (size_t i = 0; i < geo.size(); ++i) {
         const LevelGeom& g = geo[i];
         const PreparedLevel& pl = out.level[i];
+        if (i < solid_src && solid_src < geo.size()) {
+            const LevelGeom& sg = geo[solid_src];
+            const uint64_t out_slice = pl.size / L.layers;
+            const uint32_t bw = (g.w + 3) / 4, bh = (g.h + 3) / 4;
+            if (out_slice != static_cast<uint64_t>(bw) * bh * 16) return fail("internal: BC7 stand-in size mismatch");
+            for (uint32_t layer = 0; layer < L.layers; ++layer) {
+                if (solid_layer != layer) {
+                    a2b_input sin = in;
+                    sin.width = sg.w;
+                    sin.height = sg.h;
+                    solid_rgba.resize(static_cast<size_t>(sg.w) * sg.h * 4);
+                    const a2b_status st = a2b_decode_astc_rgba8(&sin, lin.data() + sg.lin_off + static_cast<uint64_t>(layer) * sg.slice,
+                                                                static_cast<size_t>(sg.slice), 1, solid_rgba.data(), nullptr);
+                    if (st != A2B_OK) return fail(std::string("ASTC decode for the stand-in failed: ") + a2b_status_string(st));
+                    solid_layer = layer;
+                }
+                uint8_t* dst = out.data.data() + pl.offset + static_cast<uint64_t>(layer) * out_slice;
+                for (uint32_t by = 0; by < bh; ++by) {
+                    const uint32_t sy = std::min(sg.h - 1, static_cast<uint32_t>((static_cast<uint64_t>(by) * 4 + 2) * sg.h / g.h));
+                    for (uint32_t bx = 0; bx < bw; ++bx) {
+                        const uint32_t sx = std::min(sg.w - 1, static_cast<uint32_t>((static_cast<uint64_t>(bx) * 4 + 2) * sg.w / g.w));
+                        bc7_solid_block(solid_rgba.data() + (static_cast<size_t>(sy) * sg.w + sx) * 4, dst + (static_cast<size_t>(by) * bw + bx) * 16);
+                    }
+                }
+            }
+            continue;
+        }
         in.width = g.w;
         in.height = g.h;
         const uint64_t out_slice = pl.size / L.layers / g.d;   // bytes of one z slice of the output

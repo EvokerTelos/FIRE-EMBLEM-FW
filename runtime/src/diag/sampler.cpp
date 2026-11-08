@@ -53,6 +53,7 @@ struct State {
     std::unordered_map<std::string, uint32_t> agg;     // key = raw sample bytes (thread, label, waiting, n, frames) -> count
     std::string out;
     std::vector<std::string> only;       // [prof] sample_threads: names to sample (empty = every registered thread)
+    std::vector<std::string> offsets;    // [prof] sample_offsets: symbols whose frames are named symbol+0x<offset>
     double hz = 0;
     uint64_t total = 0, waiting = 0;
     FILE* f = nullptr;
@@ -131,13 +132,19 @@ void loop() {
     }
 }
 
-std::string frame_name(uint64_t addr, std::unordered_map<uint64_t, std::string>& cache) {
+std::string frame_name(uint64_t addr, std::unordered_map<uint64_t, std::string>& cache, const std::vector<std::string>& offsets) {
     auto it = cache.find(addr);
     if (it != cache.end()) return it->second;
     const SymbolInfo si = symbols_lookup(addr);
     std::string n;
-    if (si.from_map && !si.symbol.empty()) n = si.symbol;
-    else if (si.module != "?" && !si.module.empty()) {
+    if (si.from_map && !si.symbol.empty()) {
+        n = si.symbol;
+        if (std::find(offsets.begin(), offsets.end(), n) != offsets.end()) {
+            char b[24];
+            std::snprintf(b, sizeof b, "+0x%llx", static_cast<unsigned long long>(si.sym_offset));
+            n += b;
+        }
+    } else if (si.module != "?" && !si.module.empty()) {
         char b[32];
         std::snprintf(b, sizeof b, "!+0x%llx", static_cast<unsigned long long>(si.offset & ~0xfffull));   // 4 KiB buckets: no symbols for other modules
         n = si.module + b;
@@ -171,7 +178,7 @@ void flush_samples(State& s) {
         line += s.names[x.thread];
         for (int i = static_cast<int>(x.n) - 1; i >= 0; i--) {
             line += ';';
-            line += frame_name(x.frames[i], s.cache);
+            line += frame_name(x.frames[i], s.cache, s.offsets);
         }
         if (x.waiting) line += ";[wait]";
         std::fprintf(s.f, "%s %u\n", line.c_str(), kv.second);
@@ -207,6 +214,14 @@ void prof_sampler_start() {
     s.hz = std::min(hz, 2000.0);
     s.out = config_get_str("prof", "sample_out", "prof_samples.folded");
     s.only.clear();
+    s.offsets.clear();
+    const std::string offs = config_get_str("prof", "sample_offsets", "");   // comma-separated symbols, e.g. f_7101980580: instruction-level hot spots
+    for (size_t a = 0; a < offs.size();) {
+        size_t b = offs.find(',', a);
+        if (b == std::string::npos) b = offs.size();
+        if (b > a) s.offsets.push_back(offs.substr(a, b - a));
+        a = b + 1;
+    }
     const std::string only = config_get_str("prof", "sample_threads", "");     // comma-separated thread names, e.g. main,nvn-render
     for (size_t a = 0; a < only.size();) {
         size_t b = only.find(',', a);

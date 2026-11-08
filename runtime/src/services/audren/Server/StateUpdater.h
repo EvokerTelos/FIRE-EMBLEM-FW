@@ -99,7 +99,9 @@ class StateUpdater {
     ResultCode UpdateBehaviourInfo() {
         BehaviourParameter parameter = _inputReader.GetRefOrRefToCopy<BehaviourParameter>();
 
-        if (!BehaviourInfo::CheckValidRevision(parameter.user_revision) || !BehaviourInfo::SameRevision(parameter.user_revision, _behaviourInfo->UserRevision)) {
+        // Revision numbers are compared, not the magic: a Switch 2 library may spell the same revision 'REV' and 'REv' (Eden-NS2 info_updater.cpp).
+        if (!BehaviourInfo::CheckValidRevision(parameter.user_revision) ||
+            BehaviourInfo::GetRevisionNumber(parameter.user_revision) != BehaviourInfo::GetRevisionNumber(_behaviourInfo->UserRevision)) {
             return ResultCode::InvalidUpdateInfo;
         }
 

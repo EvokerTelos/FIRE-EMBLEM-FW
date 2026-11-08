@@ -120,10 +120,8 @@ uint32_t thread_create(const ThreadParams& p) {
         NXLOG_E("thread", "handle table full");
         return 0;
     }
-    // ThreadLocalRegion +0x110 (in the kernel-owned 0x104..0x180 range): the thread's own handle. SDK 22's
-    // nn::os::detail::InternalCriticalSection takes the owner from here (Enter: casa 0 -> [tpidrro+0x110]; IsLockedByCurrentThread:
-    // [tpidrro+0x110] == owner & ~0x40000000), so with 0 there an unlocked critical section reads as held by the caller and the first
-    // pthread_mutex_lock aborts (Fortune's Weave, SDK 22.2). Older SDKs do not read this word.
+    // The kernel's ThreadLocalRegion current_thread_handle (TLS +0x110): SDK 22's InternalCriticalSection compares a lock's owner with it, so
+    // a zero there makes every free mutex look held by its caller (Eden-NS2 k_process.cpp Run, svc_thread.cpp CreateThread write it too).
     *reinterpret_cast<uint32_t*>(t->tls + 0x110) = t->handle;
     AcquireSRWLockExclusive(&g_list_lock);
     // Thread objects of threads that have exited and that nothing else refers to (the game closed the handle, the host thread dropped its
@@ -195,6 +193,7 @@ uint32_t main_thread_adopt(uint64_t stack_size, const char* name) {
     log_set_thread_name(t->name.c_str());
     diag_register_thread(t->name.c_str(), &t->ctx, t->id);
     sched_apply(*t);
+    occ_tag_main(*t);
     NXLOG_I("thread", "host thread %lu is now the guest main thread (stack 0x%llx..0x%llx)", GetCurrentThreadId(), (unsigned long long)stack, (unsigned long long)p.stack_top);
     return h;
 }
@@ -232,7 +231,20 @@ bool thread_set_priority(KThread& t, int hos_prio) {
 }
 
 // Application cores: 3 on Switch 1 (cores 0..2), 6 on Switch 2 (cores 0..5, the game's NPDM ThreadInfo).
-int app_core_count() { return game::info().platform == game::Platform::Switch2 ? 6 : 3; }
+// [sched] app_cores = N (experiment, notes/threads.md): the process is told it has N cores (GetInfo CoreMask, core numbers up to N - 1),
+// 1..16; a game that sizes its thread pools from the core mask then makes more threads. Cores past the host's physical cores get ideal
+// processors on SMT siblings (sched.cpp). Read once.
+int app_core_count() {
+    static const int n = [] {
+        const int def = game::info().platform == game::Platform::Switch2 ? 6 : 3;
+        const int64_t v = config_get_int("sched", "app_cores", 0);
+        if (v <= 0) return def;
+        const int k = static_cast<int>(v > 16 ? 16 : v);
+        if (k != def) NXLOG_I("sched", "[sched] app_cores = %d: the process is told it has %d cores (mask 0x%llx), not %d", k, k, (unsigned long long)((1ull << k) - 1), def);
+        return k;
+    }();
+    return n;
+}
 
 bool thread_set_core_mask(KThread& t, int ideal, uint64_t mask) {
     const int n = app_core_count();

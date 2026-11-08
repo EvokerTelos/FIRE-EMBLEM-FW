@@ -24,7 +24,6 @@ namespace Nx.Shaders.Ampere
             RegisterTex();
             RegisterCtrl();
             RegisterUniform();
-            RegisterTensor();
         }
 
         static void Op12(int op, Action<Ctx> h) => ByOp12[op] = h;

@@ -43,9 +43,6 @@ struct Region {
     uint64_t nwords = 0;
     std::unique_ptr<std::atomic<uint64_t>[]> prot, valid, written, ban;
     std::unique_ptr<std::atomic<uint64_t>[]> guard;     // PAGE_NOACCESS because of guard() (a subset of prot)
-    std::unique_ptr<std::atomic<uint64_t>[]> wsum;      // one bit per word of `written` that may be non-zero (set after the written bit):
-                                                        // take_written visits only those (the texture tracker's region is the whole heap)
-    uint64_t nsum = 0;
     int slot = -1;
     SRWLOCK lock = SRWLOCK_INIT;
     std::unique_ptr<std::atomic<uint16_t>[]> releasing;   // per page: releasers that saw it armed and have not finished its VirtualProtect (release_page)
@@ -71,7 +68,6 @@ std::atomic<int> g_hi{0};              // slots [0, g_hi) may be in use
 std::atomic<int> g_busy{0};            // fault handlers and os-write calls looking at the table
 std::atomic<int> g_live{0};
 std::atomic<uint64_t> g_faults{0};
-std::atomic<uint64_t> g_prot_epoch{0};   // memory.cpp mapping / protection changes (protection_changed)
 std::atomic<uint64_t> g_waits{0};      // rounds a fault waited for another releaser (statistics, tests)
 std::atomic<uint64_t> g_guard_faults{0};   // accesses that hit a guarded page
 std::atomic<GuardHandler> g_guard_fn{nullptr};
@@ -153,12 +149,6 @@ DWORD page_protect(uint64_t addr) {
 bool release_page(Region* r, uint64_t page) {
     const uint64_t b = bit(page);
     const uint64_t w = page >> 6;
-    // Guarded by this region since the fault was taken (guard() holds the lock exclusive, so this cannot change while we hold it shared):
-    // leave the page alone and let the access retry, which takes the guard path. Releasing it here cleared the prot bit under a guard;
-    // seen with overlapping regions (the heap-wide texture tracker had already made the page writable, so the pool copy's guard() still
-    // found it armed): the page then stayed guarded but unarmed, and once the guard went, the next write found no region to claim it and
-    // crashed as an access violation (FEFW: a worker thread writing a compute result pool right after its copy was made).
-    if (r->guard[w].load(std::memory_order_acquire) & b) return true;
     // Announce the release before the bit goes: whoever finds the bit already clear can then tell "somebody is making this page writable"
     // (the count is up from before the bit went until after the VirtualProtect) from "nobody is": a foreign read-only page.
     std::atomic<uint16_t>& rel = r->releasing[page];
@@ -167,7 +157,6 @@ bool release_page(Region* r, uint64_t page) {
     const uint64_t old = r->prot[w].fetch_and(~b, std::memory_order_acq_rel);
     r->valid[w].fetch_and(~b, std::memory_order_acq_rel);
     r->written[w].fetch_or(b, std::memory_order_acq_rel);
-    r->wsum[w >> 6].fetch_or(uint64_t{1} << (w & 63), std::memory_order_acq_rel);
     const uint64_t addr = r->base + page * kPage;
     if (old & b) {
         bool ok = true;
@@ -285,18 +274,53 @@ LONG CALLBACK on_fault(EXCEPTION_POINTERS* ep) {
             }
             if (in_region) return EXCEPTION_CONTINUE_EXECUTION;
         }
+        if (pr == PAGE_NOACCESS && guarded_at(addr)) {    // dropped and guarded again since the check above
+            g_guard_faults.fetch_add(1, std::memory_order_relaxed);
+            if (GuardHandler fn = g_guard_fn.load(std::memory_order_acquire)) fn(addr & ~(kPage - 1));
+            drop_guard(addr & ~(kPage - 1), kPage);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    bool ours = false;
+    bool ours = false, guarded_now = false;
     g_busy.fetch_add(1, std::memory_order_seq_cst);
     const int hi = g_hi.load(std::memory_order_seq_cst);
-    for (int i = 0; i < hi; ++i) {
-        Region* r = g_slots[i].load(std::memory_order_seq_cst);
-        if (!r || addr < r->base || addr >= r->base + r->npages * kPage) continue;
-        SharedLock lk(r);
-        const bool mine = release_page(r, (addr - r->base) / kPage);
-        if (mine) fault_stat(r, addr);
-        ours |= mine;
+    // Pass 0 releases the page in the regions that armed it (usually one). Only when none did (another thread released it meanwhile) does
+    // pass 1 ask release_page's slow path in every region: a VirtualQuery over the heap view (milliseconds), which the whole-heap texture
+    // region paid for every fault on a pool copy's page, under its shared lock (notes/pacing.md).
+    for (int pass = 0; pass < 2 && !ours && !guarded_now; ++pass) {
+        for (int i = 0; i < hi; ++i) {
+            Region* r = g_slots[i].load(std::memory_order_seq_cst);
+            if (!r || addr < r->base || addr >= r->base + r->npages * kPage) continue;
+            SharedLock lk(r);
+            const uint64_t pg = (addr - r->base) / kPage;
+            // guard() (exclusive lock) may have guarded the page since guarded_at above: under the shared lock the bit is final. Releasing a
+            // guarded page cleared its armed bit and left it no-access with nobody to claim the fault (a crash in Dagsion, notes/pacing.md).
+            if (test(r->guard.get(), pg)) { guarded_now = true; continue; }
+            if (pass == 0 && !test(r->prot.get(), pg)) continue;
+            const bool mine = release_page(r, pg);
+            if (mine) fault_stat(r, addr);
+            ours |= mine;
+        }
+    }
+    if (guarded_now) {     // the guard fault as above; the write then faults again on the armed page and is released as usual
+        g_busy.fetch_sub(1, std::memory_order_seq_cst);
+        g_guard_faults.fetch_add(1, std::memory_order_relaxed);
+        if (GuardHandler fn = g_guard_fn.load(std::memory_order_acquire)) fn(addr & ~(kPage - 1));
+        drop_guard(addr & ~(kPage - 1), kPage);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (!ours) {   // a write fault in a tracked region that no region claims: what each one holds for the page (the crash report follows)
+        const DWORD pr = page_protect(addr);
+        for (int i = 0; i < hi; ++i) {
+            Region* r = g_slots[i].load(std::memory_order_seq_cst);
+            if (!r || addr < r->base || addr >= r->base + r->npages * kPage) continue;
+            const uint64_t pg = (addr - r->base) / kPage;
+            NXLOG_E(kTag, "unclaimed write fault at %llx (protection %lx): region %llx (+%llu pages) prot %d valid %d guard %d ban %d releasing %d",
+                    static_cast<unsigned long long>(addr), static_cast<unsigned long>(pr), static_cast<unsigned long long>(r->base),
+                    static_cast<unsigned long long>(r->npages), test(r->prot.get(), pg), test(r->valid.get(), pg), test(r->guard.get(), pg),
+                    test(r->ban.get(), pg), static_cast<int>(r->releasing[pg].load()));
+        }
     }
     g_busy.fetch_sub(1, std::memory_order_seq_cst);
     if (!ours) return EXCEPTION_CONTINUE_SEARCH;
@@ -365,9 +389,6 @@ Region* region_create(uint64_t addr, uint64_t size) {
         bm->reset(new std::atomic<uint64_t>[r->nwords]);
         for (uint64_t i = 0; i < r->nwords; ++i) (*bm)[i].store(0, std::memory_order_relaxed);
     }
-    r->nsum = (r->nwords + 63) / 64;
-    r->wsum.reset(new std::atomic<uint64_t>[r->nsum]);
-    for (uint64_t i = 0; i < r->nsum; ++i) r->wsum[i].store(0, std::memory_order_relaxed);
     r->releasing.reset(new std::atomic<uint16_t>[r->npages]);
     for (uint64_t i = 0; i < r->npages; ++i) r->releasing[i].store(0, std::memory_order_relaxed);
     {
@@ -427,51 +448,48 @@ void region_destroy(Region* r) {
 uint64_t region_base(const Region* r) { return r ? r->base : 0; }
 uint64_t region_pages(const Region* r) { return r ? r->npages : 0; }
 
-// No other region (the texture tracker covers the whole heap, pool mirrors overlap it) has a page of [a, a + n) armed or is releasing one:
-// the page table can then stand in for VirtualQuery, which would show such a page read-only. An arm by the other region after this check
-// leaves both armed, which a fault releases in both.
-bool others_quiet(const Region* self, uint64_t a, uint64_t n) {
-    const int hi = g_hi.load(std::memory_order_seq_cst);
-    for (int i = 0; i < hi; ++i) {
-        const Region* o = g_slots[i].load(std::memory_order_seq_cst);
-        if (!o || o == self) continue;
-        const uint64_t lo = std::max(a, o->base), end = std::min(a + n, o->base + o->npages * kPage);
-        if (lo >= end) continue;
-        const uint64_t f = (lo - o->base) / kPage, c = (end - 1 - o->base) / kPage - f + 1;
-        if (any_set(o->prot.get(), f, c)) return false;
-        for (uint64_t q = f; q < f + c; ++q)
-            if (o->releasing[q].load(std::memory_order_seq_cst)) return false;
-    }
-    return true;
-}
-
 bool arm(Region* r, uint64_t first, uint64_t count) {
     if (!r || !count || first >= r->npages || count > r->npages - first) return false;
     nxrt::HitchTimer ht(nxrt::kHpWwArm);
     const uint64_t a = r->base + first * kPage, n = count * kPage;
-    // Whether the guest left every page committed read-write, from memory.cpp's page table when the range is in the heap view (read before
-    // the region lock: memory.cpp takes region locks while it holds its own). One VirtualQuery inside a pool's section view costs ~2.4 ms (it
-    // walks the view's page attributes), and the render thread arms 200-400 pages a second while the game loads. A change of mapping or
-    // protection after the read is either still in its scope (os_write_overlaps below) or has moved the epoch: then VirtualQuery decides.
-    const uint64_t epoch = g_prot_epoch.load(std::memory_order_acquire);
-    const int table = heap_rw_state(a, n);
+    // The heap's page table says whether every page is committed read-write (memory.h heap_rw_pages). A VirtualQuery walk over the heap
+    // view costs a walk of every page of the run of identical pages after the address (5 to 85 ms on a 10 GiB heap), under the exclusive
+    // lock that the game's write faults wait for: the 70 ms frames of the hitch line's "write-watch arming" (notes/pacing.md). The table
+    // is read before the lock (memory.cpp takes its lock first and region locks inside it); a change since shows in the epoch.
+    const uint64_t epoch = heap_epoch();
+    const int table = heap_rw_pages(a, n);
     ExclusiveLock lk(r);
     if (any_set(r->ban.get(), first, count)) return false;
     // A file read (or a mapping change in memory.cpp) into these pages is in progress: leave them alone. Its scope is published before it
     // releases pages under the shared lock, so either this sees it, or its release waits for this arm and undoes it.
     if (os_write_overlaps(a, a + n)) return false;
-    const bool known = table >= 0 && g_prot_epoch.load(std::memory_order_acquire) == epoch && !any_set(r->guard.get(), first, count) &&
-                       others_quiet(r, a, n);
-    if (known && table == 0) return false;
-    // every page committed read-write (the guest may have changed a protection; a page it made read-only is not ours to take)
-    for (uint64_t cur = known ? a + n : a; cur < a + n;) {
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (VirtualQuery(reinterpret_cast<void*>(cur), &mbi, sizeof mbi) != sizeof mbi || mbi.State != MEM_COMMIT) return false;
-        const DWORD pr = mbi.Protect & 0xff;
-        const bool already = pr == PAGE_READONLY && all_set(r->prot.get(), (cur - r->base) / kPage,
-                                                            (std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize) - cur) / kPage);
-        if ((pr != PAGE_READWRITE && !already) || (mbi.Protect & PAGE_GUARD)) return false;
-        cur = std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize);
+    if (table == 1 && heap_epoch() == epoch) {
+        // what the walk below checks besides the table: no page read-guarded here, or read-only because another region armed it
+        if (any_set(r->guard.get(), first, count)) return false;
+        bool other = false;
+        g_busy.fetch_add(1, std::memory_order_seq_cst);
+        const int hi = g_hi.load(std::memory_order_seq_cst);
+        for (int i = 0; i < hi && !other; ++i) {
+            Region* o = g_slots[i].load(std::memory_order_seq_cst);
+            if (!o || o == r) continue;
+            const uint64_t lo = std::max(a, o->base), end = std::min(a + n, o->base + o->npages * kPage);
+            if (lo < end) other = any_set(o->prot.get(), (lo - o->base) / kPage, (end - lo) / kPage);
+        }
+        g_busy.fetch_sub(1, std::memory_order_seq_cst);
+        if (other) return false;
+    } else if (table == 0) {
+        return false;
+    } else {
+        // every page committed read-write (the guest may have changed a protection; a page it made read-only is not ours to take)
+        for (uint64_t cur = a; cur < a + n;) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<void*>(cur), &mbi, sizeof mbi) != sizeof mbi || mbi.State != MEM_COMMIT) return false;
+            const DWORD pr = mbi.Protect & 0xff;
+            const bool already = pr == PAGE_READONLY && all_set(r->prot.get(), (cur - r->base) / kPage,
+                                                                (std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize) - cur) / kPage);
+            if ((pr != PAGE_READWRITE && !already) || (mbi.Protect & PAGE_GUARD)) return false;
+            cur = std::min<uint64_t>(a + n, reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize);
+        }
     }
     // Under the exclusive lock no fault is handled until both bits and protection are in place; a write that faults meanwhile waits and
     // then releases the page. A write that lands before the protection does not fault, and the owner's copy (made later) still sees it.
@@ -486,14 +504,24 @@ bool arm(Region* r, uint64_t first, uint64_t count) {
     return true;
 }
 
-void protection_changed(const void*, uint64_t) { g_prot_epoch.fetch_add(1, std::memory_order_acq_rel); }
-
 bool all_valid(const Region* r, uint64_t first, uint64_t count) {
     if (!r || !count || first >= r->npages || count > r->npages - first) return false;
     return all_set(r->valid.get(), first, count);
 }
 
 bool page_valid(const Region* r, uint64_t page) { return r && page < r->npages && test(r->valid.get(), page); }
+bool any_valid(const Region* r, uint64_t first, uint64_t count) {
+    if (!r || !count || first >= r->npages) return false;
+    const uint64_t end = first + std::min(count, r->npages - first);
+    for (uint64_t p = first; p < end;) {
+        const uint64_t lo = p & 63;
+        const uint64_t hi = std::min<uint64_t>(64, lo + (end - p));
+        const uint64_t mask = (hi - lo == 64) ? ~uint64_t{0} : (((uint64_t{1} << (hi - lo)) - 1) << lo);
+        if (r->valid[p >> 6].load(std::memory_order_acquire) & mask) return true;
+        p += hi - lo;
+    }
+    return false;
+}
 bool page_banned(const Region* r, uint64_t page) { return !r || page >= r->npages || test(r->ban.get(), page); }
 
 void invalidate(Region* r, uint64_t first, uint64_t count) {
@@ -520,28 +548,6 @@ bool guard(Region* r, uint64_t first, uint64_t count) {
     return true;
 }
 
-int describe(uint64_t addr, char* out, size_t n) {
-    if (!out || !n) return 0;
-    out[0] = 0;
-    int found = 0;
-    size_t used = 0;
-    const int hi = g_hi.load(std::memory_order_seq_cst);
-    for (int i = 0; i < hi; ++i) {
-        Region* r = g_slots[i].load(std::memory_order_seq_cst);
-        if (!r || addr < r->base || addr >= r->base + r->npages * kPage) continue;
-        const uint64_t p = (addr - r->base) / kPage;
-        const int k = std::snprintf(out + used, n - used, "%sregion %d base %llx page %llu: prot %d guard %d valid %d ban %d written %d releasing %u",
-                                    found ? "; " : "", i, static_cast<unsigned long long>(r->base), static_cast<unsigned long long>(p),
-                                    test(r->prot.get(), p) ? 1 : 0, test(r->guard.get(), p) ? 1 : 0, test(r->valid.get(), p) ? 1 : 0,
-                                    test(r->ban.get(), p) ? 1 : 0, test(r->written.get(), p) ? 1 : 0,
-                                    static_cast<unsigned>(r->releasing[p].load(std::memory_order_relaxed)));
-        ++found;
-        if (k < 0 || static_cast<size_t>(k) >= n - used) break;
-        used += static_cast<size_t>(k);
-    }
-    return found;
-}
-
 void unguard(Region* r, uint64_t first, uint64_t count) {
     if (!r || first >= r->npages) return;
     count = std::min(count, r->npages - first);
@@ -555,8 +561,8 @@ bool all_armed(const Region* r, uint64_t first, uint64_t count) {
     return all_set(r->prot.get(), first, count);
 }
 
-bool all_valid_or_armed(const Region* r, const std::atomic<uint64_t>* extra, uint64_t first, uint64_t count) {
-    if (!r || !extra || !count || first >= r->npages || count > r->npages - first) return false;
+bool all_valid_or_armed(const Region* r, uint64_t first, uint64_t count, const std::atomic<uint64_t>* alt) {
+    if (!r || !alt || !count || first >= r->npages || count > r->npages - first) return false;
     uint64_t p = first;
     const uint64_t end = first + count;
     while (p < end) {
@@ -564,11 +570,9 @@ bool all_valid_or_armed(const Region* r, const std::atomic<uint64_t>* extra, uin
         const uint64_t lo = p & 63;
         const uint64_t hi = std::min<uint64_t>(64, lo + (end - p));
         const uint64_t mask = (hi - lo == 64) ? ~uint64_t{0} : (((uint64_t{1} << (hi - lo)) - 1) << lo);
-        const uint64_t v = r->valid[w].load(std::memory_order_acquire);
-        if ((v & mask) != mask) {
-            const uint64_t ok = v | (extra[w].load(std::memory_order_acquire) & r->prot[w].load(std::memory_order_acquire));
-            if ((ok & mask) != mask) return false;
-        }
+        const uint64_t ok = r->valid[w].load(std::memory_order_acquire) |
+                            (r->prot[w].load(std::memory_order_acquire) & alt[w].load(std::memory_order_acquire));
+        if ((ok & mask) != mask) return false;
         p += hi - lo;
     }
     return true;
@@ -578,22 +582,14 @@ uint64_t guard_faults() { return g_guard_faults.load(std::memory_order_relaxed);
 
 void take_written(Region* r, std::vector<uint64_t>& out) {
     if (!r) return;
-    // the summary word first, then the written words it names: a writer sets its written bit before the summary bit, so a bit set after
-    // this exchange is either taken below or still marked in the summary for the next call
-    for (uint64_t sw = 0; sw < r->nsum; ++sw) {
-        if (!r->wsum[sw].load(std::memory_order_relaxed)) continue;
-        uint64_t sv = r->wsum[sw].exchange(0, std::memory_order_acq_rel);
-        while (sv) {
-            const uint64_t w = sw * 64 + static_cast<uint64_t>(__builtin_ctzll(sv));
-            sv &= sv - 1;
-            if (w >= r->nwords) continue;
-            uint64_t v = r->written[w].exchange(0, std::memory_order_acq_rel);
-            while (v) {
-                const unsigned long b = static_cast<unsigned long>(__builtin_ctzll(v));
-                v &= v - 1;
-                const uint64_t page = w * 64 + b;
-                if (page < r->npages) out.push_back(page);
-            }
+    for (uint64_t w = 0; w < r->nwords; ++w) {
+        if (!r->written[w].load(std::memory_order_relaxed)) continue;
+        uint64_t v = r->written[w].exchange(0, std::memory_order_acq_rel);
+        while (v) {
+            const unsigned long b = static_cast<unsigned long>(__builtin_ctzll(v));
+            v &= v - 1;
+            const uint64_t page = w * 64 + b;
+            if (page < r->npages) out.push_back(page);
         }
     }
 }
@@ -683,7 +679,6 @@ void forget(uint64_t addr, uint64_t size, bool ban) {
             if (test(r->prot.get(), q)) release_page(r, q);
         set_bits(r->valid.get(), first, count, false);
         set_bits(r->written.get(), first, count, true);
-        for (uint64_t w = first >> 6; w <= (first + count - 1) >> 6; ++w) r->wsum[w >> 6].fetch_or(uint64_t{1} << (w & 63), std::memory_order_acq_rel);
     });
 }
 

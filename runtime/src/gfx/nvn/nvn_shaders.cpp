@@ -14,6 +14,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -22,13 +23,12 @@
 #include <sstream>
 #include <unordered_set>
 
-#include <immintrin.h>
-#include <intrin.h>
-
 #include <nxrt/ftrace.h>
 #include <nxrt/config.h>
 #include <nxrt/gauge.h>
 #include <nxrt/log.h>
+
+#include <zstd.h>
 
 namespace nxrt::nvn::be {
 
@@ -42,53 +42,6 @@ inline uint32_t rd32(const uint8_t* p) {
     uint32_t v;
     std::memcpy(&v, p, 4);  // little-endian host (arm64, x86-64), like the Switch
     return v;
-}
-
-// The SHA instructions (Intel since Ice Lake / Alder Lake, AMD since Zen): the same digest as block() at several times the speed. The
-// shader cache keys on this hash, and the game hashes every stage of every program it links (over a second of the boot on the portable
-// loop). Intrinsics, no inline assembly; chosen at run time from CPUID.
-bool have_shani() {
-    static const bool yes = [] {
-        int r[4];
-        __cpuid(r, 0);
-        if (r[0] < 7) return false;
-        __cpuidex(r, 1, 0);
-        const bool sse41 = (r[2] >> 19) & 1, ssse3 = (r[2] >> 9) & 1;
-        __cpuidex(r, 7, 0);
-        return sse41 && ssse3 && ((r[1] >> 29) & 1);
-    }();
-    return yes;
-}
-
-template <int F>
-__attribute__((target("sha,sse4.1,ssse3"))) inline __m128i rnds4(__m128i abcd, __m128i wk) { return _mm_sha1rnds4_epu32(abcd, wk, F); }
-
-__attribute__((target("sha,sse4.1,ssse3"))) void sha1_blocks_shani(uint32_t h[5], const uint8_t* data, size_t blocks) {
-    const __m128i kSwap = _mm_set_epi64x(0x0001020304050607ll, 0x08090a0b0c0d0e0fll);
-    __m128i abcd = _mm_shuffle_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(h)), 0x1B);
-    __m128i e0 = _mm_set_epi32(static_cast<int>(h[4]), 0, 0, 0);
-    for (; blocks; --blocks, data += 64) {
-        const __m128i abcd_save = abcd, e_save = e0;
-        __m128i m[4];
-        for (int i = 0; i < 4; i++) m[i] = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(data + 16 * i)), kSwap);
-        __m128i eprev = e0;
-        for (int g = 0; g < 20; g++) {
-            const __m128i wk = g == 0 ? _mm_add_epi32(e0, m[0]) : _mm_sha1nexte_epu32(eprev, m[g & 3]);
-            eprev = abcd;
-            switch (g / 5) {   // the round function is an immediate
-                case 0: abcd = rnds4<0>(abcd, wk); break;
-                case 1: abcd = rnds4<1>(abcd, wk); break;
-                case 2: abcd = rnds4<2>(abcd, wk); break;
-                default: abcd = rnds4<3>(abcd, wk); break;
-            }
-            if (g + 4 < 20)   // W[4(g+4) ..] from the four groups before it; it takes m[g]'s slot, which this group has used
-                m[g & 3] = _mm_sha1msg2_epu32(_mm_xor_si128(_mm_sha1msg1_epu32(m[g & 3], m[(g + 1) & 3]), m[(g + 2) & 3]), m[(g + 3) & 3]);
-        }
-        e0 = _mm_sha1nexte_epu32(eprev, e_save);
-        abcd = _mm_add_epi32(abcd, abcd_save);
-    }
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(h), _mm_shuffle_epi32(abcd, 0x1B));
-    h[4] = static_cast<uint32_t>(_mm_extract_epi32(e0, 3));
 }
 
 }  // namespace
@@ -123,11 +76,6 @@ void Sha1::update(const void* data, size_t size) {
         if (used_ < 64) return;
         block(buf_);
         used_ = 0;
-    }
-    if (size >= 64 && have_shani()) {
-        sha1_blocks_shani(h_, p, size / 64);
-        p += size & ~size_t{63};
-        size &= 63;
     }
     for (; size >= 64; p += 64, size -= 64) block(p);
     std::memcpy(buf_, p, size);
@@ -166,13 +114,13 @@ ShaderControl read_control(const uint8_t* control) {
     c.valid = rd32(control) == kShaderControlMagic;
     if (c.valid && rd32(control + 4) == 201) {
         // NVN2 (Switch 2) layout, from the game's GLSLC outputs (tools/shaders/docs/AMPERE.md section 3): program length +0x38,
-        // constants +0x3c/+0x40, code area +0x44, local memory +0x50 (not read), stage u16 +0x56, compute work group +0x58, shared memory +0x64.
+        // constants +0x3c/+0x40, code area +0x44, shared memory +0x50, stage u16 +0x56, compute work group +0x58.
         c.nvn2 = true;
         c.program_size = rd32(control + 0x38);
         c.const_size = rd32(control + 0x3c);
         c.const_offset = rd32(control + 0x40);
         c.code_size = rd32(control + 0x44);
-        c.shared_size = rd32(control + 0x64);   // +0x50 is the local memory size (non-zero exactly when the SASS has LDL/STL)
+        c.shared_size = rd32(control + 0x50);
         c.stage = static_cast<int>(*reinterpret_cast<const uint16_t*>(control + 0x56));
         c.program_start = 0;   // graphics: 0x80-byte SPH v4 at +0, instructions from +0x80; compute: instructions from +0
         if (c.stage == 5) {
@@ -181,6 +129,7 @@ ShaderControl read_control(const uint8_t* control) {
             c.c0_ssbos = control[0xb2];
             c.c0_textures = control[0xb3];
             c.c0_images = control[0xb6];
+            c.c0_push_words = control[0xa9];
             c.c0_table_size = *reinterpret_cast<const uint16_t*>(control + 0xba);
         }
         return c;
@@ -360,14 +309,24 @@ void derive_meaning(DescriptorBinding& b, ShaderStage stage) {
     }
     int v = 0;
     if (b.type == DescriptorType::UniformBuffer) {
+        // Banks 0..17 at binding stageSlot * 18 + 1 + bank; Ampere's banks 18..31 at 91 + stageSlot * 14 + (bank - 18) (the harness's
+        // ampere-resource-slots range). NVN2 graphics stages read push constant slot n from bank 24 + n (sdk 0x673660 sends the slot with
+        // the data; Fortune's Weave's fragment shaders read slot 0 as c[0x18]).
         int bank = -1;
         if (n.size() > 1 && n[0] == 'c' && parse_uint(n.substr(1), 10, v)) bank = v;
-        else if (b.set == 0 && b.binding >= 1) bank = int(b.binding) - 1 - stage_slot(stage) * 18;  // fallback
+        else if (b.set == 0 && b.binding >= 91) {
+            const int k = int(b.binding) - 91 - stage_slot(stage) * 14;
+            if (k >= 0 && k < 14) bank = 18 + k;
+        } else if (b.set == 0 && b.binding >= 1) {
+            bank = int(b.binding) - 1 - stage_slot(stage) * 18;  // fallback
+        }
         m.bank = bank;
-        m.source = bank == 0 ? NvnSource::DriverConstants : bank == 1 ? NvnSource::ConstantData
-                   : bank == 24 ? NvnSource::ColorTransform
-                   : bank >= 3 && bank <= 16 ? NvnSource::UniformBlock : NvnSource::Unknown;
-        m.index = bank >= 3 && bank <= 16 ? bank - 3 : -1;
+        m.index = -1;
+        if (bank == 0) m.source = NvnSource::DriverConstants;
+        else if (bank == 1) m.source = NvnSource::ConstantData;
+        else if (bank >= 3 && bank < 18) m.source = NvnSource::UniformBlock, m.index = bank - 3;
+        else if (bank >= 24 && bank < 32) m.source = NvnSource::PushConstants, m.index = bank - 24;
+        else m.source = NvnSource::Unknown;
         return;
     }
     if (b.type == DescriptorType::StorageBuffer) {
@@ -395,6 +354,13 @@ void derive_meaning(DescriptorBinding& b, ShaderStage stage) {
     std::string_view hex = rest.substr(0, rest.find('_'));
     int word = 0;
     if (!parse_uint(hex, 16, word)) return;
+    if (bank == 0 && word == int(kPoolHandleWord) && !image) {
+        m.bank = 0;
+        m.word = word;
+        m.index = -1;
+        m.source = b.type == DescriptorType::Sampler ? NvnSource::SamplerPoolArray : NvnSource::TexturePoolArray;
+        return;
+    }
     set_texture_handle(m, image, bank, word);
 }
 
@@ -566,6 +532,8 @@ bool reflect_spirv(const uint32_t* words, size_t count, ShaderReflection& out, s
         DescriptorBinding b;
         b.set = uint32_t(d->set);
         b.binding = uint32_t(d->binding);
+        b.declared_set = b.set;
+        b.declared_binding = b.binding;
         b.used = referenced.count(v.id) != 0;
         if (auto it = names.find(v.id); it != names.end()) b.name = it->second;
         uint32_t inner = pointee;
@@ -735,7 +703,7 @@ bool apply_harness(ShaderReflection& refl, const std::vector<HarnessResource>& r
     for (const HarnessResource& r : resources) {
         DescriptorBinding* b = nullptr;
         for (auto& x : refl.bindings)
-            if (int(x.set) == r.set && int(x.binding) == r.binding) b = &x;
+            if (int(x.declared_set) == r.set && int(x.declared_binding) == r.binding) b = &x;
         if (!b) {
             ok = false;
             continue;
@@ -775,23 +743,24 @@ std::string describe_like_harness(const ShaderReflection& refl) {
         if (!b.used) continue;  // declared, never referenced: the harness does not list it
         const NvnMeaning& m = b.nvn;
         tmp[0] = 0;
+        const uint32_t set = b.declared_set, binding = b.declared_binding;
         switch (b.type) {
         case DescriptorType::UniformBuffer:
             if (m.source != NvnSource::SupportBuffer)
-                std::snprintf(tmp, sizeof tmp, "cb%d=s%ub%u", m.bank, b.set, b.binding);
+                std::snprintf(tmp, sizeof tmp, "cb%d=s%ub%u", m.bank, set, binding);
             break;
         case DescriptorType::StorageBuffer:
             if (m.c0_offset >= 0)
-                std::snprintf(tmp, sizeof tmp, "sb[c0+0x%x]=s%ub%u", m.c0_offset / 4, b.set, b.binding);
+                std::snprintf(tmp, sizeof tmp, "sb[c0+0x%x]=s%ub%u", m.c0_offset / 4, set, binding);
             else
-                std::snprintf(tmp, sizeof tmp, "sb[?]=s%ub%u", b.set, b.binding);
+                std::snprintf(tmp, sizeof tmp, "sb[?]=s%ub%u", set, binding);
             break;
         default: {
             bool image = b.type == DescriptorType::StorageImage || b.type == DescriptorType::StorageTexelBuffer;
             std::string arr = b.count != 1 ? "x" + std::to_string(b.count) : "";
-            std::snprintf(tmp, sizeof tmp, "%s%s[c%d:%d%s]=s%ub%u", image ? "img" : "tex",
-                          sampler_type_text(b.image).c_str(), m.default_bank ? -1 : m.bank, m.word, arr.c_str(), b.set,
-                          b.binding);
+            const std::string type = b.type == DescriptorType::Sampler ? "None" : sampler_type_text(b.image);   // the sampler pool array
+            std::snprintf(tmp, sizeof tmp, "%s%s[c%d:%d%s]=s%ub%u", image ? "img" : "tex", type.c_str(), m.default_bank ? -1 : m.bank, m.word,
+                          arr.c_str(), set, binding);
         }
         }
         if (!tmp[0]) continue;
@@ -805,39 +774,37 @@ std::string describe_like_harness(const ShaderReflection& refl) {
 
 namespace {
 // NVN2 compute shaders read their resources from a per-program table in c[0] (Switch 1 used 0x210/0x310 and c[2]):
-// 0x10 header bytes, then 0x10 per uniform block descriptor, 0x10 per storage buffer descriptor, 8 per texture handle,
-// 8 per image handle, slot n = NVN binding n. The counts are control bytes +0xb1/+0xb2/+0xb3/+0xb6, and the table size at
-// u16 +0xba equals 0x10 + 0x10 * (ubos + ssbos) + 8 * (textures + images) in all 3,142 compute blocks of the corpus.
-// Checked on e764a3f2 (sb at 0x10), 62619a57 (3 ubos: sb at 0x40, texture at 0x50), 7dbc445a (texture 0x40, image 0x48)
-// and 0034791c (2 ubos, 30 textures from 0x30 by GLSLC binding, image at 0x120).
+// 0x10 header bytes, 4 * control byte +0xa9 bytes of push constant data (nvnCommandBufferPushComputeConstants), then 0x10 per
+// uniform block descriptor, 0x10 per storage buffer descriptor, 8 per texture handle, 8 per image handle, slot n = NVN binding n.
+// The counts are control bytes +0xb1/+0xb2/+0xb3/+0xb6, and the table size at u16 +0xba equals
+// 0x10 + 4 * push words + 0x10 * (ubos + ssbos) + 8 * (textures + images) in all 3,142 compute blocks of Pokopia's corpus (no push
+// words there) and all 118 of Fortune's Weave's (28 push words in 38 of them, whose storage buffer and texture words the translated code
+// reads all fall in the shifted ranges). Checked on e764a3f2 (sb at 0x10), 62619a57 (3 ubos: sb at 0x40, texture at 0x50), 7dbc445a
+// (texture 0x40, image 0x48), 0034791c (2 ubos, 30 textures from 0x30 by GLSLC binding, image at 0x120) and Fortune's Weave's
+// 09b66614 (28 push words, 1 ubo: sb at 0x90, image at 0xa0).
 void apply_nvn2_compute_table(ShaderReflection& refl, const ShaderControl& c) {
     if (!c.nvn2 || c.stage != 5) return;
-    // The header is 0x10 bytes in every Pokopia block but 0x80 in Fortune's Weave's (SDK 22: every compute block checked, e.g. 09b66614:
-    // 1 ubo, 1 ssbo, 1 image, table 0xa8, storage buffer read at 0x90, image at 0xa0; eaac1801: 1 ubo, 1 texture, 1 image, table 0xa0):
-    // the slots end where the table ends, so the header is the size less the slots. A size smaller than the slots (or 0) keeps 0x10.
-    const int slots = 0x10 * (c.c0_ubos + c.c0_ssbos) + 8 * (c.c0_textures + c.c0_images);
-    const int ub0 = c.c0_table_size >= slots + 0x10 ? c.c0_table_size - slots : 0x10;
-    const int sb0 = ub0 + 0x10 * c.c0_ubos, tex0 = sb0 + 0x10 * c.c0_ssbos;
+    const int ub0 = 0x10 + 4 * c.c0_push_words, sb0 = ub0 + 0x10 * c.c0_ubos, tex0 = sb0 + 0x10 * c.c0_ssbos;
     const int img0 = tex0 + 8 * c.c0_textures, end = img0 + 8 * c.c0_images;
     for (DescriptorBinding& b : refl.bindings) {
         NvnMeaning& m = b.nvn;
+        if (m.source == NvnSource::TexturePoolArray || m.source == NvnSource::SamplerPoolArray) continue;
         if (b.type == DescriptorType::StorageBuffer) {
             const int off = m.c0_offset;
             if (off < ub0 || off >= tex0 || off % 0x10) continue;
             if (off < sb0) m.source = NvnSource::UniformAsStorage, m.index = (off - ub0) / 0x10;
             else m.source = NvnSource::StorageBuffer, m.index = (off - sb0) / 0x10;
-        } else if (b.type != DescriptorType::UniformBuffer && m.bank == 0 && m.word >= 0) {
+        } else if (b.type != DescriptorType::UniformBuffer && m.bank == 0 && m.word >= 0 && m.word < 0x4000) {
             const int off = m.word * 4;
             const bool image = b.type == DescriptorType::StorageImage || b.type == DescriptorType::StorageTexelBuffer;
-            const int base = image ? img0 : tex0, limit = image ? end : img0;
             if (!image && off >= img0 && off < end && off % 8 == 0) {
-                // TEX on an image slot (FEFW's probe filters eaac1801 / 8ab94383 sample the texture they write, one face / level at a
-                // time): an NVN image handle is a texture pool id, so the sampler binding reads the image binding's texture
-                m.source = NvnSource::SamplerBinding;
+                // a texture read through an image slot's handle (texture id, sampler 0): the shader samples the image it writes (23 of
+                // Fortune's Weave's 118 compute shaders, all with push words)
+                m.source = NvnSource::ImageBinding;
                 m.index = (off - img0) / 8;
-                m.from_image = true;
                 continue;
             }
+            const int base = image ? img0 : tex0, limit = image ? end : img0;
             if (off < base || off >= limit || off % 8) continue;
             m.source = image ? NvnSource::ImageBinding : NvnSource::SamplerBinding;
             m.index = (off - base) / 8;
@@ -845,6 +812,66 @@ void apply_nvn2_compute_table(ShaderReflection& refl, const ShaderControl& c) {
     }
 }
 }  // namespace
+
+int pool_binding_of(const DescriptorBinding& b) {
+    if (b.nvn.source == NvnSource::SamplerPoolArray) return b.type == DescriptorType::Sampler ? int(kPoolSamplers) : -1;
+    if (b.nvn.source != NvnSource::TexturePoolArray || b.type != DescriptorType::SampledImage) return -1;
+    const ImageShape& s = b.image;
+    if (s.arrayed || s.ms || s.component != ScalarType::Float) return -1;
+    return s.dim == 1 ? int(kPoolTex2D) : s.dim == 3 ? int(kPoolTexCube) : -1;
+}
+
+bool move_pool_arrays(std::vector<uint32_t>& w, ShaderReflection& refl, std::string* error) {
+    auto fail = [&](std::string why) {
+        if (error) *error = std::move(why);
+        return false;
+    };
+    struct Move { uint32_t set, binding, to; bool done; };
+    std::vector<Move> moves;
+    for (const DescriptorBinding& b : refl.bindings) {
+        if (b.nvn.source != NvnSource::TexturePoolArray && b.nvn.source != NvnSource::SamplerPoolArray) continue;
+        const int to = pool_binding_of(b);
+        if (to < 0) return fail("pool array " + b.name + " has an image shape the pool set does not have");
+        const uint32_t cap = to == int(kPoolSamplers) ? kPoolSamplerCount : kPoolTextureCount;
+        if (b.count == 0 || b.count > cap) return fail("pool array " + b.name + " is longer than the pool set's");
+        moves.push_back({b.declared_set, b.declared_binding, uint32_t(to), false});   // the words as translated (also when read again)
+    }
+    if (moves.empty()) return true;
+    // id -> word index of the literal of its DescriptorSet / Binding decoration
+    std::unordered_map<uint32_t, std::pair<size_t, size_t>> at;
+    for (size_t i = 5; i < w.size();) {
+        const uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
+        if (wc == 0 || i + wc > w.size()) return fail("truncated instruction");
+        if (op == OpDecorate && wc >= 4 && (w[i + 2] == DecDescriptorSet || w[i + 2] == DecBinding)) {
+            auto& e = at.try_emplace(w[i + 1], SIZE_MAX, SIZE_MAX).first->second;
+            (w[i + 2] == DecDescriptorSet ? e.first : e.second) = i + 3;
+        }
+        i += wc;
+    }
+    for (auto& [id, e] : at) {
+        if (e.first == SIZE_MAX || e.second == SIZE_MAX) continue;
+        for (Move& mv : moves)
+            if (!mv.done && w[e.first] == mv.set && w[e.second] == mv.binding) {
+                w[e.first] = kPoolSet;
+                w[e.second] = mv.to;
+                mv.done = true;
+                break;
+            }
+    }
+    for (const Move& mv : moves)
+        if (!mv.done) return fail("pool array decoration not found");
+    for (DescriptorBinding& b : refl.bindings)
+        for (const Move& mv : moves)
+            if (b.declared_set == mv.set && b.declared_binding == mv.binding) {
+                b.set = kPoolSet;
+                b.binding = mv.to;
+                break;
+            }
+    std::sort(refl.bindings.begin(), refl.bindings.end(), [](const DescriptorBinding& a, const DescriptorBinding& b) {
+        return a.set != b.set ? a.set < b.set : a.binding < b.binding;
+    });
+    return true;
+}
 
 bool make_shader_info(const uint8_t* code, const uint8_t* control, std::vector<uint32_t> spirv,
                       const std::string* resources, ShaderInfo& out, std::string* error, const ShaderReflection* pre_refl) {
@@ -874,7 +901,7 @@ bool make_shader_info(const uint8_t* code, const uint8_t* control, std::vector<u
         if (!apply_harness(out.refl, list)) return fail("resources record does not match the SPIR-V");
     }
     apply_nvn2_compute_table(out.refl, c);
-    return true;
+    return move_pool_arrays(out.spirv, out.refl, error);
 }
 
 const char* stage_name(ShaderStage s) {
@@ -900,7 +927,9 @@ const char* source_name(NvnSource s) {
     case NvnSource::SamplerBinding: return "sampler binding";
     case NvnSource::ImageBinding: return "image binding";
     case NvnSource::HandleInUniform: return "handle in uniform block";
-    case NvnSource::ColorTransform: return "c[24] output colour transform";
+    case NvnSource::PushConstants: return "push constants";
+    case NvnSource::TexturePoolArray: return "texture pool array";
+    case NvnSource::SamplerPoolArray: return "sampler pool array";
     default: return "unknown";
     }
 }
@@ -930,7 +959,272 @@ std::string column_text(std::string_view line, int col) {
     return std::string(line.substr(start, tab == std::string_view::npos ? std::string_view::npos : tab - start));
 }
 
+// ---- the preload pack ---------------------------------------------------------------------------------------------
+// <dir>.preload.pack (shader_cache/spirv.preload.pack: beside the cache directory, not in it; under Wine a file name that is not there
+// costs a case-insensitive scan of its whole directory, 3 s for the 99k-file cache on a microSD card) holds the .spv files of the order
+// file in one file, in that order, each one zstd frame. Read as thousands of
+// separate files from a microSD card (the Steam Deck), the boot preload ran at ~15 MB/s and the game sat on a black screen for a minute
+// or more; the pack is ~4x smaller and is read front to back (pack_prefetch).
+// Layout, little endian: PackHeader, the frames, then `count` PackDiskEntry. line_hash is FNV-1a 64 of the shader's results.tsv line when
+// the entry was written: an entry whose line has changed since (the shader was translated again) is not used, its .spv file is.
+// The runtime writes the pack itself: when a run's boot preload is done and the order file lists shaders the pack lacks, a background
+// thread (lowest priority) writes <dir>.preload.pack.new from the pack's own frames and the missing .spv files; the next start renames it to
+// preload.pack before opening it (the open pack is never replaced under a running game). [nvn] shader_pack = 0: no pack, read or written.
+constexpr char kPackMagic[8] = {'N', 'X', 'S', 'P', 'A', 'C', 'K', '1'};
+constexpr uint32_t kPackVersion = 1;
+constexpr int kPackLevel = 6;            // zstd level: ~3.8x on SPIR-V at ~200 MB/s (level 19 is ~5x at ~5 MB/s)
+struct PackHeader {
+    char magic[8];
+    uint32_t version;
+    uint32_t count;
+    uint64_t index_offset;
+    uint64_t reserved;
+};
+struct PackDiskEntry {
+    char hash[16];
+    uint64_t line_hash;
+    uint64_t offset;
+    uint32_t csize;
+    uint32_t usize;
+};
+static_assert(sizeof(PackHeader) == 32 && sizeof(PackDiskEntry) == 40, "preload.pack layout");
+
+// <dir>.preload.pack<suffix>; a trailing separator of the cache directory is dropped, so the file stays beside the directory.
+std::string pack_path(std::string dir, const char* suffix) {
+    while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
+    return dir + ".preload.pack" + suffix;
+}
+
+bool pack_enabled() {
+    static const bool on = nxrt::config_get_bool("nvn", "shader_pack", true);
+    return on;
+}
+
+uint64_t fnv1a64(std::string_view s) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+std::wstring widen(const std::string& s) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>(std::max(n, 0)), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+}
+
+// A positional read: threads share the handle (under Wine a pread; Windows serialises reads on a synchronous handle, still correct).
+bool read_at(void* file, uint64_t off, void* dst, uint32_t n) {
+    OVERLAPPED ov = {};
+    ov.Offset = static_cast<DWORD>(off);
+    ov.OffsetHigh = static_cast<DWORD>(off >> 32);
+    DWORD got = 0;
+    return ReadFile(static_cast<HANDLE>(file), dst, n, &got, &ov) && got == n;
+}
+
+uint64_t now_ms() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 }  // namespace
+
+// open(), lock_ held: results_ and lines_ are in place.
+void ShaderCache::pack_open() {
+    if (!pack_enabled()) return;
+    const std::wstring path = widen(pack_path(dir_, "")), fresh = widen(pack_path(dir_, ".new"));
+    if (GetFileAttributesW(fresh.c_str()) != INVALID_FILE_ATTRIBUTES && !MoveFileExW(fresh.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING))
+        NXLOG_W("nvn", "shader pack: preload.pack.new could not replace preload.pack (error %lu)", static_cast<unsigned long>(GetLastError()));
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    PackHeader h = {};
+    LARGE_INTEGER size = {};
+    const bool head_ok = GetFileSizeEx(f, &size) && read_at(f, 0, &h, sizeof h) && !std::memcmp(h.magic, kPackMagic, sizeof h.magic) &&
+                         h.version == kPackVersion && h.count <= 1000000 && h.index_offset >= sizeof h &&
+                         h.index_offset + uint64_t{h.count} * sizeof(PackDiskEntry) == static_cast<uint64_t>(size.QuadPart);
+    std::vector<PackDiskEntry> idx(head_ok ? h.count : 0);
+    if (!head_ok || (h.count && !read_at(f, h.index_offset, idx.data(), static_cast<uint32_t>(idx.size() * sizeof(PackDiskEntry))))) {
+        NXLOG_W("nvn", "shader pack: preload.pack is not a pack this runtime reads: the .spv files are read (and a new pack written)");
+        CloseHandle(f);
+        return;
+    }
+    size_t stale = 0;
+    uint64_t bytes = 0;
+    for (const PackDiskEntry& e : idx) {
+        std::string hash(e.hash, sizeof e.hash);
+        auto ln = lines_.find(hash);
+        if (ln == lines_.end() || fnv1a64(std::string_view(results_.data() + ln->second.first, ln->second.second)) != e.line_hash ||
+            e.offset < sizeof h || e.csize == 0 || e.offset + e.csize > h.index_offset || e.usize == 0 || e.usize % 4 || e.usize > (64u << 20)) {
+            stale++;
+            continue;
+        }
+        bytes += e.usize;
+        pack_.emplace(std::move(hash), PackEntry{e.offset, e.csize, e.usize});
+    }
+    pack_file_ = f;
+    pack_data_end_ = h.index_offset;
+    NXLOG_I("nvn", "shader pack: preload.pack has %zu shaders (%llu MiB of SPIR-V in %llu MiB)%s", pack_.size(),
+            static_cast<unsigned long long>(bytes >> 20), static_cast<unsigned long long>(h.index_offset >> 20),
+            stale ? (", " + std::to_string(stale) + " translated again since and read from their .spv files").c_str() : "");
+}
+
+bool ShaderCache::pack_read(const std::string& hash, std::string& out) {
+    if (!pack_file_) return false;
+    auto it = pack_.find(hash);
+    if (it == pack_.end()) return false;
+    const PackEntry& e = it->second;
+    thread_local std::string comp;
+    comp.resize(e.csize);
+    if (!read_at(pack_file_, e.offset, comp.data(), e.csize)) return false;
+    out.resize(e.usize);
+    const size_t n = ZSTD_decompress(out.data(), out.size(), comp.data(), comp.size());
+    if (ZSTD_isError(n) || n != e.usize) {
+        out.clear();
+        return false;
+    }
+    return true;
+}
+
+bool ShaderCache::read_spv(const std::string& hash, std::string& out) {
+    if (pack_read(hash, out)) {
+        pre_from_pack_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    pre_from_files_.fetch_add(1, std::memory_order_relaxed);
+    return read_file(dir_ + "/" + hash + ".spv", out);
+}
+
+// Reads the frames front to back on its own handle, ahead of the workers: one sequential read of the card, whose data the workers' reads
+// then find in the operating system's cache.
+void ShaderCache::pack_prefetch() {
+    log_set_thread_name("nvn-pack-read");
+    const uint64_t t0 = now_ms();
+    HANDLE f = CreateFileW(widen(pack_path(dir_, "")).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    std::vector<char> buf(8u << 20);
+    uint64_t off = 0;
+    while (off < pack_data_end_ && !pack_stop_.load(std::memory_order_relaxed)) {
+        DWORD got = 0;
+        const DWORD want = static_cast<DWORD>(std::min<uint64_t>(buf.size(), pack_data_end_ - off));
+        if (!ReadFile(f, buf.data(), want, &got, nullptr) || got == 0) break;
+        off += got;
+    }
+    CloseHandle(f);
+    const uint64_t ms = std::max<uint64_t>(1, now_ms() - t0);
+    NXLOG_I("nvn", "shader pack: read %llu MiB in %.1f s (%.0f MB/s)", static_cast<unsigned long long>(off >> 20), ms / 1000.0,
+            static_cast<double>(off) / 1000.0 / static_cast<double>(ms));
+}
+
+// The last preload worker, as it ends.
+void ShaderCache::preload_done() {
+    NXLOG_I("nvn", "shader preload: done after %.1f s (%llu .spv reads from preload.pack, %llu from separate files so far)",
+            (now_ms() - pre_start_ms_) / 1000.0, static_cast<unsigned long long>(pre_from_pack_.load()),
+            static_cast<unsigned long long>(pre_from_files_.load()));
+}
+
+// Started with the preload when the pack lacks shaders of the order file; writes once the preload is done (or after 90 s: workers wait
+// while the prepared shaders the game has not taken fill [nvn] shader_preload_mb, and may then never end), so the boot reads come first.
+void ShaderCache::pack_build(size_t missing) {
+    log_set_thread_name("nvn-pack-write");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    while (pre_live_.load() > 0 && now_ms() - pre_start_ms_ < 90000) {
+        if (pack_stop_.load()) return;
+        Sleep(250);
+    }
+    const uint64_t t0 = now_ms();
+    const std::string tmp_path = pack_path(dir_, ".tmp");
+    const std::wstring tmp = widen(tmp_path), out = widen(pack_path(dir_, ".new"));
+    NXLOG_I("nvn", "shader pack: writing preload.pack.new (%zu shaders of the order file, %zu not in preload.pack yet)", pre_list_.size(), missing);
+    HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        NXLOG_W("nvn", "shader pack: cannot create %s (error %lu)", tmp_path.c_str(), static_cast<unsigned long>(GetLastError()));
+        return;
+    }
+    auto put = [f](const void* p, size_t n) {
+        DWORD w = 0;
+        return WriteFile(f, p, static_cast<DWORD>(n), &w, nullptr) && w == n;
+    };
+    PackHeader h = {};
+    std::memcpy(h.magic, kPackMagic, sizeof h.magic);
+    h.version = kPackVersion;
+    bool ok = put(&h, sizeof h);     // count and index_offset are filled in at the end
+    uint64_t off = sizeof h, raw_total = 0;
+    std::vector<PackDiskEntry> idx;
+    idx.reserve(pre_list_.size());
+    std::unordered_set<std::string> seen;
+    std::string raw, comp;
+    size_t reused = 0, compressed = 0, skipped = 0;
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    for (const std::string& hash : pre_list_) {
+        if (!ok || !cc) break;
+        if (pack_stop_.load(std::memory_order_relaxed)) {
+            ok = false;
+            break;
+        }
+        if (hash.size() != sizeof(PackDiskEntry::hash) || !seen.insert(hash).second) continue;
+        PackDiskEntry e = {};
+        std::memcpy(e.hash, hash.data(), sizeof e.hash);
+        {
+            std::lock_guard lk(lock_);
+            auto ln = lines_.find(hash);
+            if (ln == lines_.end()) {
+                skipped++;
+                continue;
+            }
+            e.line_hash = fnv1a64(std::string_view(results_.data() + ln->second.first, ln->second.second));
+        }
+        if (auto it = pack_.find(hash); it != pack_.end()) {          // still current in the old pack: its frame as it is
+            comp.resize(it->second.csize);
+            if (!read_at(pack_file_, it->second.offset, comp.data(), it->second.csize)) {
+                skipped++;
+                continue;
+            }
+            e.usize = it->second.usize;
+            reused++;
+        } else {
+            if (!read_file(dir_ + "/" + hash + ".spv", raw) || raw.empty() || raw.size() % 4 || raw.size() > (64u << 20)) {
+                skipped++;
+                continue;
+            }
+            comp.resize(ZSTD_compressBound(raw.size()));
+            const size_t n = ZSTD_compressCCtx(cc, comp.data(), comp.size(), raw.data(), raw.size(), kPackLevel);
+            if (ZSTD_isError(n)) {
+                skipped++;
+                continue;
+            }
+            comp.resize(n);
+            e.usize = static_cast<uint32_t>(raw.size());
+            compressed++;
+        }
+        e.offset = off;
+        e.csize = static_cast<uint32_t>(comp.size());
+        ok = put(comp.data(), comp.size());
+        off += comp.size();
+        raw_total += e.usize;
+        idx.push_back(e);
+    }
+    if (cc) ZSTD_freeCCtx(cc);
+    ok = ok && cc && !idx.empty();
+    if (ok) {
+        h.count = static_cast<uint32_t>(idx.size());
+        h.index_offset = off;
+        LARGE_INTEGER zero = {};
+        ok = put(idx.data(), idx.size() * sizeof(PackDiskEntry)) && SetFilePointerEx(f, zero, nullptr, FILE_BEGIN) && put(&h, sizeof h);
+    }
+    ok = ok && FlushFileBuffers(f);   // on the card before the rename: a card pulled early leaves the old pack, never half a new one
+    CloseHandle(f);
+    if (!ok || !MoveFileExW(tmp.c_str(), out.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        if (!pack_stop_.load()) NXLOG_W("nvn", "shader pack: writing preload.pack.new failed (error %lu)", static_cast<unsigned long>(GetLastError()));
+        return;
+    }
+    NXLOG_I("nvn", "shader pack: wrote preload.pack.new in %.1f s: %zu shaders (%zu from preload.pack, %zu compressed, %zu skipped), "
+                   "%llu MiB of SPIR-V in %llu MiB; it is used from the next start", (now_ms() - t0) / 1000.0, idx.size(), reused, compressed, skipped,
+            static_cast<unsigned long long>(raw_total >> 20), static_cast<unsigned long long>(off >> 20));
+}
 
 bool ShaderCache::open(const std::string& dir) {
     std::lock_guard lk(lock_);
@@ -978,6 +1272,7 @@ bool ShaderCache::open(const std::string& dir) {
     dir_ = dir;
     open_ = true;
     NXLOG_I("nvn", "shader cache %s: %zu records", dir.c_str(), lines_.size());
+    pack_open();
     start_preload();
     return true;
 }
@@ -1003,10 +1298,26 @@ void ShaderCache::start_preload() {
     if (pre_list_.empty() || threads == 0) return;
     NXLOG_I("nvn", "shader preload: %zu shaders from %s on %lld threads", pre_list_.size(), order_path_.c_str(),
             static_cast<long long>(threads));
+    pre_start_ms_ = now_ms();
+    pre_live_.store(static_cast<int>(threads));
+    if (pack_file_ && !pack_.empty()) pack_prefetch_thread_ = std::thread([this] { pack_prefetch(); });
+    if (pack_enabled()) {
+        size_t missing = 0;
+        for (const std::string& h : pre_list_)
+            if (!pack_.count(h)) missing++;
+        // A handful of new shaders is not worth rewriting a few hundred MB on the card: they are read from their files until more come.
+        if (missing >= 32 || (missing && missing * 50 >= pre_list_.size())) pack_build_thread_ = std::thread([this, missing] { pack_build(missing); });
+    }
     for (int64_t i = 0; i < threads; ++i) pre_threads_.emplace_back([this] { preload_worker(); });
 }
 
 void ShaderCache::preload_worker() {
+    struct LastOut {
+        ShaderCache* c;
+        ~LastOut() {
+            if (c->pre_live_.fetch_sub(1) == 1) c->preload_done();
+        }
+    } last_out{this};
     for (;;) {
         std::string hash;
         {
@@ -1038,7 +1349,7 @@ std::unique_ptr<ShaderCache::Preloaded> ShaderCache::preload_one(const std::stri
         if (by_hash_.count(hash)) return nullptr;   // the game got there first
     }
     std::string bytes;
-    if (!read_file(dir_ + "/" + hash + ".spv", bytes) || bytes.empty() || bytes.size() % 4) return nullptr;
+    if (!read_spv(hash, bytes) || bytes.empty() || bytes.size() % 4) return nullptr;
     auto p = std::make_unique<Preloaded>();
     p->words.resize(bytes.size() / 4);
     std::memcpy(p->words.data(), bytes.data(), bytes.size());
@@ -1094,14 +1405,17 @@ void ShaderCache::flush_order(const std::string& lines) {
 }
 
 ShaderCache::~ShaderCache() {
-    if (worker_) worker_->stop();   // its reader thread calls add_record
     {
         std::lock_guard lk(pre_mu_);
         pre_stop_ = true;
     }
     pre_cv_.notify_all();
+    pack_stop_.store(true);
     for (std::thread& t : pre_threads_)
         if (t.joinable()) t.join();
+    if (pack_prefetch_thread_.joinable()) pack_prefetch_thread_.join();
+    if (pack_build_thread_.joinable()) pack_build_thread_.join();
+    if (pack_file_) CloseHandle(static_cast<HANDLE>(pack_file_));
     if (!order_pending_.empty() && !order_path_.empty()) {
         std::ofstream f(order_path_, std::ios::binary | std::ios::app);
         if (f) f << order_pending_;
@@ -1112,8 +1426,7 @@ namespace {
 void dump_missing_block(const std::string& hash, const uint8_t* code, const uint8_t* control, uint32_t code_size);
 }
 
-const ShaderInfo* ShaderCache::find(const uint8_t* code, const uint8_t* control, FindMiss* miss) {
-    if (miss) *miss = FindMiss{};
+const ShaderInfo* ShaderCache::find(const uint8_t* code, const uint8_t* control) {
     if (!code || !control) return nullptr;
     ShaderControl c = read_control(control);
     if (!c.valid || c.code_size == 0 || c.code_size > 16u << 20) {
@@ -1136,36 +1449,9 @@ const ShaderInfo* ShaderCache::find(const uint8_t* code, const uint8_t* control,
             }
         }
     }
-    if (miss) miss->hash = hash;
     if (!is_open) {   // no cache at all: every block is missing, and still goes to [nvn] dump_missing
         dump_missing_block(hash, code, control, c.code_size);
         return nullptr;
-    }
-    // On-demand translation: a block without a results.tsv record goes to the translator (a .spv without its record, which the launcher's
-    // setup may have written since this run read results.tsv, is translated again: it is the record that is missing). Until it answers the
-    // stage is pending; the caller skips what needs it.
-    if (!have_record && worker_) {
-        using St = ShaderTranslatorClient::State;
-        St st = worker_->state(hash);
-        if (st == St::Unknown && worker_->running()) {
-            NXFT("shader.ondemand_submit");
-            const uint32_t ctrl_bytes = c.nvn2 ? std::max<uint32_t>(0xd8, rd32(control + 0x30)) : 0x880;
-            worker_->submit(hash, code, c.code_size, control, ctrl_bytes);
-            dump_missing_block(hash, code, control, c.code_size);   // [nvn] dump_missing: every block sent to the translator too
-            st = worker_->state(hash);
-        }
-        if (st == St::Pending) {
-            if (miss) miss->pending = true;
-            return nullptr;
-        }
-        if (st == St::Done) {   // add_record put its row in before the state turned Done
-            std::lock_guard lk(lock_);
-            if (auto it = by_hash_.find(hash); it != by_hash_.end()) return it->second.get();
-            if (auto ln = lines_.find(hash); ln != lines_.end()) {
-                record = column_text(std::string_view(results_.data() + ln->second.first, ln->second.second), resources_col_);
-                have_record = true;
-            }
-        }
     }
     return load(hash, code, control, c.code_size, have_record ? &record : nullptr);
 }
@@ -1229,7 +1515,7 @@ const ShaderInfo* ShaderCache::load(const std::string& hash, const uint8_t* code
         words = std::move(pre->words);
     } else {
         std::string bytes;
-        if (!read_file(dir_ + "/" + hash + ".spv", bytes) || bytes.empty() || bytes.size() % 4) {
+        if (!read_spv(hash, bytes) || bytes.empty() || bytes.size() % 4) {
             dump_missing_block(hash, code, control, code_size);
             return miss("no usable " + dir_ + "/" + hash + ".spv");
         }
@@ -1274,7 +1560,7 @@ const ShaderInfo* ShaderCache::load_stub(const std::string& hash) {
         dir = dir_;
     }
     std::string bytes;
-    if (!read_file(dir + "/" + hash + ".spv", bytes) || bytes.empty() || bytes.size() % 4) {
+    if (!read_spv(hash, bytes) || bytes.empty() || bytes.size() % 4) {
         if (!existing) {
             std::lock_guard lk(lock_);
             stubs_.emplace(hash, nullptr);
@@ -1284,6 +1570,8 @@ const ShaderInfo* ShaderCache::load_stub(const std::string& hash) {
     std::vector<uint32_t> words(bytes.size() / 4);
     std::memcpy(words.data(), bytes.data(), bytes.size());
     if (existing) {                         // the words were dropped: put them back (the reflection is kept)
+        ShaderReflection again = existing->refl;
+        if (!move_pool_arrays(words, again)) return existing;
         std::lock_guard lk(lock_);
         if (existing->spirv.empty()) existing->spirv = std::move(words);
         return existing;
@@ -1296,6 +1584,7 @@ const ShaderInfo* ShaderCache::load_stub(const std::string& hash) {
         std::vector<HarnessResource> list;
         if (!parse_harness_resources(record, list) || !apply_harness(info->refl, list)) info.reset();
     }
+    if (info && !move_pool_arrays(words, info->refl, &error)) info.reset();
     if (info) {
         info->stage = info->refl.stage;
         info->spirv = std::move(words);
@@ -1316,67 +1605,6 @@ void ShaderCache::release_stub_spirv(const ShaderInfo* s) {
     auto it = stubs_.find(s->hash);
     if (it == stubs_.end() || it->second.get() != s) return;
     std::vector<uint32_t>().swap(it->second->spirv);
-}
-
-void ShaderCache::add_record(const std::string& hash, const std::string& row) {
-    if (row.empty()) return;
-    std::lock_guard lk(lock_);
-    if (!open_ || lines_.count(hash)) return;
-    const size_t off = results_.size();   // lines_ keeps offsets, so the string may move
-    results_ += row;
-    results_ += '\n';
-    lines_.emplace(hash, std::make_pair(off, row.size()));
-}
-
-namespace {
-std::string exe_folder_utf8();
-}
-
-bool ShaderCache::start_translator() {
-    if (!is_open() || worker_) return false;
-    std::string harness = nxrt::config_get_str("nvn", "shader_translator", "");
-    if (harness == "off" || harness == "0") {
-        NXLOG_I("nvn", "on-demand shader translation off ([nvn] shader_translator = off)");
-        return false;
-    }
-    std::error_code ec;
-    if (harness.empty()) {
-        const std::string exe = exe_folder_utf8();
-        if (!exe.empty()) harness = exe + "/tools/spirv_harness/spirv_harness.exe";
-    }
-    if (harness.empty() || !std::filesystem::is_regular_file(harness, ec)) {
-        NXLOG_I("nvn", "on-demand shader translation off: no translator at %s; blocks missing from the cache stay missing",
-                harness.empty() ? "<exe folder>/tools/spirv_harness/spirv_harness.exe" : harness.c_str());
-        return false;
-    }
-    ShaderTranslatorClient::Options opt;
-    opt.harness = harness;
-    opt.cache_dir = dir_;
-    std::string corpus = nxrt::config_get_str("nvn", "shader_corpus", "");
-    if (corpus.empty()) corpus = (std::filesystem::path(dir_).parent_path() / "corpus").string();
-    if (std::filesystem::is_regular_file(std::filesystem::path(corpus) / "unique_all.tsv", ec) ||
-        std::filesystem::is_regular_file(std::filesystem::path(corpus) / "unique.tsv", ec))
-        opt.corpus_dir = corpus;
-    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const int64_t def_jobs = std::clamp<int64_t>(hw / 2, 2, 8);
-    opt.jobs = static_cast<int>(std::clamp<int64_t>(nxrt::config_get_int("nvn", "shader_translate_jobs", def_jobs), 1, 64));
-    auto w = std::make_unique<ShaderTranslatorClient>();
-    std::string error;
-    const bool ok = w->start(
-        opt, [this](const std::string& hash, const std::string& row, bool) { add_record(hash, row); },
-        [](bool warn, const std::string& text) {
-            if (warn) NXLOG_W("nvn", "%s", text.c_str());
-            else NXLOG_I("nvn", "%s", text.c_str());
-        },
-        &error);
-    if (!ok) {
-        NXLOG_W("nvn", "on-demand shader translation off: %s", error.c_str());
-        return false;
-    }
-    worker_ = std::move(w);
-    NXLOG_I("nvn", "on-demand shader translation on: %s, %d jobs, corpus %s; draws and dispatches that need a block being translated are skipped",
-            harness.c_str(), opt.jobs, opt.corpus_dir.empty() ? "none (the block bytes alone)" : opt.corpus_dir.c_str());
-    return true;
 }
 
 const ShaderInfo* ShaderCache::find_by_hash(const std::string& hash) {
@@ -1411,47 +1639,6 @@ static std::string exe_folder() {
 }
 
 namespace {
-std::string exe_folder_utf8() {
-    wchar_t buf[MAX_PATH];
-    const DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return {};
-    const std::u8string u = std::filesystem::path(buf).parent_path().u8string();
-    return std::string(u.begin(), u.end());
-}
-
-// Held open for the life of the process: the launcher's setup sees the game running (it cannot open the file for writing) and lowers its
-// own translation to idle priority. <cache dir>/../game_running.lock.
-void hold_game_lock(const std::string& cache_dir) {
-    static HANDLE h = INVALID_HANDLE_VALUE;
-    if (h != INVALID_HANDLE_VALUE) return;
-    const std::wstring p = (std::filesystem::path(cache_dir).parent_path() / "game_running.lock").wstring();
-    h = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-}
-
-// A cache folder without results.tsv: with a translator the cache starts empty and fills while the game runs (header only, the format
-// spirv_harness writes).
-bool make_empty_cache(const std::string& dir) {
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    std::ofstream f(dir + "/results.tsv", std::ios::binary | std::ios::app);
-    if (!f) return false;
-    f.seekp(0, std::ios::end);
-    if (f.tellp() == 0)
-        f << "hash\tgroup\tstage\tstages_using\tstatus\tms\tspv_bytes\tresources\ttranslator_messages\terror\tdraw_time_queries\tglslc_reflection\n";
-    return static_cast<bool>(f);
-}
-
-bool translator_installed() {
-    const std::string configured = nxrt::config_get_str("nvn", "shader_translator", "");
-    if (configured == "off" || configured == "0") return false;
-    std::error_code ec;
-    if (!configured.empty()) return std::filesystem::is_regular_file(configured, ec);
-    const std::string exe = exe_folder_utf8();
-    return !exe.empty() && std::filesystem::is_regular_file(exe + "/tools/spirv_harness/spirv_harness.exe", ec);
-}
-}  // namespace
-
-namespace {
 // Gauges (nxrt/gauge.h) for the process cache. Declared after the cache in shader_cache(), so it is destroyed before the cache.
 struct ShaderCacheGauges {
     explicit ShaderCacheGauges(const ShaderCache& c) {
@@ -1470,16 +1657,9 @@ ShaderCache& shader_cache() {
     static ShaderCacheGauges gauges(cache);
     static std::once_flag once;
     std::call_once(once, [] {
-        auto opened = [](const std::string& dir) {
-            hold_game_lock(dir);
-            cache.start_translator();
-        };
-        const bool translator = translator_installed();
         std::string configured = nxrt::config_get_str("nvn", "shader_cache", "");
         if (!configured.empty()) {
-            std::error_code ec;
-            if (translator && !std::filesystem::exists(configured + "/results.tsv", ec)) make_empty_cache(configured);
-            if (cache.open(configured)) opened(configured);  // logs its own failure
+            cache.open(configured);  // logs its own failure
             return;
         }
         // The working directory first, then the folder of the executable.
@@ -1488,16 +1668,7 @@ ShaderCache& shader_cache() {
         for (const std::string& dir : candidates) {
             std::error_code ec;
             if (!std::filesystem::exists(dir + "/results.tsv", ec)) continue;
-            if (cache.open(dir)) {
-                opened(dir);
-                return;
-            }
-        }
-        // No cache yet (the setup has not translated anything): with a translator, start an empty one beside the executable.
-        if (std::string exe = exe_folder(); translator && !exe.empty() && make_empty_cache(exe + "/shader_cache/spirv") &&
-                                            cache.open(exe + "/shader_cache/spirv")) {
-            opened(exe + "/shader_cache/spirv");
-            return;
+            if (cache.open(dir)) return;
         }
         NXLOG_W("nvn", "no shader cache: set [nvn] shader_cache (NXRT_NVN_SHADER_CACHE) to a folder with results.tsv");
     });

@@ -1,9 +1,15 @@
 // astc2bc7 library core. GPL-3.0-or-later.
 // Uses: ARM astcenc 5.7.0 (Apache-2.0) through per-ISA DLLs, bc7e.ispc from bc7enc_rdo (Apache-2.0, Binomial LLC).
+// Build switches: A2B_BC7E_CPP uses bc7e translated to C++ (src/bc7e_cpp.cpp) instead of the ISPC object; A2B_ASTC_STATIC calls an
+// astcenc decoder linked into the program instead of loading the DLLs (cmake/a2b_cpp.cmake sets both).
 #include "astc2bc7.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <intrin.h>
 
@@ -11,13 +17,19 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "astcenc.h"
+#ifdef A2B_BC7E_CPP
+#include "bc7e_cpp.h"
+namespace ispc = bc7e_cpp;
+#else
 #include "bc7e_ispc.h"
+#endif
 
 namespace {
 
@@ -36,6 +48,23 @@ AstcApi g_astc;
 std::mutex g_astc_mutex;
 std::once_flag g_bc7e_once;
 
+#ifdef A2B_ASTC_STATIC
+#ifndef A2B_ASTC_STATIC_ISA
+#define A2B_ASTC_STATIC_ISA "static"
+#endif
+a2b_status ensure_astc(const char*) {
+    std::lock_guard<std::mutex> lock(g_astc_mutex);
+    if (!g_astc.decompress) {
+        g_astc.isa = A2B_ASTC_STATIC_ISA;
+        g_astc.config_init = &astcenc_config_init;
+        g_astc.context_alloc = &astcenc_context_alloc;
+        g_astc.decompress = &astcenc_decompress_image;
+        g_astc.context_free = &astcenc_context_free;
+        g_astc.error_string = &astcenc_get_error_string;
+    }
+    return A2B_OK;
+}
+#else
 bool cpu_has_avx2() {
     int r[4];
     __cpuid(r, 0);
@@ -99,6 +128,7 @@ a2b_status ensure_astc(const char* dll_dir) {
         if (load_isa(dir, isa, g_astc)) return A2B_OK;
     return A2B_ERR_NO_ASTC_LIB;
 }
+#endif
 
 // ---------------------------------------------------------------- helpers
 template <class F>
@@ -130,6 +160,16 @@ uint64_t div_up(uint64_t a, uint64_t b) { return (a + b - 1) / b; }
 extern "C" {
 
 a2b_status a2b_init(const char* dll_dir) { return ensure_astc(dll_dir); }
+
+a2b_encoder a2b_bc7_encoder(const char** name) {
+#ifdef A2B_BC7E_CPP
+    if (name) *name = std::strcmp(bc7e_cpp::bc7e_cpp_variant(), "avx2") == 0 ? "bc7e C++ (AVX2)" : "bc7e C++ (x86-64)";
+    return A2B_ENCODER_CPP;
+#else
+    if (name) *name = "bc7e ISPC";
+    return A2B_ENCODER_ISPC;
+#endif
+}
 
 const char* a2b_status_string(a2b_status s) {
     switch (s) {
@@ -170,6 +210,41 @@ uint64_t a2b_output_size(const a2b_input* in) {
     return bb ? div_up(in->width, 4) * div_up(in->height, 4) * bb : 0;
 }
 
+// astcenc contexts are costly to make (block-size tables: tens of ms for some block sizes) and every decode used to make and free
+// one per thread; kept here per (profile, block size) and handed out one user at a time.
+namespace {
+struct CtxPool {
+    std::mutex m;
+    std::map<uint32_t, std::vector<astcenc_context*>> free;
+};
+CtxPool& ctx_pool() {
+    static CtxPool* p = new CtxPool;   // never freed: contexts may still be in use at exit
+    return *p;
+}
+uint32_t ctx_key(astcenc_profile prof, uint32_t bw, uint32_t bh) { return ((uint32_t)prof << 16) | (bw << 8) | bh; }
+astcenc_context* ctx_take(uint32_t key, const astcenc_config& cfg) {
+    {
+        CtxPool& p = ctx_pool();
+        std::lock_guard<std::mutex> lk(p.m);
+        auto& v = p.free[key];
+        if (!v.empty()) {
+            astcenc_context* c = v.back();
+            v.pop_back();
+            return c;
+        }
+    }
+    astcenc_context* c = nullptr;
+    if (g_astc.context_alloc(&cfg, 1, &c, nullptr) != ASTCENC_SUCCESS) return nullptr;
+    return c;
+}
+void ctx_give(uint32_t key, astcenc_context* c) {
+    if (!c) return;
+    CtxPool& p = ctx_pool();
+    std::lock_guard<std::mutex> lk(p.m);
+    p.free[key].push_back(c);
+}
+}  // namespace
+
 a2b_status a2b_decode_astc_rgba8(const a2b_input* in, const void* data, size_t data_size, int threads, uint8_t* rgba,
                                  a2b_stats* stats) {
     if (!in || !data || !rgba || !a2b_is_astc(in->format)) return A2B_ERR_ARGS;
@@ -194,13 +269,14 @@ a2b_status a2b_decode_astc_rgba8(const a2b_input* in, const void* data, size_t d
 
     if (threads <= 0) threads = (int)std::max(1u, std::thread::hardware_concurrency());
     const int nthreads = (int)std::min<size_t>((size_t)threads, bands);
+    const uint32_t key = ctx_key(prof, bw, bh);
     std::vector<astcenc_context*> ctx(nthreads, nullptr);
     std::atomic<int> failed{0};
     const astcenc_swizzle swz{ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A};
 
     parallel_for(bands, nthreads, [&](size_t band, int t) {
         if (failed.load()) return;
-        if (!ctx[t] && g_astc.context_alloc(&cfg, 1, &ctx[t], nullptr) != ASTCENC_SUCCESS) { failed = 1; return; }
+        if (!ctx[t] && !(ctx[t] = ctx_take(key, cfg))) { failed = 1; return; }
         const uint32_t by0 = (uint32_t)band * rows_per_band, by1 = std::min(blocks_y, by0 + rows_per_band);
         const uint32_t y0 = by0 * bh, y1 = std::min(h, by1 * bh);
         uint8_t* slice = rgba + (size_t)y0 * w * 4;
@@ -210,8 +286,7 @@ a2b_status a2b_decode_astc_rgba8(const a2b_input* in, const void* data, size_t d
         const size_t len = (size_t)(by1 - by0) * blocks_x * 16;
         if (g_astc.decompress(ctx[t], src, len, &img, &swz, 0) != ASTCENC_SUCCESS) failed = 1;
     });
-    for (auto* c : ctx)
-        if (c) g_astc.context_free(c);
+    for (auto* c : ctx) ctx_give(key, c);   // a context is reusable after any decompress (decompress_reset is only for multi-thread use of one context)
     if (stats) {
         stats->decode_seconds = now_s() - t0;
         stats->astc_isa = g_astc.isa;

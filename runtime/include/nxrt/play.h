@@ -51,9 +51,6 @@ struct StartOptions {
 };
 bool start(const StartOptions& opt);        // after nxrt::init, the renderer and the NVN back end; installs the hid input source and the hooks
 void stop();                                // saves changed settings, removes the hooks and the input source
-// The frame boundary for a game without a frame-update hook (GamePlay::frame_update): pumps the window events, reads the keyboard, mouse and
-// pads into the hid source and runs the play layer's per-frame work. Call once per presented frame on the thread that started play mode.
-void frame_boundary();
 
 // Counters for the tests and the log.
 struct Stats {

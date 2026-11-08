@@ -97,8 +97,6 @@ min = bytes the sdk itself touches or clears (safe for the back end to use); max
 | NVNdlssNetworkBuilder (new) | – | 0xB8 | – | texture IDs at +0x38, 128 bytes |
 | NVNdlssParameters (new) | – | 0xC0 | – | SetDefaults writes to +0xC0 |
 
-The three DLSS objects are fully mapped since goal 18 (field offsets in `src/gfx/nvn/api_dlss.cpp`, from the setters/getters and the packet of `nvnCommandBufferEvaluateDlss` 0x5DEBC0; the network is `memset` 0x220 by Initialize and carries an embedded memory pool at +200). Signature corrections to the Hex-Rays rows: `nvnDlssNetworkBuilderGetStorageSize(builder)` has one argument (the second is a scratch vector register), `nvnDlssNetworkResize(network, int w, int h)` takes the new output size, `nvnDlssNetworkBuilderGetOptimalSettings(builder, 6 x int*)` forwards six pointers to the driver, the texture arguments of the six `SetInputColor`-style calls are `(const NVNtexture*, const NVNtextureView* or null)`.
-
 Acceleration structures are not objects: they are memory the game sizes with `DeviceCalculateAccelerationStructureMemoryRequirements` and passes as addresses.
 
 Note for the back end: texture (0x80→0xC0), queue (0x2000→0x3000), command buffer, window, program and the queue/window builders grew. min is a lower bound from sdk code only; where max is bold the game's layout settles the size.
@@ -121,6 +119,25 @@ Note for the back end: texture (0x80→0xC0), queue (0x2000→0x3000), command b
 - **Control section header** (accessor getters, offsets from the control pointer): `+0 u32` (first field copied out; magic or kind, unconfirmed), `+4 u32 major = 201` (required), `+8 u32 minor` (≤ 17), `+0xC u16`, `+0xE u16`, stage `u8 @+0x56`, flag bytes `+0x70–0x76`, `+0x92–0x94`, `+0xA7`, embedded blob `offset u32 @+0xC8, size u32 @+0xCC` (copied verbatim into program memory), and for newer minors `+0xD1/+0xD2 u8`, `+0xD8/+0xDC u32`. The minor picks one of 7 accessor classes (minors 0–1, 2, 3–12, 13–14, 15, 16, 17); newer ones add fields, older ones return 0. Per-stage hardware state is 1564 bytes copied out of the parsed control.
 - **The sdk patches the shader code in place**: it maps the code GPU address back to CPU memory through the device's memory-pool list, then walks 16-byte instructions backwards from the end of the code looking at the low 9 opcode bits: 0x118 (NOP) is skipped, and a 0x147 (BRA) preceded by at least 8 NOPs gets a block of MOV-immediate instructions (`…0xFF7802`, scheduling words `0x000FC00000000F00`) written with the code size, a control value and the stage number. This is Volta-and-later 128-bit SASS. **Checked**; what the patched values mean is *inferred*.
 - **GPU class**: the device stores a compute class at device+0x14; QMD/compute code picks layouts for **0xC5C0 (Turing), 0xC7C0 (Ampere B) and 0xC9C0 (Ada)**, and several paths test `== 0xC9C0`. No 3D class constant (xx97) appears as an immediate. Which class the console reports is a runtime value, not settled here.
+
+## 6. Push constants (Fire Emblem: Fortune's Weave, NVN 231.40)
+
+Read in Fortune's Weave's sdk (SDK 22.2). The driver keeps its proc names in a sorted pool (u32 offsets at sdk 0xC7D240 into the strings at
+0xC77DB2, without the `nvn` prefix); the implementation of name n is at table 0xEA6528 + 8n, and the public thunk at 0x650DC0 + 16n jumps
+through a run-time copy at 0x1040978.
+
+- `nvnCommandBufferPushGraphicsConstants(cmdbuf, int slot, int offset, int size, const void* data)` (sdk 0x673660) and
+  `nvnCommandBufferPushComputeConstants` (0x673A60): nothing under 4 bytes, size clamped to 0x100, size / 4 words sent, `slot & 7`,
+  `offset & 0xFF` in bytes. Graphics: method 0x141, payload `(slot & 7) | (offset & 0xFF) << 8`, then the words. Compute: method 0x2EA6 at
+  word `0x4C + 64 * slot + offset / 4` of the driver's compute block, which is c[0] + 0x10 + 0x100 * slot + offset. **Checked.**
+- `...Deferred(cmdbuf, slot, offset, size, NVNbufferAddress)` (0x673810 / 0x673CC0) store a deferred record `{0x1E, slot, offset, size,
+  address}`: the data is read from GPU memory when the command runs. **Checked.**
+- Graphics shaders read slot n as constant bank 24 + n (the game's fragment shaders read slot 0 as c[0x18]; banks 25..31 *inferred*).
+  Compute shaders read it in c[0] after the 0x10-byte header: control byte +0xA9 = push words, and the c[0] resource table starts after
+  them, at `0x10 + 4 * ctrl[0xA9]`. c[0] +0x4 / +0x8 are the work-group counts x / y (one shader linearises its group id with them; +0xC = z
+  *inferred*).
+- The game (main 0xB5EAA8 graphics, 0xB5EAD8 compute) pushes 0x70 bytes to slot 0 at offset 0 once per pass: a 3x3 gamut matrix (rows at
+  0x0 / 0x10 / 0x20), luma weights at 0x30 (BT.709 or BT.2020, by the colour mode at graphics object +0x33B8) and brightness terms at 0x40..0x4C.
 
 ## How the tables were made
 
@@ -184,7 +201,7 @@ All in `work/nvn2/py/` (not committed): `mainload.py` (loader → slot per name)
 | 43 | nvnCommandBufferAddCommandMemory | 0x5C49C0 | v: ppll | v: ppll | same |  | 1 |
 | 44 | nvnCommandBufferAddControlMemory | 0x5C4BB0 | v: ppl | v: ppl | same |  | 1 |
 | 45 | nvnCommandBufferBarrier | 0x61CB70 | v: pi | v: pi | same |  | 13 |
-| 46 | nvnCommandBufferBeginDeviceCommands | 0x5DC220 | v: pp (sdk-verified) |  | new | nvn2 | unused |
+| 46 | nvnCommandBufferBeginDeviceCommands | 0x5DC220 | v: pp (hexrays) |  | new | nvn2 | unused |
 | 47 | nvnCommandBufferBeginRecording | 0x5C4D20 | v: p | v: p | same |  | 1 |
 | 48 | nvnCommandBufferBeginTransformFeedback | 0x608E40 | v: pl | v: pl | same |  | 1 |
 | 49 | nvnCommandBufferBindAccelerationStructure | 0x600CE0 | v: piil (hexrays) |  | new | nvn2 | unused |
@@ -266,7 +283,7 @@ All in `work/nvn2/py/` (not committed): `mainload.py` (loader → slot per name)
 | 125 | nvnCommandBufferDrawTexture | 0x60A6D0 | v: plpp | v: plpp | same |  | unused |
 | 126 | nvnCommandBufferDrawTransformFeedback | 0x609460 | v: pil | v: pil | same |  | 1 |
 | 127 | nvnCommandBufferEnableExclusiveScissor | 0x620EA0 | v: pi (hexrays) |  | new | nvn2 | unused |
-| 128 | nvnCommandBufferEndDeviceCommands | 0x5DC320 | v: pp (sdk-verified) |  | new | nvn2 | unused |
+| 128 | nvnCommandBufferEndDeviceCommands | 0x5DC320 | v: pl (hexrays) |  | new | nvn2 | unused |
 | 129 | nvnCommandBufferEndRecording | 0x5C4DE0 | l: p | l: p | same |  | 1 |
 | 130 | nvnCommandBufferEndTransformFeedback | 0x608EB0 | v: pl | v: pl | same |  | 8 |
 | 131 | nvnCommandBufferEvaluateDlss | 0x5DEBC0 | v: pll (hexrays) |  | new | nvn2 | unused |
@@ -383,7 +400,7 @@ All in `work/nvn2/py/` (not committed): `mainload.py` (loader → slot per name)
 | 242 | nvnCommandBufferSetZCullZF32CompressionEnable | 0x60C6E0 | v: pi (hexrays) |  | new | nvn2 | unused |
 | 243 | nvnCommandBufferShadingRateImagePalette | 0x620D80 | v: piil (hexrays) |  | new | nvn2 | unused |
 | 244 | nvnCommandBufferSignalEvent | 0x5E1320 | v: ppiiii | v: ppiiii | same |  | unused |
-| 245 | nvnCommandBufferSubmitDeviceCommands | 0x5DC680 | v: pp (sdk-verified) |  | new | nvn2 | unused |
+| 245 | nvnCommandBufferSubmitDeviceCommands | 0x5DC680 | v: pp (hexrays) |  | new | nvn2 | unused |
 | 246 | nvnCommandBufferTiledDownsample | 0x61E220 | v: ppp | v: ppp | same |  | unused |
 | 247 | nvnCommandBufferTiledDownsampleTextureView | 0x61E230 | v: ppppp | v: ppppp | same |  | unused |
 | 248 | nvnCommandBufferUpdateUniformBuffer | 0x60A4E0 | v: pllllp | v: pllllp | same |  | unused |
@@ -406,12 +423,12 @@ All in `work/nvn2/py/` (not committed): `mainload.py` (loader → slot per name)
 | 265 | nvnDeviceBuilderSetDefaults | 0x5D64F0 | v: p | v: p | same |  | 1 |
 | 266 | nvnDeviceBuilderSetFlags | 0x5D6500 | v: pi | v: pi | same |  | 1 |
 | 267 | nvnDeviceCalculateAccelerationStructureMemoryRequirements | 0x5F5040 | l: plppp (hexrays) |  | new | nvn2 | unused |
-| 268 | nvnDeviceCommandBufferGetHandle | 0x5DC200 | l: p (sdk-verified) |  | new | nvn2 | unused |
-| 269 | nvnDeviceCommandBufferSetCommandMemorySize | 0x5DC1E0 | v: pl (sdk-verified) |  | new | nvn2 | unused |
-| 270 | nvnDeviceCommandBufferSetComputeMemorySize | 0x5DC1F0 | v: pl (sdk-verified) |  | new | nvn2 | unused |
-| 271 | nvnDeviceCommandBufferSetDefaults | 0x5DC1A0 | v: p (sdk-verified) |  | new | nvn2 | unused |
-| 272 | nvnDeviceCommandBufferSetDevice | 0x5DC1C0 | v: pp (sdk-verified) |  | new | nvn2 | unused |
-| 273 | nvnDeviceCommandBufferSetStorage | 0x5DC1D0 | v: ppll (sdk-verified) |  | new | nvn2 | unused |
+| 268 | nvnDeviceCommandBufferGetHandle | 0x5DC200 | l: p (hexrays) |  | new | nvn2 | unused |
+| 269 | nvnDeviceCommandBufferSetCommandMemorySize | 0x5DC1E0 | v: pl (hexrays) |  | new | nvn2 | unused |
+| 270 | nvnDeviceCommandBufferSetComputeMemorySize | 0x5DC1F0 | v: pl (hexrays) |  | new | nvn2 | unused |
+| 271 | nvnDeviceCommandBufferSetDefaults | 0x5DC1A0 | v: p (hexrays) |  | new | nvn2 | unused |
+| 272 | nvnDeviceCommandBufferSetDevice | 0x5DC1C0 | v: pl (hexrays) |  | new | nvn2 | unused |
+| 273 | nvnDeviceCommandBufferSetStorage | 0x5DC1D0 | v: plll (hexrays) |  | new | nvn2 | unused |
 | 274 | nvnDeviceCompactAccelerationStructure | 0x5F7A50 | l: plll (hexrays) |  | new | nvn2 | unused |
 | 275 | nvnDeviceCopyAccelerationStructure | 0x5F7A30 | v: plll (hexrays) |  | new | nvn2 | unused |
 | 276 | nvnDeviceFinalize | 0x5D6510 | v: p | v: p | same |  | 1 |

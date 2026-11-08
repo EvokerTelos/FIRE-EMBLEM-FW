@@ -92,6 +92,44 @@ Copyright (c) 2018-2026 Arseny Kapoulkine. MIT licence, same text as the Wonder 
 
 Copyright (c) 2017-2026 Advanced Micro Devices, Inc. All rights reserved. MIT licence, same text as the Wonder notice above.
 
+### Zstandard 1.5.7 (BSD-3-Clause; dual-licensed BSD or GPL-2.0, used under BSD)
+
+The library sources (lib/common, lib/compress, lib/decompress), fetched pinned by cmake/gfx_deps.cmake, compress and read the
+shader preload pack (src/gfx/nvn/nvn_shaders.cpp).
+
+```
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
 ### Dear ImGui (MIT)
 
 Copyright (c) 2014-2026 Omar Cornut. MIT licence, same text as the Wonder notice above.
@@ -203,13 +241,6 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 `src/services/pl.cpp` uses DejaVu Sans (`DejaVuSans.ttf`) as the fallback shared font. The font file is not in this worktree. Its licence text is `assets/fonts/LICENSE-DejaVu.txt` (in the `svc-pl` worktree, with the font at `assets/fonts/DejaVuSans.ttf`), the Bitstream Vera licence as the DejaVu fonts name it. Not copied here.
 
-## zstd 1.5.7 with ZBIC (hexkyz/zstd), decoder only (BSD-3-Clause)
-
-Files: `third_party/zstd_zbic/zstddeclib.c`. Copyright (c) Meta Platforms, Inc. and affiliates; ZBIC changes by hexkyz, under zstd's
-dual BSD / GPLv2 licence, taken under the BSD option. Licence text: `third_party/zstd_zbic/LICENSE`. Source:
-https://github.com/hexkyz/zstd, commit 02a8f10c6f4acfcfba2e31e034fbae9f07938f96, amalgamated with zstd's `combine.py` (provenance and
-hashes in `third_party/zstd_zbic/README.txt`). Used by `src/loader/zbic.cpp` for ZBIC-compressed NSO segments (`docs/zbic.md`).
-
 ## AMD FidelityFX SDK v1.1.4, FSR 1 shader headers (MIT)
 
 Files: `third_party/ffx_fsr1/` (`fsr1/ffx_fsr1.h`, `ffx_core*.h`, `ffx_common_types.h` and the other headers listed in `third_party/ffx_fsr1/README.txt`). Copyright (C) 2024 Advanced Micro Devices, Inc. Licence text: `third_party/ffx_fsr1/LICENSE.txt`. Source: https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, tag v1.1.4. Used by `src/gfx/extras/`: the EASU and RCAS compute shaders are generated from these headers by `scripts/gen_extras_shaders.py`, and the constant setup is a port in `src/gfx/extras/fsr1_consts.cpp`.
@@ -224,7 +255,7 @@ Files: `third_party/amd_ffx_api/` (`api/include/ffx_api.h`, `ffx_api_types.h`, `
 
 ## AMD FidelityFX FSR 3.1 runtime (MIT)
 
-`amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` (AMD-signed, byte-identical to `Kits/FidelityFX/signedbin/` in the FidelityFX SDK v2.4.0 release; the SDK's licence, `licenses/LICENSE.FidelityFX-SDK-v2.4.0.txt` in the release, lists both under MIT) are not in this repository. The release package carries them unchanged in `upscalers/fsr3/`; the game loads them at run time only (`LoadLibrary`), found there, next to the executable or via `[upscale] fsr_dll`. Copyright (C) Advanced Micro Devices, Inc.
+`amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll` (AMD-signed, byte-identical to `Kits/FidelityFX/signedbin/` in the FidelityFX SDK v2.4.0 release; the SDK's licence, `licenses/LICENSE.FidelityFX-SDK-v2.4.0.txt` in the release, lists both under MIT) are not in this repository and this project does not distribute them. The game loads them at run time only (`LoadLibrary`) if you put them in `upscalers/fsr3/`, next to the executable or name them with `[upscale] fsr_dll`. Copyright (C) Advanced Micro Devices, Inc.
 
 ## NVIDIA Streamline SDK v2.14.16 headers (MIT)
 
@@ -232,8 +263,47 @@ Files: `third_party/nvidia_streamline/include/` (unmodified). Copyright (c) NVID
 
 ## NVIDIA Streamline runtime DLLs (MIT)
 
-`sl.interposer.dll`, `sl.common.dll` and `sl.dlss.dll` (NVIDIA-signed, from `bin/x64` of the Streamline SDK v2.14.16 release, https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.16; MIT, `licenses/LICENSE.Streamline.MIT.txt`, third-party notices in `licenses/NOTICE.Streamline-3rd-party.md`) are not in this repository. The release package carries them unchanged in `upscalers/streamline/`; the game loads them at run time only. Copyright (c) NVIDIA CORPORATION.
+`sl.interposer.dll`, `sl.common.dll` and `sl.dlss.dll` (NVIDIA-signed, from `bin/x64` of the Streamline SDK v2.14.16 release, https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.16; MIT, `licenses/LICENSE.Streamline.MIT.txt`, third-party notices in `licenses/NOTICE.Streamline-3rd-party.md`) are not in this repository and this project does not distribute them. The game loads them at run time only, if you install them yourself. Copyright (c) NVIDIA CORPORATION.
 
 ## NVIDIA DLSS (nvngx_dlss.dll, not shipped) and Intel XeSS (not shipped)
 
-`nvngx_dlss.dll` (NVIDIA DLSS Super Resolution 310.9.16) is under the NVIDIA RTX SDKs LICENSE (v. March 14, 2024; https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt, a copy is `licenses/LICENSE.NVIDIA-RTX-SDKs.txt` in the release). That licence requires redistributors to pass on terms at least as protective as its own and forbids any use that subjects the SDK to a licence requiring it to be redistributable at no charge (section 4e), which does not fit a GPL-3.0 package, so neither the repository nor the release package contains the file. The launcher's Game files page offers to download it from NVIDIA's own repository (https://github.com/NVIDIA/DLSS, tag v310.9.16, sha256 checked) into `upscalers/streamline/` on the player's PC after showing the licence. `libxess.dll` (Intel XeSS) is never shipped either; `xess_dll` is read but not used (see `docs/CONFIG.md`). The DLSS SDK itself (NGX static library) is not used.
+`nvngx_dlss.dll` (NVIDIA DLSS Super Resolution 310.9.16) is under the NVIDIA RTX SDKs LICENSE (v. March 14, 2024; https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt, a copy is `licenses/LICENSE.NVIDIA-RTX-SDKs.txt` in the release). That licence requires redistributors to pass on terms at least as protective as its own and forbids any use that subjects the SDK to a licence requiring it to be redistributable at no charge (section 4e), which does not fit a GPL-3.0 package, so this repository does not contain the file and this project neither distributes nor downloads it. `libxess.dll` (Intel XeSS) is never shipped either; `xess_dll` is read but not used (see `docs/CONFIG.md`). The DLSS SDK itself (NGX static library) is not used.
+
+## dav1d 1.5.1 (BSD-2-Clause)
+
+`third_party/dav1d`: the AV1 decoder of the Switch 2 movie player (`src/media/movie_vdec.cpp`), 8-bit, built from source. The C
+sources come from nxnative-penis6's vendored copy (`dm/third_party/dav1d`, MIT repository, dav1d itself BSD-2-Clause) without its arm64
+assembly; the x86-64 assembly (`src/x86`, `src/ext/x86`) is upstream 1.5.1's and is built when NASM is found (`src/ext/x86/x86inc.asm`
+is under the ISC licence stated in its header); `config/config.h` is written for Windows x64 and `src/win32/thread.c` is upstream's. Upstream: https://code.videolan.org/videolan/dav1d.
+Licence: `third_party/dav1d/COPYING` (Copyright © 2018-2019, VideoLAN and dav1d authors; BSD-2-Clause).
+
+## nxnative-penis6 (MIT)
+
+`src/media/movie_vdec.cpp` (the Switch 2 movie decoder front end) is ported from nxnative-penis6 `dm/host/hle_nx2_movie.c`, and the dav1d
+copy in `third_party/dav1d` comes from its `dm/third_party/dav1d`. Several comments cite its commits for hardware facts (NVN2 sync scope,
+display modes, shader forms); those facts are re-implemented here, not copied. Nothing is taken from its `nx2_lower` (GPL-3.0-or-later),
+which would in any case be compatible with this project's GPL-3.0 licence. Source: https://git.eden-emu.dev/penis6/nxnative-penis6.
+
+```
+MIT License
+
+Copyright (c) 2026 seedds
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

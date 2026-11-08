@@ -23,6 +23,8 @@
 
 namespace nxrt::nvn::be::gpu {
 
+struct Frame;
+
 struct BindingDesc {
     uint32_t set = 0, binding = 0;
     VkDescriptorType type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -33,10 +35,10 @@ struct BindingDesc {
 };
 
 struct ProgLayout {
-    VkDescriptorSetLayout sets[4] = {};
+    VkDescriptorSetLayout sets[5] = {};         // 0..3 the program's own; kPoolSet (4) the shared pool arrays, when a stage samples through them
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::vector<BindingDesc> bindings;          // every used descriptor of every stage, sorted by (set, binding)
-    bool has_set[4] = {};
+    bool has_set[5] = {};
     VkShaderStageFlags push_stages = 0;         // push constant range [0, push_bytes) of generated stages (ShaderInfo::push_bytes); 0 = none
     uint32_t push_bytes = 0;
 };
@@ -96,9 +98,8 @@ bool resolve_stage_modules(const GraphicsKey& key, StageModules* out);
 std::vector<SpvIntSlot> key_int_slots(const GraphicsKey& key);
 // The dynamic state list every graphics pipeline and pipeline library uses.
 const VkPipelineDynamicStateCreateInfo* pipeline_dynamic_state();
-// Whether the pipelines list the NVN2 smaller features' dynamic states: the device has the extension and [nvn] small_dynamic is not false.
-bool small_dynamic_conservative();
-bool small_dynamic_fsr();
+// The pNext of every translated shader stage: robust uniform buffer access ([nvn] robust_ubo), or null when off or not supported.
+const void* ubo_robustness();
 VkPipelineCache pipeline_cache_handle();
 void note_pipeline_created(double ms, const char* what);   // counters and the dirty flag of the cache file
 
@@ -140,7 +141,25 @@ uint32_t xfb_stride(const ShaderInfo* vs);
 // Persistent buffers every draw may bind: the driver constants (c[0]) image and a shader's constant data (c[1]).
 VkBuffer constant_data_buffer(const ShaderInfo* s, VkDeviceSize* range);
 VkBuffer driver_constants_buffer(VkDeviceSize* range);
-VkBuffer color_transform_buffer(VkDeviceSize* range);   // c[24], NVN2 fragment output colour transform (identity: SDR)
+
+// ---- texture and sampler pools as descriptor arrays (kPoolSet, nvn_shaders.h) -------------------------------------------------------
+// One set layout for every program that samples through the pools: kPoolSamplers (4096 samplers), kPoolTex2D and kPoolTexCube (65536
+// sampled images each), partially bound and updated after bind. Null when the device cannot (descriptor indexing, its limits): those
+// programs get no layout and their draws are skipped.
+VkDescriptorSetLayout pool_set_layout();
+// The set for a texture and sampler pool pair, brought up to date with the registrations since it was last current: only the ids changed since
+// are written. A set the GPU may still be reading is left alone and another one of the pair's few is made current instead. Element i of
+// the 2D / cube array is texture id i viewed as that shape (a black dummy when it is not one, or not registered); element j of the
+// samplers is sampler id j. Null without a pool or a layout.
+VkDescriptorSet pool_set(TexturePool* tp, SamplerPool* sp, Frame& f);
+// The textures registered in tp that are not ready to be sampled (written by the CPU since the last upload, or not in their sampled
+// layout), appended to `out`: the replay uploads and transitions them before a draw that samples through the pool. Cheap when nothing
+// moved: it looks at the ids registered since the last call and the textures tex_transition moved since (pool_note_layout), and at every
+// registered texture only when the CPU wrote textures since (g_tex_scan_epoch).
+void pool_textures_to_prepare(TexturePool* tp, std::vector<Texture*>& out);
+// Some registration, layout move or CPU write since the pair was last made current: the replay sets its bindings again. O(1).
+bool pool_state_moved(TexturePool* tp, SamplerPool* sp);
+void pool_sets_shutdown();                       // device idle
 
 // ---- pipeline libraries (nvn_gpl.cpp, VK_EXT_graphics_pipeline_library) ------------------------------------------------------
 // A pipeline is linked from four parts: vertex input, pre-rasterisation shaders (vertex/geometry code + raster state), fragment shader

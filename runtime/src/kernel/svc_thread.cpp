@@ -4,20 +4,20 @@
 // Argument registers (AArch64): see include/nxrt/svc.h.
 #include <windows.h>
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 
 #include <cstdio>
 #include "nxrt/diag.h"
-#include "nxrt/config.h"
 #include "nxrt/dispatch.h"
-#include "nxrt/game.h"
 #include "nxrt/kernel.h"
 #include "nxrt/log.h"
 #include "nxrt/runtime.h"
 #include "nxrt/memory.h"
 #include "nxrt/module.h"
 #include "nxrt/svc.h"
+#include "kernel_internal.h"
 
 namespace nxrt {
 namespace {
@@ -51,7 +51,7 @@ void svc_exit_process(::Ctx* c) {
 void svc_create_thread(::Ctx* c) {            // x1 entry, x2 arg, x3 stack top, w4 priority, w5 core -> x1 handle
     int32_t prio = static_cast<int32_t>(X(c, 4)), core = static_cast<int32_t>(X(c, 5));
     if (prio < 0 || prio > 63) return svc_ret(c, kInvalidPriority);
-    if (core != -2 && (core < 0 || core > 7)) return svc_ret(c, kInvalidCoreId);
+    if (core != -2 && (core < 0 || core > std::max(7, app_core_count() - 1))) return svc_ret(c, kInvalidCoreId);
     ThreadParams p;
     p.entry = X(c, 1);
     p.arg = X(c, 2);
@@ -60,6 +60,7 @@ void svc_create_thread(::Ctx* c) {            // x1 entry, x2 arg, x3 stack top,
     p.core = core;
     uint32_t h = thread_create(p);
     if (!h) return svc_ret(c, kOutOfResource);
+    thread_diag_note_created(h);
     NXLOG_D("svc", "CreateThread entry %s prio %d core %d -> handle 0x%x", module_describe(p.entry).c_str(), prio, core, h);
     X(c, 1) = h;
     svc_ret(c, kOk);
@@ -69,37 +70,8 @@ void svc_start_thread(::Ctx* c) { svc_ret(c, thread_start(static_cast<uint32_t>(
 
 void svc_exit_thread(::Ctx*) { thread_exit(); }
 
-// The registered game's polling sleeps (nxrt/game.h PollSleep), as absolute return addresses; empty while [sched] poll_sleeps is off.
-struct PollSleeps {
-    uint64_t ret[32] = {};
-    int64_t ns[32] = {};
-    uint32_t n = 0;
-};
-const PollSleeps& poll_sleeps() {
-    static const PollSleeps t = [] {
-        PollSleeps p;
-        const game::Info& g = game::info();
-        if (!g.poll_sleeps || !g.poll_sleep_count || !config_get_bool("sched", "poll_sleeps", true)) return p;
-        for (uint32_t i = 0; i < g.poll_sleep_count && p.n < 32; ++i, ++p.n) {
-            p.ret[p.n] = g.main_base + g.poll_sleeps[i].ret;
-            p.ns[p.n] = g.poll_sleeps[i].ns;
-        }
-        NXLOG_I("svc", "[sched] poll_sleeps: %u sleeps in the game's polling loops are shortened", p.n);
-        return p;
-    }();
-    return t;
-}
-
 void svc_sleep_thread(::Ctx* c) {              // x0 ns (0, -1, -2 = yield variants)
     int64_t ns = static_cast<int64_t>(X(c, 0));
-    if (ns >= 1000000) {   // nn::os::SleepThread is a leaf that ends in the svc, so lr is the game's call site
-        const PollSleeps& p = poll_sleeps();
-        for (uint32_t i = 0; i < p.n; ++i)
-            if (p.ret[i] == X(c, 30)) {
-                if (p.ns[i] < ns) ns = p.ns[i];
-                break;
-            }
-    }
     if (ns > 0) sleep_ns(ns);
     else yield_host();
 }
@@ -143,7 +115,7 @@ void svc_set_thread_core_mask(::Ctx* c) {      // w0 handle, w1 ideal core (0..3
     if (ideal == -3) {                                   // keep the ideal core, replace the mask
         if (!mask) return fail(kInvalidCombination);
         ideal = t->ideal_core;
-    } else if (ideal != -2 && (ideal < -1 || ideal > 7)) {              // -1 = IdealCoreDontCare: only the mask matters
+    } else if (ideal != -2 && (ideal < -1 || ideal > std::max(7, app_core_count() - 1))) {              // -1 = IdealCoreDontCare: only the mask matters
         return fail(kInvalidCoreId);
     } else if (!mask) {
         return fail(kInvalidCombination);

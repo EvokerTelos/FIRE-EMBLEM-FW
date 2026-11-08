@@ -20,6 +20,9 @@ Fetched into this folder (git-ignored by `tools/textures/.gitignore`). Nothing h
 - Everything else in the repo: LICENSE says "All other source code files in this repo are available under 2 licenses -- choose whichever you prefer": Alternative A MIT (Copyright 2020-2021 Richard Geldreich, Jr.) or Alternative B public domain (Unlicense wording). `bc7enc.cpp` header: "MIT license or public domain".
 - `lodepng.cpp` / `lodepng.h`: LodePNG, Copyright 2005-2016 Lode Vandevenne, zlib-style licence text included in LICENSE.
 - The repo also ships a prebuilt `ispc.exe` (third_party/bc7enc_rdo/ispc.exe). It is not used; the official ISPC below is used instead.
+- `src/bc7e_cpp.h` and `src/bc7e_cpp.cpp` (in the tree, generated) are `bc7e.ispc` of this commit translated to C++ by
+  `scripts/port_bc7e.py`: a modified version of an Apache-2.0 file, so they carry its copyright line and say that they were changed. The
+  default (`cpp`) build of the library uses them; neither ISPC compiler is run for it.
 - LICENSE contains no SPDX identifiers, so the SPDX names above are read from the text.
 
 ## ISPC compiler (Intel Corporation)

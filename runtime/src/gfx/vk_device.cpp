@@ -22,6 +22,7 @@
 #include "nxrt/log.h"
 #include "nxrt/platform.h"
 #include "vk_gauges.h"
+#include "extras/framegen_ffx.h"
 #include "extras/temporal.h"
 
 #include <vk_mem_alloc.h>
@@ -385,6 +386,11 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     }
     const bool x_colorspace = !headless && has_iext(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);   // HDR10 / scRGB entries in the surface format list
     if (x_colorspace) inst_exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+#ifdef _WIN32
+    // needed by VK_EXT_full_screen_exclusive (below), which keeps borderless fullscreen from being turned into exclusive mode
+    const bool x_surfcaps2 = !headless && has_iext(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+    if (x_surfcaps2) inst_exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+#endif
     if (has_iext(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
         // the extension is on whenever it is there (command buffer labels for the game's debug groups, RenderDoc); the messenger only with validation
         inst_exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -546,11 +552,11 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT avids = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT adrua = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT};
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT agpl = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
-    VkPhysicalDeviceFragmentShadingRateFeaturesKHR afsr = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
     VkPhysicalDeviceTransformFeedbackFeaturesEXT atfb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
     VkPhysicalDeviceIndexTypeUint8FeaturesEXT au8 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT};
     VkPhysicalDevicePresentIdFeaturesKHR apid = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
     VkPhysicalDeviceAntiLagFeaturesAMD aal = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD};
+    VkPhysicalDevicePipelineRobustnessFeaturesEXT aprb = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT};
     std::vector<const char*> dev_exts;
     void* chain = nullptr;
     auto add_ext = [&](const char* name, void* feat_struct) {
@@ -570,10 +576,6 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     const bool x_vids = add_ext(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, &avids);
     const bool x_drua = add_ext(VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME, &adrua);
     const bool x_tfb = add_ext(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME, &atfb);
-    // NVN2 smaller features (nvn_small.h): shading rate and conservative raster (the latter has no feature struct; its mode is set dynamically through EDS3)
-    const bool x_fsr = add_ext(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, &afsr);
-    const bool x_cr = has_dext(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
-    if (x_cr) dev_exts.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
     // 8-bit index buffers (the EXT and the KHR extension share the feature struct)
     const bool x_u8 = add_ext(VK_EXT_INDEX_TYPE_UINT8_EXTENSION_NAME, &au8) || add_ext("VK_KHR_index_type_uint8", &au8);
     // pipelines linked from separately compiled shader parts (nvn_gpl.cpp): needs VK_KHR_pipeline_library next to the extension itself
@@ -590,6 +592,17 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.external_memory_host = has_dext(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (features_.external_memory_host) dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     if (has_dext(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) { dev_exts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME); features_.push_descriptor = true; }
+    // robust access per pipeline, for the translated shaders' uniform buffers only (nvn_pipeline.cpp ubo_robustness); robustness2 is
+    // enabled for its pipeline behaviour, not its device-wide features (left off: they cost speed)
+    const bool x_prb = add_ext(VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME, &aprb);
+    bool rba2 = false;
+    if (x_prb && has_dext(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+        VkPhysicalDeviceRobustness2FeaturesEXT r2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+        VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &r2};
+        vkGetPhysicalDeviceFeatures2(physical_, &f2);
+        rba2 = r2.robustBufferAccess2 == VK_TRUE;
+        if (rba2) dev_exts.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    }
     // availability query: one chain holding all the structs
     a11.pNext = &a12; a12.pNext = &a13; a13.pNext = chain;
     VkPhysicalDeviceFeatures2 avail = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &a11};
@@ -641,8 +654,6 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.vertex_input_dynamic_state = x_vids && avids.vertexInputDynamicState;
     features_.dynamic_rendering_unused_attachments = x_drua && adrua.dynamicRenderingUnusedAttachments;
     features_.transform_feedback = x_tfb && atfb.transformFeedback;
-    features_.fragment_shading_rate = x_fsr && afsr.pipelineFragmentShadingRate;
-    features_.conservative_raster_dynamic = x_cr && x_eds3 && aeds3.extendedDynamicState3ConservativeRasterizationMode && aeds3.extendedDynamicState3ExtraPrimitiveOverestimationSize;
     features_.index_type_uint8 = x_u8 && au8.indexTypeUint8;
     if (features_.transform_feedback) {   // transformFeedbackQueries is a property: the primitive counters of indirect draws under feedback need it
         VkPhysicalDeviceTransformFeedbackPropertiesEXT tfp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
@@ -663,12 +674,14 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     features_.present_id = x_pid && apid.presentId;
     features_.low_latency2 = x_ll2 && features_.present_id;
     features_.anti_lag = x_aal && aal.antiLag;
+    features_.ubo_robustness = (x_prb && aprb.pipelineRobustness) ? (rba2 ? 2 : 1) : 0;   // robustBufferAccess itself is a required feature
     NXLOG_I(kTag, "texture compression on this GPU: BC %s, ASTC-LDR %s, ETC2 %s", features_.bc ? "yes" : "no",
             features_.astc_ldr ? "yes" : "no", features_.etc2 ? "yes" : "no");
-    NXLOG_I(kTag, "features: geometry %d float64 %d int64 %d dualSrc %d logicOp %d multiViewport %d drawParams %d descIndexing %d interlock %d depthClipControl %d customBorder %d hostMemImport %d pushDesc %d",
+    NXLOG_I(kTag, "features: geometry %d float64 %d int64 %d dualSrc %d logicOp %d multiViewport %d drawParams %d descIndexing %d interlock %d depthClipControl %d customBorder %d hostMemImport %d pushDesc %d uboRobustness %d",
             features_.geometry_shader, features_.shader_float64, features_.shader_int64, features_.dual_src_blend, features_.logic_op,
             features_.multi_viewport, features_.shader_draw_parameters, features_.descriptor_indexing, features_.fragment_shader_interlock,
-            features_.depth_clip_control, features_.custom_border_color, features_.external_memory_host, features_.push_descriptor);
+            features_.depth_clip_control, features_.custom_border_color, features_.external_memory_host, features_.push_descriptor,
+            features_.ubo_robustness);
     {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT xh = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
         VkPhysicalDeviceVulkan11Properties p11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES, features_.external_memory_host ? &xh : nullptr};
@@ -682,32 +695,29 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
         limits_.subgroup_ops = p11.subgroupSupportedOperations;
         limits_.max_memory_allocation_count = props_.limits.maxMemoryAllocationCount;
     }
-    if (features_.conservative_raster_dynamic) {
-        VkPhysicalDeviceConservativeRasterizationPropertiesEXT cp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT};
-        VkPhysicalDeviceProperties2 cpp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &cp};
-        vkGetPhysicalDeviceProperties2(physical_, &cpp);
-        limits_.cons_max_extra = cp.maxExtraPrimitiveOverestimationSize;
-        limits_.cons_granularity = cp.extraPrimitiveOverestimationSizeGranularity;
-    }
-    if (features_.fragment_shading_rate && vkGetPhysicalDeviceFragmentShadingRatesKHR) {
-        uint32_t nr = 0;
-        vkGetPhysicalDeviceFragmentShadingRatesKHR(physical_, &nr, nullptr);
-        std::vector<VkPhysicalDeviceFragmentShadingRateKHR> rates(nr, {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR});
-        if (nr && vkGetPhysicalDeviceFragmentShadingRatesKHR(physical_, &nr, rates.data()) >= 0) {
-            for (uint32_t i = 0; i < nr; ++i) {
-                const uint32_t w = rates[i].fragmentSize.width, h = rates[i].fragmentSize.height;
-                if (!(rates[i].sampleCounts & VK_SAMPLE_COUNT_1_BIT) || w > 4 || h > 4 || (w & (w - 1)) || (h & (h - 1))) continue;
-                limits_.fsr_sizes |= 1u << ((w >= 4 ? 2u : w >= 2 ? 1u : 0u) * 3 + (h >= 4 ? 2u : h >= 2 ? 1u : 0u));
-            }
-        }
-        if (!limits_.fsr_sizes) features_.fragment_shading_rate = false;
-    }
     if (!headless) dev_exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-    float prio = 1.0f;
+#ifdef _WIN32
+    // Without it the driver may take a window covering the monitor (borderless fullscreen) into exclusive mode on its own, and every
+    // switch to another window or monitor then blacks the screen out while the display mode changes (vk_renderer.cpp disallows it).
+    if (x_surfcaps2 && has_dext(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME)) {
+        dev_exts.push_back(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
+        features_.full_screen_exclusive = true;
+    }
+#endif
+    // [dlss] frame_gen = fsr3: the FSR 3 swapchain presents and acquires on queues of its own (extras/framegen_ffx.h)
+    uint32_t fg_queues = 0;
+    if (!headless) {
+        uint32_t nfam = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nfam, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(nfam);
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nfam, fams.data());
+        if (queue_family_ < nfam) fg_queues = extras::ffx_fg_extra_queues(fams[queue_family_].queueCount);
+    }
+    const float prio[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = queue_family_;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &prio;
+    qci.queueCount = 1 + fg_queues;
+    qci.pQueuePriorities = prio;
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &en};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
@@ -717,6 +727,7 @@ bool Device::init(const DeviceDesc& desc, std::string* error) {
     if (r != VK_SUCCESS) return fail("vkCreateDevice failed (" + std::to_string(r) + ")");
     volkLoadDevice(device_);
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
+    if (fg_queues) extras::ffx_fg_install(*this, fg_queues);
 
     uint32_t nq = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physical_, &nq, nullptr);

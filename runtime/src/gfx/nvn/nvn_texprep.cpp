@@ -246,6 +246,9 @@ void worker_main() {
                     std::lock_guard<std::mutex> sl(s.mu);
                     s.map[t].slow = true;     // the entry is never erased while its job runs
                 }
+                // A take that began waiting while this job was still looking for a cache entry must see `slow` now and go on with a stand-in;
+                // without this it slept through the whole transcode (1.5-2 s render-thread stalls choosing body types at character creation).
+                s.cv_done.notify_all();
                 TexCaps full = s.caps;
                 full.cache_only = false;
                 full.encode_threads = 1;
@@ -455,6 +458,7 @@ bool peek_entry_format(Texture* t, VkFormat& entry) {
         if (it == s.map.end()) return false;
         Entry& e = it->second;
         if (e.st == Entry::Running && e.job_gen == t->prep_gen.load(std::memory_order_acquire)) {
+            if (e.slow) return false;   // no cache entry: the job transcodes (seconds); the caller looks the texture up itself, as with no job
             if (s.cv_done.wait_until(lk, deadline) == std::cv_status::timeout) return false;
             continue;
         }

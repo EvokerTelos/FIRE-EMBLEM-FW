@@ -66,7 +66,20 @@ struct PictureSettings {
     bool neutral() const { return contrast == 1.0 && saturation == 1.0 && black == 0.0 && gamma == 1.0; }
 };
 // The named presets ([picture] preset): "neutral" and "vivid". False for any other name (*out unchanged).
-bool picture_preset(const std::string& name, PictureSettings* out);
+inline bool picture_preset(const std::string& name, PictureSettings* out) {   // inline: the launcher's settings code uses it without nxrt_gfx
+    if (name == "neutral" || name == "off" || name.empty()) {
+        *out = PictureSettings{};
+        return true;
+    }
+    if (name == "vivid") {   // a modest push against the game's hazy look
+        *out = PictureSettings{};
+        out->contrast = 1.10;
+        out->saturation = 1.15;
+        out->black = -0.03;
+        return true;
+    }
+    return false;
+}
 PictureSettings picture_clamped(PictureSettings p);
 
 struct Settings {
@@ -130,8 +143,6 @@ void hdr_refresh_levels();
 
 // The game's declarations (HdrMode::Native). Thread-safe; each call refreshes the levels and the swapchain metadata, and logs the native decision once.
 void hdr_note_layer_luminance(bool extended, unsigned min_nits, unsigned max_nits);
-// Set by the gfx library when it is linked (core code calls through it, so core links without gfx).
-extern void (*layer_luminance_sink)(bool extended, unsigned min_nits, unsigned max_nits);
 // color_space: the NVN2 value (-1 = not set); display: 10 floats (red, green, blue, white x/y, max, min luminance) or null; content: max CLL, max FALL or null.
 void hdr_note_window_hdr(int color_space, const float* display, const float* content);
 bool hdr_mode_native();

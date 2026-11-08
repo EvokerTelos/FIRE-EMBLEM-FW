@@ -72,7 +72,9 @@ struct TexGpu {
     float scale = 1.0f;                                 // resolution scale: base is the NVN size times this ([gfx] render_scale, render targets only)
     bool scale_blocked = false;                         // was scaled, brought back to 1 (bound as a storage image, or paired with an unscaled target)
     std::map<std::array<uint32_t, 12>, VkImageView> views;
-    int refs = 1;                                       // texture objects over the same storage share one image (render thread)
+    std::array<uint32_t, 12> last_key = {};             // view_for's last answer (render thread): most lookups repeat it (rt agent)
+    VkImageView last_view = VK_NULL_HANDLE;
+    int refs = 1;                                      // texture objects over the same storage share one image (render thread)
     struct SparseState* sparse = nullptr;               // a sparse-residency image (a big texture of a virtual pool), else null
     // CPU-streamed textures (tex_ensure_current): uploads for CPU writes that came at most kStreamGap presents apart, in a row
     uint32_t cpu_streak = 0, cpu_upload_at = 0;
@@ -211,6 +213,9 @@ bool format_view_ok(const TexGpu& g, VkFormat fmt) {
 
 // A promoted image answers the 8-bit RGBA formats the game asks for (its sRGB and UNORM views) with its own format: the values are linear floats.
 VkFormat promoted_view_format(const TexGpu& g, VkFormat f) {
+    // An image made in its format's fallback (D24S8 as D32_SFLOAT_S8_UINT on GPUs without D24S8, e.g. AMD) answers views of the
+    // NVN format with its own: before, every shader sampling such a depth buffer got the dummy view.
+    if (g.fmt && f == g.fmt->vk && g.format == g.fmt->vk_fallback && f != g.format) return g.format;
     if (g.promoted && (f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_R8G8B8A8_UNORM)) return g.format;
     // An ASTC view (a texture view naming its ASTC format, sRGB or not) of an image stored transcoded (BC7, or the disk cache's RGBA8/BC5)
     // reads the image's own format, as its sRGB or UNORM partner like the view asks. Mario Kart World's character and course materials
@@ -251,7 +256,6 @@ struct Shape {
     VkExtent3D base = {1, 1, 1};
     uint32_t levels = 1, layers = 1;
     bool cube = false;
-    bool cube_compat = false;                  // created CUBE_COMPATIBLE: cube targets and every square 2D image of 6n layers
     uint32_t samples = 1;                      // multisampled render target / resolve source
 };
 
@@ -266,15 +270,13 @@ Shape shape_of(const Texture& t) {
     s.base.depth = is3d ? static_cast<uint32_t>(std::max(1, b.depth)) : 1u;
     s.levels = std::max<uint32_t>(1, t.levels);
     s.layers = std::max<uint32_t>(1, t.layers);
-    s.cube = target_is_cube(b.target);
+    // a square 2D array of 6n layers may be sampled as cubes (Fortune's Weave's environment compute shaders do): cube-compatible too
+    s.cube = target_is_cube(b.target) ||
+             (b.target == NVN_TEXTURE_TARGET_2D_ARRAY && s.layers >= 6 && s.layers % 6 == 0 && s.base.width == s.base.height && b.samples <= 1);
     if (target_is_multisample(b.target) || b.samples > 1) {
         s.samples = static_cast<uint32_t>(vk_sample_count(b.samples));
         s.levels = 1;
     }
-    // A cube sampler can meet an image made for another object over the same storage (a 2D array of 6 layers: S4f shares one image per
-    // piece of memory): such an image must be cube-compatible too, or the cube view fails and the binding gets the dummy (FEFW: texture
-    // 138, RG8 16x16x6, sampled as a cube by ~20 lighting shaders). Vulkan allows the flag on any square 2D image with 6n layers.
-    s.cube_compat = s.cube || (s.type == VK_IMAGE_TYPE_2D && s.samples == 1 && s.layers >= 6 && s.layers % 6 == 0 && s.base.width == s.base.height);
     return s;
 }
 
@@ -302,7 +304,7 @@ gfx::ImageDesc make_desc(const Shape& s, VkFormat fmt, VkImageUsageFlags usage, 
 
 VkImageCreateFlags base_flags(const Shape& s, VkFormat fmt) {
     VkImageCreateFlags f = 0;
-    if (s.cube_compat) f |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    if (s.cube) f |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (s.type == VK_IMAGE_TYPE_3D) f |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;   // 2D views of the slices
     if (srgb_partner(fmt) != VK_FORMAT_UNDEFINED || bit_alias_class(fmt)) f |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     return f;
@@ -383,6 +385,7 @@ bool sparse_flush_binds(TexGpu& g) {
     VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkFence fence = VK_NULL_HANDLE;
     if (vkCreateFence(vkdev(), &fi, nullptr, &fence) != VK_SUCCESS) return false;
+    if (on_render_thread()) submit_recorded();     // binds come after the submissions recorded before them, as without a batch
     VkResult r;
     {
         std::lock_guard<std::mutex> lk(device().queue_mutex());
@@ -518,7 +521,7 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
     g->base = s.base;
     g->levels = s.levels;
     g->layers = s.layers;
-    g->cube = s.cube_compat;
+    g->cube = s.cube;
     auto fail = [&](const std::string& why) -> TexGpu* {
         NXLOG_E(kTag, "texture %u: no image (%s): the texture is not usable on the GPU", t->id, why.c_str());
         g->failed = true;
@@ -664,7 +667,7 @@ TexGpu* tex_or_null(Texture* t, float want_scale = 1.0f) {
 float g_render_scale = 0.0f;
 float render_scale_now() {
     if (g_render_scale > 0.0f) return g_render_scale;
-    static const std::string v = nxrt::config_get_str("gfx", "render_scale", "");   // read once: this runs for every draw while unset
+    static const std::string v = nxrt::config_get_str("gfx", "render_scale", "");   // once: every draw asks (support_for_draw), and a lookup is a getenv
     float sc = 1.0f;
     if (!v.empty()) {
         sc = static_cast<float>(std::atof(v.c_str()));
@@ -953,14 +956,30 @@ void fill_zero(Frame& f, TexGpu& g) {
 }
 
 // ---- views ----------------------------------------------------------------------------------------------------------------
+bool rt_check_on() {
+    static const bool on = nxrt::config_get_bool("nvn", "rt_check", false);
+    return on;
+}
+
 // The view with these fields, created once and cached on the image.
 VkImageView view_for(TexGpu& g, VkImageViewType type, uint32_t base_level, uint32_t level_count, uint32_t base_layer, uint32_t layer_count,
                      VkFormat fmt, VkImageAspectFlags aspect, const VkComponentMapping& swz) {
     const std::array<uint32_t, 12> key = {static_cast<uint32_t>(type), base_level, level_count, base_layer, layer_count,
                                           static_cast<uint32_t>(fmt), static_cast<uint32_t>(aspect), static_cast<uint32_t>(swz.r),
                                           static_cast<uint32_t>(swz.g), static_cast<uint32_t>(swz.b), static_cast<uint32_t>(swz.a), 0u};
+    if (g.last_view && g.last_key == key) {
+        if (rt_check_on()) {   // [nvn] rt_check: the map holds the same view (notes/rt.md)
+            const auto c = g.views.find(key);
+            if (c == g.views.end() || c->second != g.last_view) NXLOG_W("nvn.rtcheck", "mismatch: view_for last view");
+        }
+        return g.last_view;
+    }
     auto it = g.views.find(key);
-    if (it != g.views.end()) return it->second;
+    if (it != g.views.end()) {
+        g.last_key = key;
+        g.last_view = it->second;
+        return it->second;
+    }
     VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vi.image = g.img.image;
     vi.viewType = type;
@@ -1435,6 +1454,7 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     std::vector<VkImageView> views;
     for (auto& kv : g->views) views.push_back(kv.second);
     g->views.clear();
+    g->last_view = VK_NULL_HANDLE;
     defer_destroy([old, views]() mutable {
         for (VkImageView v : views) { vkDestroyImageView(vkdev(), v, nullptr); vk_gauge_image_views().sub(1); }
         device().destroy_image(old);
@@ -1444,6 +1464,7 @@ bool tex_rescale(Texture* t, Frame& f, float to, const char* why) {
     g->layout = nl;
     g->scale = to;
     if (to == 1.0f) g->scale_blocked = true;
+    pool_texture_remade(t);
     return true;
 }
 
@@ -1814,6 +1835,7 @@ void tex_ensure_current(Texture* t, Frame& f) {
 
 void tex_transition(Texture* t, Frame& f, VkImageLayout layout) {
     TexGpu* g = tex_or_null(t);
+    if (g && g->layout != layout) pool_note_layout(t, layout);
     if (g) move_layout(f, *g, layout);
 }
 
@@ -1829,7 +1851,6 @@ void tex_sparse_before_copy(Texture* t, uint32_t layer, uint32_t level) {
 void tex_mark_gpu_written(Texture* t) {
     TexGpu* g = tex_or_null(t);
     if (!g) return;
-    if (!g->gpu_written) tev(t, "gpu_written", 0, 0);
     g->gpu_written = true;
     t->cpu_dirty.store(false);                   // the GPU data is the newer one until the CPU writes again
 }
@@ -2034,14 +2055,40 @@ SamplerInfo tuned_sampler(const SamplerInfo& in) {
     return s;
 }
 
+// sampler_for's last few answers, for the game's sampler and the tuning tuned_sampler applies (render thread, as the map): a draw's
+// samplers repeat from draw to draw (rt agent, notes/rt.md). Emptied with the map (tex_shutdown).
+struct SamplerLast { SamplerInfo in; int aniso = 0; float bias = 0.0f; VkSampler out = VK_NULL_HANDLE; };
+static SamplerLast g_sampler_last[4];
+static unsigned g_sampler_last_next = 0;
+
 VkSampler sampler_for(const SamplerInfo& game_sampler) {
+    SamplerLast* last = g_sampler_last;
+    unsigned& last_next = g_sampler_last_next;
+    const int aniso = gfx::tuning().anisotropy.load(std::memory_order_relaxed);
+    const float bias = gfx::tuning().lod_bias.load(std::memory_order_relaxed);
+    for (int i = 0; i < 4; ++i) {
+        const SamplerLast& l = last[i];
+        if (l.out && l.aniso == aniso && l.bias == bias && l.in == game_sampler) {
+            if (rt_check_on()) {   // [nvn] rt_check: the map gives the same sampler
+                const SamplerInfo s = tuned_sampler(game_sampler);
+                VkSampler m = VK_NULL_HANDLE;
+                for (const auto& e : g_sh.samplers[sampler_hash(s)]) if (e.first == s) m = e.second;
+                if (m != l.out) NXLOG_W("nvn.rtcheck", "mismatch: sampler_for last sampler");
+            }
+            return l.out;
+        }
+    }
     const SamplerInfo s = tuned_sampler(game_sampler);
     auto& bucket = g_sh.samplers[sampler_hash(s)];
     for (const auto& e : bucket)
-        if (e.first == s) return e.second;
+        if (e.first == s) {
+            last[last_next++ % 4] = {game_sampler, aniso, bias, e.second};
+            return e.second;
+        }
     const VkSampler v = create_sampler(s);
     if (v == VK_NULL_HANDLE) return dummy_sampler();
     bucket.emplace_back(s, v);
+    last[last_next++ % 4] = {game_sampler, aniso, bias, v};
     return v;
 }
 
@@ -2092,6 +2139,7 @@ void tex_shutdown() {
     for (auto& kv : g_sh.samplers)
         for (auto& e : kv.second) { vkDestroySampler(vkdev(), e.second, nullptr); vk_gauge_samplers().sub(1); }
     g_sh.samplers.clear();
+    for (SamplerLast& l : g_sampler_last) l = SamplerLast();
     if (g_sh.dummy_sampler != VK_NULL_HANDLE) { vkDestroySampler(vkdev(), g_sh.dummy_sampler, nullptr); vk_gauge_samplers().sub(1); }
     for (auto& kv : g_sh.storage) {
         if (kv.second.view != VK_NULL_HANDLE) { vkDestroyImageView(vkdev(), kv.second.view, nullptr); vk_gauge_image_views().sub(1); }
@@ -2149,6 +2197,7 @@ static bool convert_png_impl(const uint8_t* src, VkFormat f, VkExtent3D e, uint3
             case VK_FORMAT_R8_UNORM: c[0] = c[1] = c[2] = p[0] / 255.0f; break;
             case VK_FORMAT_R16_UNORM: c[0] = c[1] = c[2] = u16(0) / 65535.0f; break;
             case VK_FORMAT_R16_SFLOAT: c[0] = c[1] = c[2] = half_to_float(u16(0)); hdr = true; break;
+            case VK_FORMAT_R16G16_SFLOAT: c[0] = half_to_float(u16(0)); c[1] = half_to_float(u16(1)); c[2] = 0; hdr = true; break;
             case VK_FORMAT_R16G16B16A16_SFLOAT: for (int k = 0; k < 4; ++k) c[k] = half_to_float(u16(k)); hdr = true; break;
             case VK_FORMAT_R16G16B16A16_UNORM: for (int k = 0; k < 4; ++k) c[k] = u16(k) / 65535.0f; break;
             case VK_FORMAT_R32_SFLOAT: c[0] = c[1] = c[2] = f32(0); hdr = true; break;
@@ -2191,6 +2240,7 @@ static uint32_t dump_bpp(VkFormat f, VkImageAspectFlags* aspect) {
     switch (f) {
         case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
         case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+        case VK_FORMAT_R16G16_SFLOAT:
             return 4;
         case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R16G16B16A16_UNORM: case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32_UINT: return 8;
         case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_R32G32B32A32_UINT: return 16;
@@ -2317,7 +2367,9 @@ bool snapshot_write(int index, const std::string& path, std::string* stats) {
         return wrote;
     }
     const bool ok = convert_png_impl(static_cast<const uint8_t*>(s.buf.mapped), s.format, s.e, s.bpp, s.aspect, path, stats);
-    if ((s.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || s.format == VK_FORMAT_R16G16B16A16_UNORM) {   // depth, 16-bit colour: the texel bytes too (<path>.bin), an 8-bit PNG loses the precision
+    const bool hdr = s.format == VK_FORMAT_R16G16B16A16_SFLOAT || s.format == VK_FORMAT_R16_SFLOAT || s.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+                     s.format == VK_FORMAT_R32_SFLOAT || s.format == VK_FORMAT_R16G16_SFLOAT;
+    if ((s.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || s.format == VK_FORMAT_R16G16B16A16_UNORM || hdr) {   // depth, 16-bit colour, float: the texel bytes too (<path>.bin), an 8-bit PNG loses the precision
         if (FILE* f = std::fopen((path + ".bin").c_str(), "wb")) {
             std::fwrite(s.buf.mapped, 1, static_cast<size_t>(s.e.width) * s.e.height * s.bpp, f);
             std::fclose(f);

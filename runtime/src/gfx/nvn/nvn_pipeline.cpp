@@ -3,6 +3,7 @@
 // VkPipelineCache persists between runs ([nvn] pipeline_cache, default "pipeline_cache.bin").
 #include "nvn_pipeline.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -11,15 +12,20 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 
 #include "nxrt/config.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/gauge.h"
 #include "nxrt/log.h"
+#include "nvn_enums.h"
+#include "nvn_format.h"
 #include "nvn_gpu_internal.h"
 #include "nvn_spirv_patch.h"
+#include "vk_gauges.h"
 #include "extras/hdr_nvn.h"
 #include "nxrt/extras.h"
 
@@ -40,7 +46,7 @@ std::recursive_mutex g_module_mu;   // every module cache below; the variant mak
 std::map<LayoutKey, ProgLayout> g_layouts;
 // Descriptor set layouts and the pipeline layout built from them, shared by every program whose descriptors are the same (S24): two programs with
 // the same signature get the same VkPipelineLayout handle, so the shader parts compiled for one are found again for the other.
-struct SharedLayout { VkDescriptorSetLayout sets[4] = {}; VkPipelineLayout layout = VK_NULL_HANDLE; };
+struct SharedLayout { VkDescriptorSetLayout sets[5] = {}; VkPipelineLayout layout = VK_NULL_HANDLE; };
 std::map<std::string, SharedLayout> g_shared_layouts;
 std::unordered_map<const ShaderInfo*, VkShaderModule> g_modules;
 std::mutex g_module_id_mu;
@@ -70,8 +76,6 @@ nxrt::GaugeCounter g_pipeline_count{"nvn.pipelines"};   // live VkPipelines (gra
 std::unordered_map<const ShaderInfo*, std::pair<gfx::Buffer, VkDeviceSize>> g_const_bufs;
 gfx::Buffer g_driver_const;
 bool g_driver_const_made = false;
-gfx::Buffer g_color_transform;
-bool g_color_transform_made = false;
 // Counters mirrored at the sites that change the maps above (they are render thread only, so the gauge reads these instead).
 nxrt::GaugeCounter g_pipes_created{"nvn.pipelines_created"};     // ever; same events as counters().pipelines_created (shader parts included)
 nxrt::GaugeCounter g_gfx_keys{"nvn.pipeline_keys"};              // entries in g_gfx: one per graphics key tried (a failed build keeps its entry)
@@ -167,10 +171,18 @@ void pipeline_cache_flush() {
 }
 
 bool GraphicsKey::operator==(const GraphicsKey& o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
+// Word by word: byte by byte it was ~300 dependent multiplies a lookup, and the render thread looks up a key for most draws (~1,700 a
+// frame in Dagsion; rt agent, notes/rt.md). Only the in-memory map g_gfx uses it. Keys are zeroed before they are filled (padding too).
 uint64_t GraphicsKey::hash() const {
+    static_assert(sizeof(GraphicsKey) % 8 == 0, "GraphicsKey is hashed in 8-byte words");
     const uint8_t* p = reinterpret_cast<const uint8_t*>(this);
     uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < sizeof *this; ++i) h = (h ^ p[i]) * 1099511628211ull;
+    for (size_t i = 0; i < sizeof *this; i += 8) {
+        uint64_t w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x9e3779b97f4a7c15ull;
+        h ^= h >> 29;
+    }
     return h;
 }
 
@@ -196,6 +208,12 @@ static VkShaderModule create_module(const std::vector<uint32_t>& words, const ch
             code = &fixed;
         }
     }
+    // Every Location output of a vertex / tessellation evaluation / geometry shader starts at (0,0,0,1) as on the console: a component the
+    // shader never writes is undefined in Vulkan, and RADV hands NaN where AMD's Windows driver hands 0 (spirv_init_outputs). Every
+    // module goes through here, the ones spirv_add_outputs / spirv_gs_passthrough rewrote included. [nvn] init_outputs = false: off (A/B).
+    static const bool init_outputs = config_get_bool("nvn", "init_outputs", true);
+    std::vector<uint32_t> initialised;
+    if (init_outputs && spirv_init_outputs(*code, initialised)) code = &initialised;
     // [nvn] spirv_salt (measurement only): an OpSourceExtension with the salt in every module gives the driver a new shader hash, so a run
     // compiles every shader from scratch without touching the driver's own cache on disk.
     static const std::string salt = config_get_str("nvn", "spirv_salt", "");
@@ -383,7 +401,7 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
         if (!s) continue;
         for (size_t i = 0; i < s->refl.bindings.size(); ++i) {
             const DescriptorBinding& b = s->refl.bindings[i];
-            if (!b.used || b.set > 3) continue;
+            if (!b.used || (b.set > 3 && b.set != kPoolSet)) continue;
             const auto k = std::make_pair(b.set, b.binding);
             auto f = index.find(k);
             if (f == index.end()) {
@@ -419,6 +437,18 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
         }
         sig.append("|", 1);
     }
+    // the pool arrays: the shared layout of kPoolSet (pool_set_layout), whatever arrays the program's stages use
+    for (const BindingDesc& d : pl.bindings) pl.has_set[kPoolSet] |= d.set == kPoolSet;
+    VkDescriptorSetLayout pool_layout = VK_NULL_HANDLE;
+    if (pl.has_set[kPoolSet]) {
+        pool_layout = pool_set_layout();
+        if (!pool_layout) {
+            static bool logged = false;
+            if (!logged) { logged = true; NXLOG_E(kTag, "a program samples through the texture pool but the device has no pool set layout: its draws are skipped"); }
+            return nullptr;
+        }
+        sig.append("pools", 5);
+    }
     // push constants of generated stages (the pass-through tessellation control shader): one range from offset 0 over those stages
     VkPushConstantRange pcr = {0, 0, 0};
     for (int st = 0; st < 6; ++st)
@@ -443,8 +473,9 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
                 return nullptr;
             }
         }
+        nl.sets[kPoolSet] = pool_layout;            // not owned (pool_sets_shutdown destroys it)
         VkPipelineLayoutCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        pci.setLayoutCount = 4;
+        pci.setLayoutCount = pool_layout ? 5 : 4;
         pci.pSetLayouts = nl.sets;
         pci.pushConstantRangeCount = pcr.size ? 1 : 0;
         pci.pPushConstantRanges = pcr.size ? &pcr : nullptr;
@@ -454,7 +485,7 @@ const ProgLayout* prog_layout(const ShaderInfo* const stages[6]) {
         }
         sh = g_shared_layouts.emplace(sig, nl).first;
     }
-    for (int set = 0; set < 4; ++set) pl.sets[set] = sh->second.sets[set];
+    for (int set = 0; set < 5; ++set) pl.sets[set] = sh->second.sets[set];
     pl.layout = sh->second.layout;
     pl.push_stages = pcr.stageFlags;
     pl.push_bytes = pcr.size;
@@ -515,43 +546,35 @@ bool resolve_stage_modules(const GraphicsKey& key, StageModules* out) {
     return true;
 }
 
-bool small_dynamic_conservative() {
-    static const bool on = config_get_bool("nvn", "small_dynamic", true) && device().features().conservative_raster_dynamic;
-    return on;
-}
-bool small_dynamic_fsr() {
-    static const bool on = config_get_bool("nvn", "small_dynamic", true) && device().features().fragment_shading_rate;
-    return on;
+const VkPipelineDynamicStateCreateInfo* pipeline_dynamic_state() {
+    static const VkDynamicState dyn[] = {
+        VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
+        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+        VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
+        VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_DEPTH_BIAS,
+        VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BOUNDS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_LINE_WIDTH};
+    static const VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0,
+                                                        sizeof(dyn) / sizeof(dyn[0]), dyn};
+    return &dy;
 }
 
-// The dynamic states of every graphics pipeline. The NVN2 smaller features add two groups when the device has them (nvn_small.h): the
-// conservative raster mode / overestimation size (VK_EXT_conservative_rasterization with extended dynamic state 3) and the fragment shading
-// rate (VK_KHR_fragment_shading_rate). Once a pipeline lists them, the replay sets them before the first draw of every pass
-// (set_dynamic_state). [nvn] small_dynamic = false leaves both out.
-const VkPipelineDynamicStateCreateInfo* pipeline_dynamic_state() {
-    static const struct Dyn {
-        VkDynamicState s[32];
-        VkPipelineDynamicStateCreateInfo ci;
-        Dyn() {
-            const VkDynamicState base[] = {
-                VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
-                VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-                VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
-                VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
-                VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_DEPTH_BIAS,
-                VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_DEPTH_BOUNDS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-                VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_LINE_WIDTH};
-            uint32_t n = 0;
-            for (VkDynamicState d : base) s[n++] = d;
-            if (small_dynamic_conservative()) {
-                s[n++] = VK_DYNAMIC_STATE_CONSERVATIVE_RASTERIZATION_MODE_EXT;
-                s[n++] = VK_DYNAMIC_STATE_EXTRA_PRIMITIVE_OVERESTIMATION_SIZE_EXT;
-            }
-            if (small_dynamic_fsr()) s[n++] = VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR;
-            ci = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, n, s};
-        }
-    } dyn;
-    return &dyn.ci;
+// A constant bank read past its bound size gives zero on the console; translated shaders index banks with values read from them (the
+// light loops of the game's lighting compute shaders run past their 896-byte block), and without robust access those reads go anywhere.
+const void* ubo_robustness() {
+    auto make = [](VkPipelineRobustnessBufferBehaviorEXT ubo) {
+        VkPipelineRobustnessCreateInfoEXT r = {VK_STRUCTURE_TYPE_PIPELINE_ROBUSTNESS_CREATE_INFO_EXT};
+        r.storageBuffers = r.vertexInputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DEVICE_DEFAULT_EXT;
+        r.uniformBuffers = ubo;
+        r.images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DEVICE_DEFAULT_EXT;
+        return r;
+    };
+    static const VkPipelineRobustnessCreateInfoEXT v1 = make(VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT),
+                                                   v2 = make(VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2_EXT);
+    static const bool on = nxrt::config_get_bool("nvn", "robust_ubo", true);
+    const int level = on ? device().features().ubo_robustness : 0;
+    return level == 2 ? &v2 : level == 1 ? &v1 : nullptr;
 }
 
 VkPipelineCache pipeline_cache_handle() {
@@ -579,7 +602,7 @@ VkPipeline build_graphics_pipeline(const GraphicsKey& key, const ProgLayout& lay
     if (!resolve_stage_modules(key, &sm)) return VK_NULL_HANDLE;
     for (int i = 0; i < 5; ++i) {
         if (!sm.m[i]) continue;
-        stages[ns] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stages[ns] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, ubo_robustness()};
         stages[ns].stage = bits[i];
         stages[ns].module = sm.m[i];
         stages[ns].pName = "main";
@@ -741,8 +764,8 @@ VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout) {
     VkShaderModule m = shader_module(cs);
     VkPipeline pipe = VK_NULL_HANDLE;
     if (m) {
-        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, ubo_robustness()};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, ubo_robustness()};
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         ci.stage.module = m;
         ci.stage.pName = "main";
@@ -799,19 +822,537 @@ VkBuffer driver_constants_buffer(VkDeviceSize* range) {
     return g_driver_const.buffer;
 }
 
-// c[24]: the NVN2 fragment output colour transform (3x3 matrix in std140 rows at 0x00/0x10/0x20, vec3 offset at 0x30) the driver
-// supplies; the translator binds it as "<stage>_c24". The vi queries report an SDR display, so it is the identity.
-VkBuffer color_transform_buffer(VkDeviceSize* range) {
-    if (!g_color_transform_made) {
-        g_color_transform_made = true;
-        if (device().create_buffer(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, gfx::MemoryUse::Upload, &g_color_transform, "nvn c24") == VK_SUCCESS) {
-            std::memset(g_color_transform.mapped, 0, 256);
-            float* m = static_cast<float*>(g_color_transform.mapped);
-            m[0] = m[5] = m[10] = 1.0f;
+// ---- texture and sampler pools as descriptor arrays (kPoolSet) -------------------------------------------------------------------
+// The GPU may still run submissions that read a pool set when the game registers something new, so each pool pair keeps a few sets and
+// only writes one that no submission in flight reads (or one that only the submission being recorded has bound: the bindings are update
+// after bind). A set is brought up to date with the ids registered since it was last current (the pools' change lists); a new set is
+// written whole once. An element whose texture is not in its sampled layout yet (an attachment of the open pass) gets the dummy and is
+// written again once it is. Render thread, except pool_set_layout (pipeline layouts are also made by the prewarm workers).
+namespace {
+
+constexpr VkShaderStageFlags kPoolStages = VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_COMPUTE_BIT;
+constexpr uint64_t kPoolIdle = 2000;            // submissions after which an unused pool pair or texture pool record is dropped
+
+std::mutex g_pool_layout_mu;
+VkDescriptorSetLayout g_pool_layout = VK_NULL_HANDLE;
+bool g_pool_layout_tried = false;
+uint32_t g_pool_copies = 2;                     // sets per pool pair (2..8, from the device's update-after-bind budget)
+
+struct PoolCopy {
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    bool written = false;                       // every element written once
+    uint64_t tex_version = 0, smp_version = 0;  // the registrations it holds
+    uint64_t used = 0, used_before = 0;         // serial of the last submission that bound it, and of the one before that
+    std::vector<uint32_t> pending;              // texture ids holding the dummy until their texture is in its sampled layout
+};
+struct PoolPair {
+    Ref<TexturePool> tp;
+    Ref<SamplerPool> sp;
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    std::vector<PoolCopy> copies;
+    int cur = -1;
+    uint64_t last_use = 0;
+};
+// What pool_textures_to_prepare knows of a texture pool.
+struct PoolRes {
+    Ref<TexturePool> tp;
+    uint64_t version = ~0ull;                   // registrations reflected in by_id / reg
+    std::vector<Texture*> by_id;                // the texture at each id (compared only; reg holds the references)
+    std::unordered_map<Texture*, std::pair<Ref<Texture>, uint32_t>> reg;   // registered textures, the number of ids each sits at
+    std::vector<Ref<Texture>> watch;            // to look at next time
+    uint64_t epoch = 0;                         // g_tex_scan_epoch when every texture was last looked at
+    bool all = true;                            // look at every texture next time
+    uint64_t last_use = 0;
+};
+std::vector<std::unique_ptr<PoolPair>> g_pool_pairs;
+std::vector<std::unique_ptr<PoolRes>> g_pool_res;
+std::vector<Ref<Texture>> g_layout_moves;       // pool_note_layout, drained by pool_textures_to_prepare
+nxrt::GaugeCounter g_pool_writes{"nvn.pool_descriptors_written"};
+nxrt::GaugeCounter g_pool_sets{"nvn.pool_sets"};
+
+template <class Pool>
+uint64_t version_of(Pool* p) {
+    if (!p) return 0;
+    std::shared_lock<std::shared_mutex> lk(p->lock);
+    return p->version;
+}
+
+// Texture id `id` as an element of the 2D or cube array: a view of that shape when the texture (or its view) has it and it is in its
+// sampled layout, else the dummy (*not_ready: it may become usable, write it again later).
+VkDescriptorImageInfo pool_image(const TexturePool::Entry& e, VkImageViewType type, bool* not_ready) {
+    VkDescriptorImageInfo ii = {VK_NULL_HANDLE, dummy_view(type, false), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    Texture* t = e.used ? e.tex.get() : nullptr;
+    if (!t || !t->fmt) return ii;
+    // finalized and still registered: the image of a live texture on the same storage (tex_gpu takes it), else the dummy, not a new image
+    if (t->destroyed.load(std::memory_order_relaxed) && !t->gpu && !texture_registry_find_alias(t)) return ii;
+    const int target = e.has_view && e.view.has_target ? e.view.target : t->b.target;
+    // a square 2D array of 6n layers is also a cube (its image is made cube compatible, shape_of): the game registers its environment
+    // maps that way and samples them through the cube array, as it binds them to cube samplers
+    const bool cube_array = target == NVN_TEXTURE_TARGET_2D_ARRAY && t->b.width == t->b.height && t->b.samples <= 1 && t->layers >= 6 &&
+                            t->layers % 6 == 0;
+    const bool cube = target == NVN_TEXTURE_TARGET_CUBEMAP || target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY || cube_array;
+    // a cube read through the 2D array gives its first face: Maxwell keeps a cube's faces as layers and a non-array sample reads layer 0, as
+    // tex_sampled_view does for bound slots (nxnative-penis6 6b0cffbb5e); the dummy read zero
+    const bool flat = target == NVN_TEXTURE_TARGET_2D || target == NVN_TEXTURE_TARGET_2D_ARRAY || target == NVN_TEXTURE_TARGET_RECTANGLE ||
+                      target == NVN_TEXTURE_TARGET_CUBEMAP || target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+    if (type == VK_IMAGE_VIEW_TYPE_CUBE ? !cube : !flat) return ii;
+    if (!tex_gpu(t)) return ii;
+    if (tex_layout(t) != tex_sampled_layout(t)) {
+        *not_ready = true;
+        return ii;
+    }
+    ViewRequest q;
+    q.type = type;
+    int sw[4] = {t->b.swizzle[0], t->b.swizzle[1], t->b.swizzle[2], t->b.swizzle[3]};
+    int dsmode = t->b.depth_stencil_mode;
+    if (e.has_view) {
+        const TextureViewInfo& v = e.view;
+        if (v.has_levels) { q.base_level = static_cast<uint32_t>(v.min_level); q.level_count = static_cast<uint32_t>(v.num_levels); }
+        if (v.has_layers) { q.base_layer = static_cast<uint32_t>(v.min_layer); q.layer_count = static_cast<uint32_t>(v.num_layers); }
+        if (v.has_format)
+            if (const FormatInfo* fi = format_info(v.format)) q.format = fi->vk;
+        if (v.has_swizzle) for (int i = 0; i < 4; ++i) sw[i] = v.swizzle[i];
+        if (v.has_depth_stencil_mode) dsmode = v.depth_stencil_mode;
+    }
+    q.swizzle = {vk_swizzle(sw[0]), vk_swizzle(sw[1]), vk_swizzle(sw[2]), vk_swizzle(sw[3])};
+    q.depth_aspect = dsmode == NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH;
+    q.component = 1;                            // the arrays are float images
+    if (VkImageView v = tex_sampled_view(t, q)) {
+        ii.imageView = v;
+        ii.imageLayout = tex_sampled_layout(t);
+    }
+    return ii;
+}
+
+// Writes the elements of `ids` (all ids when null) of one set from the pools as they are now.
+void write_pool_textures(PoolCopy& c, TexturePool* tp, const std::vector<uint32_t>* ids) {
+    static std::vector<VkDescriptorImageInfo> flat, cube;
+    std::vector<uint32_t> pending;
+    std::vector<VkWriteDescriptorSet> writes;
+    auto element = [&](const TexturePool::Entry* e, uint32_t id, size_t at) {
+        bool not_ready = false;
+        static const TexturePool::Entry kNone;
+        flat[at] = pool_image(e ? *e : kNone, VK_IMAGE_VIEW_TYPE_2D, &not_ready);
+        cube[at] = pool_image(e ? *e : kNone, VK_IMAGE_VIEW_TYPE_CUBE, &not_ready);
+        if (not_ready) pending.push_back(id);
+    };
+    std::shared_lock<std::shared_mutex> lk;
+    if (tp) lk = std::shared_lock<std::shared_mutex>(tp->lock);
+    const size_t count = tp ? std::min<size_t>(tp->entries.size(), kPoolTextureCount) : 0;
+    if (!ids) {
+        flat.resize(kPoolTextureCount);
+        cube.resize(kPoolTextureCount);
+        for (uint32_t id = 0; id < kPoolTextureCount; ++id) element(id < count ? &tp->entries[id] : nullptr, id, id);
+        size_t used = 0, n2d = 0, ncube = 0;
+        const VkImageView d2 = dummy_view(VK_IMAGE_VIEW_TYPE_2D, false), dc = dummy_view(VK_IMAGE_VIEW_TYPE_CUBE, false);
+        for (uint32_t id = 0; id < count; ++id) {
+            used += tp->entries[id].used ? 1 : 0;
+            n2d += flat[id].imageView != d2 ? 1 : 0;
+            ncube += cube[id].imageView != dc ? 1 : 0;
+        }
+        NXLOG_I(kTag, "pool arrays: set written whole: %zu of %zu ids registered, %zu sampled as 2D, %zu as cubes, %zu waiting for their sampled layout",
+                used, count, n2d, ncube, pending.size());
+        for (uint32_t b : {uint32_t(kPoolTex2D), uint32_t(kPoolTexCube)}) {
+            VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = c.set;
+            w.dstBinding = b;
+            w.descriptorCount = kPoolTextureCount;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            w.pImageInfo = b == kPoolTex2D ? flat.data() : cube.data();
+            writes.push_back(w);
+        }
+        c.pending.clear();
+    } else {
+        flat.resize(ids->size());
+        cube.resize(ids->size());
+        for (size_t k = 0; k < ids->size(); ++k) {
+            const uint32_t id = (*ids)[k];
+            element(id < count ? &tp->entries[id] : nullptr, id, k);
+            for (uint32_t b : {uint32_t(kPoolTex2D), uint32_t(kPoolTexCube)}) {
+                VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w.dstSet = c.set;
+                w.dstBinding = b;
+                w.dstArrayElement = id;
+                w.descriptorCount = 1;
+                w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                w.pImageInfo = b == kPoolTex2D ? &flat[k] : &cube[k];
+                writes.push_back(w);
+            }
+        }
+        // the ids written now are no longer pending (unless they still are)
+        c.pending.erase(std::remove_if(c.pending.begin(), c.pending.end(), [&](uint32_t id) { return std::find(ids->begin(), ids->end(), id) != ids->end(); }),
+                        c.pending.end());
+    }
+    lk = {};
+    vkUpdateDescriptorSets(vkdev(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    g_pool_writes.add(static_cast<int64_t>(ids ? ids->size() * 2 : 2ull * kPoolTextureCount));
+    c.pending.insert(c.pending.end(), pending.begin(), pending.end());
+}
+
+void write_pool_samplers(PoolCopy& c, SamplerPool* sp, const std::vector<uint32_t>* ids) {
+    static std::vector<VkDescriptorImageInfo> info;
+    std::vector<VkWriteDescriptorSet> writes;
+    std::shared_lock<std::shared_mutex> lk;
+    if (sp) lk = std::shared_lock<std::shared_mutex>(sp->lock);
+    auto element = [&](uint32_t id) {
+        VkDescriptorImageInfo ii = {dummy_sampler(), VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+        if (sp && id < sp->used.size() && sp->used[id]) ii.sampler = sampler_for(sp->entries[id]);
+        return ii;
+    };
+    if (!ids) {
+        info.resize(kPoolSamplerCount);
+        for (uint32_t id = 0; id < kPoolSamplerCount; ++id) info[id] = element(id);
+        VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet = c.set;
+        w.dstBinding = kPoolSamplers;
+        w.descriptorCount = kPoolSamplerCount;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        w.pImageInfo = info.data();
+        writes.push_back(w);
+    } else {
+        info.resize(ids->size());
+        for (size_t k = 0; k < ids->size(); ++k) {
+            info[k] = element((*ids)[k]);
+            VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = c.set;
+            w.dstBinding = kPoolSamplers;
+            w.dstArrayElement = (*ids)[k];
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            w.pImageInfo = &info[k];
+            writes.push_back(w);
         }
     }
-    *range = 256;
-    return g_color_transform.buffer;
+    lk = {};
+    vkUpdateDescriptorSets(vkdev(), static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    g_pool_writes.add(static_cast<int64_t>(ids ? ids->size() : kPoolSamplerCount));
+}
+
+// The ids registered after `from` up to the pool's current version (sorted, unique); false when the change list no longer reaches back
+// that far (write every id).
+template <class Pool>
+bool changed_since(Pool* p, uint64_t from, uint64_t* now, std::vector<uint32_t>& ids) {
+    ids.clear();
+    if (!p) { *now = 0; return true; }
+    std::shared_lock<std::shared_mutex> lk(p->lock);
+    *now = p->version;
+    const uint64_t n = p->version - from;
+    if (from > p->version || n > p->changes.size()) return false;
+    ids.assign(p->changes.end() - static_cast<std::ptrdiff_t>(n), p->changes.end());
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    ids.erase(std::remove_if(ids.begin(), ids.end(), [](uint32_t id) { return id >= kPoolTextureCount; }), ids.end());
+    return true;
+}
+
+// True when some pending element of the set has become writable.
+bool pending_ready(const PoolCopy& c, TexturePool* tp) {
+    if (c.pending.empty() || !tp) return false;
+    std::shared_lock<std::shared_mutex> lk(tp->lock);
+    for (uint32_t id : c.pending) {
+        if (id >= tp->entries.size()) continue;
+        Texture* t = tp->entries[id].used ? tp->entries[id].tex.get() : nullptr;
+        if (!t || (t->gpu && tex_layout(t) == tex_sampled_layout(t))) return true;
+    }
+    return false;
+}
+
+void update_copy(PoolCopy& c, TexturePool* tp, SamplerPool* sp) {
+    std::vector<uint32_t> ids;
+    uint64_t tv = 0, sv = 0;
+    if (!c.written) {
+        changed_since(tp, 0, &tv, ids);
+        changed_since(sp, 0, &sv, ids);
+        write_pool_textures(c, tp, nullptr);
+        write_pool_samplers(c, sp, nullptr);
+        c.written = true;
+    } else {
+        if (changed_since(tp, c.tex_version, &tv, ids)) {
+            for (uint32_t id : c.pending) ids.push_back(id);
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+            if (!ids.empty()) write_pool_textures(c, tp, &ids);
+        } else {
+            write_pool_textures(c, tp, nullptr);
+        }
+        if (changed_since(sp, c.smp_version, &sv, ids)) {
+            ids.erase(std::remove_if(ids.begin(), ids.end(), [](uint32_t id) { return id >= kPoolSamplerCount; }), ids.end());
+            if (!ids.empty()) write_pool_samplers(c, sp, &ids);
+        } else {
+            write_pool_samplers(c, sp, nullptr);
+        }
+    }
+    c.tex_version = tv;
+    c.smp_version = sv;
+}
+
+PoolPair* pool_pair(TexturePool* tp, SamplerPool* sp) {
+    for (auto& p : g_pool_pairs)
+        if (p->tp.get() == tp && p->sp.get() == sp) return p.get();
+    auto p = std::make_unique<PoolPair>();
+    p->tp = Ref<TexturePool>::share(tp);
+    p->sp = Ref<SamplerPool>::share(sp);
+    const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_SAMPLER, g_pool_copies * kPoolSamplerCount},
+                                           {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, g_pool_copies * 2 * kPoolTextureCount}};
+    VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    ci.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+    ci.maxSets = g_pool_copies;
+    ci.poolSizeCount = 2;
+    ci.pPoolSizes = sizes;
+    const VkResult r = vkCreateDescriptorPool(vkdev(), &ci, nullptr, &p->dpool);
+    if (r != VK_SUCCESS) {
+        NXLOG_E(kTag, "pool arrays: descriptor pool for %u sets failed (%d)", g_pool_copies, static_cast<int>(r));
+        return nullptr;
+    }
+    vk_gauge_descriptor_pools().add(1);
+    g_pool_pairs.push_back(std::move(p));
+    return g_pool_pairs.back().get();
+}
+
+PoolRes& pool_res(TexturePool* tp) {
+    for (auto& r : g_pool_res)
+        if (r->tp.get() == tp) return *r;
+    auto r = std::make_unique<PoolRes>();
+    r->tp = Ref<TexturePool>::share(tp);
+    g_pool_res.push_back(std::move(r));
+    return *g_pool_res.back();
+}
+
+// Drops the pairs and texture pool records nothing used for kPoolIdle submissions (their sets once the GPU is done with them).
+void pool_prune(uint64_t serial) {
+    static uint64_t last = 0;
+    if (serial - last < 256) return;
+    last = serial;
+    for (auto it = g_pool_pairs.begin(); it != g_pool_pairs.end();) {
+        if (serial - (*it)->last_use < kPoolIdle) { ++it; continue; }
+        const VkDescriptorPool dp = (*it)->dpool;
+        g_pool_sets.sub(static_cast<int64_t>((*it)->copies.size()));
+        defer_destroy([dp] { vkDestroyDescriptorPool(vkdev(), dp, nullptr); vk_gauge_descriptor_pools().sub(1); });
+        it = g_pool_pairs.erase(it);
+    }
+    g_pool_res.erase(std::remove_if(g_pool_res.begin(), g_pool_res.end(), [&](const std::unique_ptr<PoolRes>& r) { return serial - r->last_use >= kPoolIdle; }),
+                     g_pool_res.end());
+}
+
+}  // namespace
+
+VkDescriptorSetLayout pool_set_layout() {
+    std::lock_guard<std::mutex> lk(g_pool_layout_mu);
+    if (g_pool_layout_tried) return g_pool_layout;
+    g_pool_layout_tried = true;
+    VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 f2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12};
+    vkGetPhysicalDeviceFeatures2(device().physical(), &f2);
+    VkPhysicalDeviceVulkan12Properties p12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &p12};
+    vkGetPhysicalDeviceProperties2(device().physical(), &p2);
+    // the pool arrays plus room for a program's own textures and samplers (sets 2 and 3) in the same stage
+    const uint64_t images = 2ull * kPoolTextureCount, per_set = images + kPoolSamplerCount;
+    const bool feats = f12.descriptorIndexing && f12.descriptorBindingPartiallyBound && f12.descriptorBindingSampledImageUpdateAfterBind &&
+                       f12.shaderSampledImageArrayNonUniformIndexing;
+    const bool limits = p12.maxDescriptorSetUpdateAfterBindSampledImages >= images + 512 && p12.maxPerStageDescriptorUpdateAfterBindSampledImages >= images + 256 &&
+                        p12.maxDescriptorSetUpdateAfterBindSamplers >= kPoolSamplerCount + 512 && p12.maxPerStageDescriptorUpdateAfterBindSamplers >= kPoolSamplerCount + 256 &&
+                        p12.maxPerStageUpdateAfterBindResources >= per_set + 512 && p12.maxUpdateAfterBindDescriptorsInAllPools >= 2 * per_set;
+    g_pool_copies = static_cast<uint32_t>(std::clamp<uint64_t>(p12.maxUpdateAfterBindDescriptorsInAllPools / (2 * per_set), 2, 8));
+    NXLOG_I(kTag, "pool arrays: descriptor indexing %d, partially bound %d, sampled images update after bind %d, non-uniform indexing %d; update-after-bind limits: "
+            "%u sampled images per set, %u per stage, %u samplers per set, %u per stage, %u resources per stage, %u in all pools: %s",
+            f12.descriptorIndexing, f12.descriptorBindingPartiallyBound, f12.descriptorBindingSampledImageUpdateAfterBind, f12.shaderSampledImageArrayNonUniformIndexing,
+            p12.maxDescriptorSetUpdateAfterBindSampledImages, p12.maxPerStageDescriptorUpdateAfterBindSampledImages, p12.maxDescriptorSetUpdateAfterBindSamplers,
+            p12.maxPerStageDescriptorUpdateAfterBindSamplers, p12.maxPerStageUpdateAfterBindResources, p12.maxUpdateAfterBindDescriptorsInAllPools,
+            feats && limits ? "usable" : "NOT usable: programs that sample through the pools are not drawn");
+    if (!feats || !limits) return VK_NULL_HANDLE;
+    const VkDescriptorSetLayoutBinding b[kPoolBindingCount] = {
+        {kPoolSamplers, VK_DESCRIPTOR_TYPE_SAMPLER, kPoolSamplerCount, kPoolStages, nullptr},
+        {kPoolTex2D, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kPoolTextureCount, kPoolStages, nullptr},
+        {kPoolTexCube, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kPoolTextureCount, kPoolStages, nullptr}};
+    const VkDescriptorBindingFlags flags = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    const VkDescriptorBindingFlags fl[kPoolBindingCount] = {flags, flags, flags};
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bf = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+    bf.bindingCount = kPoolBindingCount;
+    bf.pBindingFlags = fl;
+    VkDescriptorSetLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, &bf};
+    ci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    ci.bindingCount = kPoolBindingCount;
+    ci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(vkdev(), &ci, nullptr, &g_pool_layout) != VK_SUCCESS) {
+        NXLOG_E(kTag, "pool arrays: descriptor set layout failed");
+        g_pool_layout = VK_NULL_HANDLE;
+    }
+    return g_pool_layout;
+}
+
+VkDescriptorSet pool_set(TexturePool* tp, SamplerPool* sp, Frame& f) {
+    if (!pool_set_layout()) return VK_NULL_HANDLE;
+    pool_prune(f.serial);
+    PoolPair* pp = pool_pair(tp, sp);
+    if (!pp) return VK_NULL_HANDLE;
+    pp->last_use = f.serial;
+    auto bind = [&](int i) {
+        PoolCopy& c = pp->copies[static_cast<size_t>(i)];
+        if (c.used != f.serial) { c.used_before = c.used; c.used = f.serial; }
+        pp->cur = i;
+        return c.set;
+    };
+    const uint64_t tv = version_of(tp), sv = version_of(sp);
+    if (pp->cur >= 0) {
+        const PoolCopy& c = pp->copies[static_cast<size_t>(pp->cur)];
+        if (c.written && c.tex_version == tv && c.smp_version == sv && !pending_ready(c, tp)) return bind(pp->cur);
+    }
+    // a set no submission in flight reads: the current one when only this submission has bound it, else the most up to date idle one
+    const uint64_t done = poll_completed();
+    auto idle = [&](const PoolCopy& c) { return (c.used == f.serial ? c.used_before : c.used) <= done; };
+    int pick = pp->cur >= 0 && idle(pp->copies[static_cast<size_t>(pp->cur)]) ? pp->cur : -1;
+    for (size_t i = 0; pick < 0 && i < pp->copies.size(); ++i)
+        if (idle(pp->copies[i]) && pp->copies[i].written) pick = static_cast<int>(i);
+    if (pick < 0 && pp->copies.size() < g_pool_copies) {
+        PoolCopy c;
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = pp->dpool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &g_pool_layout;
+        if (vkAllocateDescriptorSets(vkdev(), &ai, &c.set) == VK_SUCCESS) {
+            device().set_name(VK_OBJECT_TYPE_DESCRIPTOR_SET, reinterpret_cast<uint64_t>(c.set), "nvn pool arrays");
+            pp->copies.push_back(std::move(c));
+            g_pool_sets.add(1);
+            pick = static_cast<int>(pp->copies.size() - 1);
+        }
+    }
+    if (pick < 0) {
+        // every set is being read by submissions in flight: wait for the one bound longest ago
+        size_t oldest = 0;
+        for (size_t i = 1; i < pp->copies.size(); ++i)
+            if (pp->copies[i].used < pp->copies[oldest].used) oldest = i;
+        static int logged = 0;
+        if (logged++ < 10) NXLOG_W(kTag, "pool arrays: all %zu sets of a pool pair are in flight; waiting for submission %llu", pp->copies.size(),
+                                   static_cast<unsigned long long>(pp->copies[oldest].used));
+        submit_recorded();
+        while (poll_completed() < pp->copies[oldest].used) std::this_thread::yield();
+        pick = static_cast<int>(oldest);
+    }
+    update_copy(pp->copies[static_cast<size_t>(pick)], tp, sp);
+    return bind(pick);
+}
+
+void pool_note_layout(Texture* t, VkImageLayout layout) {
+    if (!t || g_pool_res.empty() || layout == tex_sampled_layout(t)) return;   // nothing samples through a pool yet
+    if (g_layout_moves.size() >= 4096) {
+        for (auto& r : g_pool_res) r->all = true;
+        g_layout_moves.clear();
+    }
+    g_layout_moves.push_back(Ref<Texture>::share(t));
+}
+
+void pool_texture_remade(Texture* t) {
+    if (!t) return;
+    const TexGpu* g = t->gpu;   // textures sharing the image hold the same views
+    for (auto& pp : g_pool_pairs) {
+        TexturePool* tp = pp->tp.get();
+        if (!tp) continue;
+        if (!g) {   // released (many at a scene change): skip the scan when the pool's record says t is not registered in it
+            const PoolRes* r = nullptr;
+            for (auto& x : g_pool_res)
+                if (x->tp.get() == tp) r = x.get();
+            if (r && !r->reg.count(t) && r->version == version_of(tp)) continue;
+        }
+        std::unique_lock<std::shared_mutex> lk(tp->lock);
+        const size_t n = std::min<size_t>(tp->entries.size(), kPoolTextureCount);
+        for (size_t id = 0; id < n; ++id) {
+            Texture* x = tp->entries[id].used ? tp->entries[id].tex.get() : nullptr;
+            if (x && (x == t || (g && x->gpu == g))) pool_note_change(*tp, static_cast<int>(id));
+        }
+    }
+}
+
+void pool_textures_to_prepare(TexturePool* tp, std::vector<Texture*>& out) {
+    if (!tp) return;
+    PoolRes& r = pool_res(tp);
+    r.last_use = current_serial();
+    for (const Ref<Texture>& t : g_layout_moves)        // moved since the last call: the pools they are registered in look at them
+        for (auto& pr : g_pool_res)
+            if (pr->reg.count(t.get())) pr->watch.push_back(t);
+    g_layout_moves.clear();
+    {
+        std::shared_lock<std::shared_mutex> lk(tp->lock);
+        if (r.version != tp->version) {
+            const uint64_t n = tp->version - r.version;
+            const bool partial = r.version != ~0ull && r.version <= tp->version && n <= tp->changes.size() && r.by_id.size() == tp->entries.size();
+            auto set_id = [&](uint32_t id) {
+                const TexturePool::Entry& e = tp->entries[id];
+                Texture* now = e.used ? e.tex.get() : nullptr;
+                Texture*& was = r.by_id[id];
+                if (was == now) return;
+                if (was) {
+                    auto it = r.reg.find(was);
+                    if (it != r.reg.end() && --it->second.second == 0) r.reg.erase(it);
+                }
+                if (now) {
+                    auto& slot = r.reg[now];
+                    if (!slot.second++) slot.first = Ref<Texture>::share(now);
+                    if (partial) r.watch.push_back(slot.first);
+                }
+                was = now;
+            };
+            if (partial) {
+                for (size_t k = tp->changes.size() - n; k < tp->changes.size(); ++k)
+                    if (tp->changes[k] < tp->entries.size()) set_id(tp->changes[k]);
+            } else {
+                r.by_id.assign(tp->entries.size(), nullptr);
+                r.reg.clear();
+                for (uint32_t id = 0; id < tp->entries.size(); ++id) set_id(id);
+                r.all = true;
+            }
+            r.version = tp->version;
+        }
+    }
+    const uint64_t ep = g_tex_scan_epoch.load(std::memory_order_relaxed);
+    if (ep != r.epoch) {
+        r.all = true;
+        r.epoch = ep;
+    }
+    const size_t first = out.size();
+    auto look = [&](Texture* t) {
+        if ((t->destroyed.load(std::memory_order_relaxed) && !t->gpu && !texture_registry_find_alias(t)) || !tex_gpu(t)) return;
+        if (t->cpu_dirty.load(std::memory_order_relaxed) || tex_layout(t) != tex_sampled_layout(t)) out.push_back(t);
+    };
+    if (r.all) {
+        for (auto& [t, e] : r.reg) look(t);
+        r.all = false;
+    } else {
+        for (const Ref<Texture>& t : r.watch) look(t.get());
+    }
+    // not ready now (the replay leaves an attachment of the open pass as it is): looked at again next time
+    r.watch.clear();
+    for (size_t i = first; i < out.size(); ++i) r.watch.push_back(Ref<Texture>::share(out[i]));
+}
+
+bool pool_state_moved(TexturePool* tp, SamplerPool* sp) {
+    if (!g_layout_moves.empty()) return true;
+    PoolRes* r = nullptr;
+    for (auto& x : g_pool_res)
+        if (x->tp.get() == tp) r = x.get();
+    if (tp && (!r || r->all || !r->watch.empty() || r->epoch != g_tex_scan_epoch.load(std::memory_order_relaxed) || r->version != version_of(tp))) return true;
+    for (auto& p : g_pool_pairs) {
+        if (p->tp.get() != tp || p->sp.get() != sp) continue;
+        if (p->cur < 0) return true;
+        const PoolCopy& c = p->copies[static_cast<size_t>(p->cur)];
+        return c.tex_version != version_of(tp) || c.smp_version != version_of(sp) || pending_ready(c, tp);
+    }
+    return true;
+}
+
+void pool_sets_shutdown() {
+    VkDevice d = vkdev();
+    for (auto& p : g_pool_pairs) {
+        if (p->dpool) { vkDestroyDescriptorPool(d, p->dpool, nullptr); vk_gauge_descriptor_pools().sub(1); }
+        g_pool_sets.sub(static_cast<int64_t>(p->copies.size()));
+    }
+    g_pool_pairs.clear();
+    g_pool_res.clear();
+    g_layout_moves.clear();
+    std::lock_guard<std::mutex> lk(g_pool_layout_mu);
+    if (g_pool_layout) vkDestroyDescriptorSetLayout(d, g_pool_layout, nullptr);
+    g_pool_layout = VK_NULL_HANDLE;
+    g_pool_layout_tried = false;
 }
 
 size_t pipeline_count() { return static_cast<size_t>(g_pipeline_count.get()); }
@@ -862,10 +1403,11 @@ void pipeline_shutdown() {
     g_layouts.clear();
     for (auto& [k, l] : g_shared_layouts) {          // the handles in g_layouts were copies of these
         if (l.layout) vkDestroyPipelineLayout(d, l.layout, nullptr);
-        for (VkDescriptorSetLayout s : l.sets)
-            if (s) vkDestroyDescriptorSetLayout(d, s, nullptr);
+        for (int set = 0; set < 4; ++set)            // kPoolSet's is pool_sets_shutdown's
+            if (l.sets[set]) vkDestroyDescriptorSetLayout(d, l.sets[set], nullptr);
     }
     g_shared_layouts.clear();
+    pool_sets_shutdown();
     for (auto& [k, m] : g_modules)
         if (m) vkDestroyShaderModule(d, m, nullptr);
     g_modules.clear();
@@ -887,8 +1429,6 @@ void pipeline_shutdown() {
     g_const_bytes.sub(g_const_bytes.get());
     if (g_driver_const_made) device().destroy_buffer(g_driver_const);
     g_driver_const_made = false;
-    if (g_color_transform_made) device().destroy_buffer(g_color_transform);
-    g_color_transform_made = false;
     if (g_cache) vkDestroyPipelineCache(d, g_cache, nullptr);
     g_cache = VK_NULL_HANDLE;
     g_cache_tried = false;

@@ -223,6 +223,10 @@ TexLayout compute_texture_layout(const TextureBuilderInfo& b) {
             if (s.h <= 5) gy = 1u << s.h;
         } else if (b.has_packaged_layout && b.packaged_layout[0] <= 4) {
             gy = 1u << b.packaged_layout[0];
+        } else if (b.flags & NVN_TEXTURE_FLAGS_VIDEO_DECODE) {
+            // a video surface: 2-GOB blocks, Tegra's decoder layout. Fortune's Weave budgets its movie's RGBA target (flags 0x2) at pitch * rows
+            // and with 16-GOB blocks the target did not fit beside the frame's planes (notes/nxnative-port.md)
+            gy = std::min<uint32_t>(gy, 2);
         }
         ds.gob_blocks_y = gy;
         ds.gob_blocks_z = 1;

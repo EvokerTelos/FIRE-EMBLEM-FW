@@ -1,4 +1,17 @@
-# hook sites of main
-# Render-target memory pool (f_7100646b20: desc {size, flags 0xa1} -> f_7100053b30, kept at renderer+360). Stock size 0x3f000000
-# (1008 MB) is sized for 2560x1440 output from 1280x720; native 3840x2160 with 4096 shadows needs more: 0xbf000000 (3056 MB).
-patch 7100646f88 52a7e009 52b7e009   # mov w9, #0x3f000000 -> #0xbf000000
+# hook sites of main (build DB93B0125F4850601D61C3EDDE012F8EB2ECFE77)
+# frame rate (runtime games/fefw/fefw_play.cpp, [fefw] fps60): the gameplay start's target frame rate store `str w9, [x8, #0x1dc]`
+# into the graphics object (w9 = 30, from `mov w9, #0x1e` at 0x71007bf1ac)
+inline 0x71007bf1c0
+# movies (runtime games/fefw/fefw_movie.cpp, [media] movies = host): the player's setup (0x1906510) picks native images or frames in CPU
+# buffers by the byte at +0x1318 (`ldrb w21` at 0x190654c); the host decoder fills CPU buffers, so the site at the next instruction sets w21 = 1.
+# On that path the player sets its frame count (+0xff8) to 4 only after making the buffers (2 by default, 0x1903ae0): the site before that sets it
+# first (nxnative-penis6 patches.py does both by rewriting the code)
+inline 0x7101906550
+inline 0x7101906634
+# frame update (runtime games/fefw/fefw_game.cpp, play mode): the present wrapper (nvnWindowSetPresentInterval, nvnQueuePresentTexture), once per
+# presented frame on the main thread; it pumps play mode (window events, the gamepad into the npad state)
+entryhook 0x710005d170
+# time step (runtime games/fefw/fefw_play.cpp, [fefw] smooth_step, on with fps120): app::time::Manager's step (0x180eea0) before its clamp
+# (`ldr s0, [x19, #0x168]`): s0 = the measured time since the last frame and s1 = the step the game chose (60 / target unless s0 is over it
+# by 0.1), both in frames of 1/59.94 s; the hook may replace s1
+inline 0x710180ef44

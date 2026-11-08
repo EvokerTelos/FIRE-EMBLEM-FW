@@ -46,4 +46,21 @@ int texture_patch_bc7_matching(const Bc7Match& m, const uint8_t* rgba, std::vect
 // The BC7 blocks of a whole level (layer 0, row-major, 16 bytes each) and its size in texels (multiples of 4). Debug dumps.
 bool texture_read_bc7_level(const void* guest, uint32_t level, std::vector<uint8_t>* blocks, uint32_t* width, uint32_t* height);
 
+// ---- any block-linear texture, known by its storage (e.g. a font's BC4 glyph sheets; the caller encodes the blocks) ----------------------
+// The game loads such a texture from its files unchanged, so the start of its storage is the file's bytes.
+struct TexContentMatch {
+    int nvn_format = 0;                  // NVNformat value (NVN_FORMAT_RGTC1_UNORM = 0x49, ...)
+    uint32_t width = 0, height = 0, layers = 1;
+    const uint8_t* data = nullptr;       // the first `size` bytes of the storage (tiled, as in the file)
+    size_t size = 0;
+};
+// Ids of the live textures of that format and shape whose storage starts with those bytes, leaving out the ids in `skip` (optional).
+// Compares at most `size` bytes per candidate; cheap enough to call every second or so.
+std::vector<uint32_t> texture_find_by_content(const TexContentMatch& m, const std::vector<uint32_t>* skip);
+// Level 0, layer `layer` of the live texture `id`: the storage units (blocks, or texels when uncompressed) of the rectangle (x, y, w, h
+// in texels, multiples of the block size; storage row order), row-major. read: `blocks` receives them. write: puts them there and marks
+// the texture written by the CPU, so it is uploaded again before its next use. False: no such texture or a bad rectangle.
+bool texture_read_blocks(uint32_t id, uint32_t layer, uint32_t x, uint32_t y, uint32_t w, uint32_t h, std::vector<uint8_t>* blocks);
+bool texture_write_blocks(uint32_t id, uint32_t layer, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t* blocks, size_t size);
+
 }  // namespace nxrt::gfx

@@ -23,3 +23,13 @@ else()
     message(STATUS "nxrt: libvpx not found (looked in: ${_nxrt_vpx_roots}): no host video decoders")
     target_compile_definitions(nxrt PRIVATE NXRT_HAVE_LIBVPX=0)
 endif()
+
+# dav1d (BSD-2-Clause, third_party/dav1d) for the Switch 2 movie player's AV1 decoder (src/media/movie_vdec.cpp): built from source, C only.
+option(NXRT_DAV1D "Build dav1d for AV1 movies (src/media/movie_vdec.cpp)" ON)
+if(NXRT_DAV1D)
+    add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../third_party/dav1d" "${CMAKE_BINARY_DIR}/third_party/dav1d")
+    target_link_libraries(nxrt PUBLIC nxrt_dav1d)
+    target_compile_definitions(nxrt PRIVATE NXRT_HAVE_DAV1D=1)
+else()
+    target_compile_definitions(nxrt PRIVATE NXRT_HAVE_DAV1D=0)
+endif()

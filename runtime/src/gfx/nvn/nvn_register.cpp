@@ -18,13 +18,11 @@ void register_all_impls() {
         register_api_cmdbuf();
         register_api_cmd_state();
         register_api_cmd_work();
-        register_api_device_cmds();
-        register_api_dlss();
-        register_api_small();
         register_api_device();
         register_api_memory();
         register_api_texture();
         register_api_program();
+        register_api_dlss();
         // Open the shader cache now, at backend install: its recorded-order preload starts reading on background threads
         // before the game builds its first program.
         be::shader_cache();

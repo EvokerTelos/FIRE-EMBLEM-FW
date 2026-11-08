@@ -10,100 +10,75 @@ function statusChip(s) {
       ? `<span class="chip danger">${icon('circle-alert')}Stopped abnormally, ${esc(code)}</span>`
       : `<span class="chip ok">${icon('circle-check')}Exited, ${esc(code)}</span>`;
   }
-  return `<span class="chip">Ready</span>`;
+  return '<span class="chip">Ready</span>';
 }
 
-function reportHtml(s, game) {
+function reportHtml(s) {
   if (s.state !== 'exited') return '';
-  const files = s.files.filter((f) => s.crashed || f.name === game.log);
+  const files = s.files.filter((f) => s.crashed || f.name === 'fefw.log');
   return `
     <div class="card">
       <h2>${icon(s.crashed ? 'circle-alert' : 'file-text')}${s.crashed ? 'The game did not end cleanly' : 'Last run'}</h2>
       <p class="dim">${esc(s.message)}</p>
       ${files.length ? `<div class="row wrap" style="margin-top: var(--space-4)">${files
-        .map((f) => `<button class="btn" data-open="${esc(f.name)}">${icon('file-text')}${esc(f.name)}${f.fresh && f.name !== game.log ? ' (new)' : ''}</button>`)
+        .map((f) => `<button class="btn" data-open="${esc(f.name)}">${icon('file-text')}${esc(f.name)}${f.fresh && f.name !== 'fefw.log' ? ' (new)' : ''}</button>`)
         .join('')}</div>` : ''}
     </div>`;
 }
 
-// The shader cache while it fills: setup's live progress when it is translating, else what the cache holds.
-export function shaderPct(s) {
-  const live = s.progress.state === 'running' && s.progress.phase === 'translate' && s.progress.total;
-  const done = live ? s.progress.done : s.shaders_done;
-  const total = live ? s.progress.total : s.shaders_total;
-  return total ? Math.min(100, Math.floor((100 * done) / total)) : null;
-}
-
-export function shaderLine(s) {
-  if (s.complete) return 'ready';
-  const pct = shaderPct(s);
-  const running = s.progress.state === 'running';
-  const head = pct === null ? 'Shaders: being prepared' : `Shaders: ${pct}%`;
-  return `${head} (the game can start; missing shaders are made while you play)${running ? '' : '. Set up continues them in the background.'}`;
-}
-
 export async function render(el, ctx) {
-  const game = ctx.game;
   const [cfg, ov] = await Promise.all([api('get_config'), api('get_overview')]);
-  let setup = await api('setup_status');
-  const report = cfg.dump_dir ? await api('validate_dump', { path: cfg.dump_dir }) : null;
+  const setup = ov.repo_ok ? await api('setup_status') : null;
+  const report = cfg.dump_dir && ov.repo_ok ? await api('validate_dump', { path: cfg.dump_dir }) : null;
   const chosen = report && report.chosen;
   let status = await api('game_status');
 
   function draw() {
     const running = status.state === 'running';
     const problems = [];
-    if (!cfg.dump_dir) problems.push('No game files chosen yet.');
+    if (!ov.repo_ok) problems.push('The repository was not found. Set its folder in Settings.');
+    else if (!cfg.dump_dir) problems.push('No game files chosen yet.');
     else if (!chosen) problems.push(`The game files at ${cfg.dump_dir} are not usable: ${report.errors.join(' ')}`);
-    if (!ov.exe_exists) problems.push(`${game.exe} was not found in ${ov.game_dir}. Put the launcher next to ${game.exe}, or set the game folder in Settings.`);
-    if (chosen && ov.exe_exists && !setup.playable) problems.push(setup.progress.state === 'running' ? 'Setup is still building the game (Game files).' : 'Setup is not finished yet: open Game files and press Set up.');
+    else if (!setup.complete) problems.push(setup.progress.state === 'running' ? 'Setup is still running.' : 'Setup is not finished yet: open Setup and press Set up.');
     const ready = problems.length === 0;
+    const left = setup ? setup.steps.filter((x) => x.state !== 'done').map((x) => x.title) : [];
 
     el.innerHTML = `
       <div class="page">
         <div class="hero">
-          <h1>${esc(game.short_title)}</h1>
-          <p class="dim">Native PC port. Your game files stay where they are.</p>
+          <h1>Play</h1>
+          <p class="dim">A native PC build of the game, recompiled on this PC from your own dump.</p>
         </div>
-
         ${problems.map((p) => `<div class="banner danger">${icon('circle-x')}<div>${esc(p)}</div></div>`).join('')}
-        ${problems.length && (!chosen || !setup.playable) ? `<div><button class="btn primary" id="to-setup">${icon(chosen ? 'wrench' : 'folder-open')}${chosen ? 'Set up' : 'Choose game files'}</button></div>` : ''}
+        ${problems.length && ov.repo_ok ? `<div><button class="btn primary" id="to-setup">${icon(chosen ? 'hammer' : 'folder-open')}${chosen ? 'Open Setup' : 'Choose game files'}</button></div>` : ''}
 
         <div class="row wrap">
           <button class="btn primary big" id="play" ${ready && !running ? '' : 'disabled'}>${icon('play')}${running ? 'Running' : 'Play'}</button>
           ${statusChip(status)}
         </div>
-        ${ready && !setup.complete ? `<p class="dim" id="shader-line">${icon('loader-circle', setup.progress.state === 'running' ? 'spin' : '')}${esc(shaderLine(setup))}</p>` : ''}
-
-        ${reportHtml(status, game)}
+        ${reportHtml(status)}
 
         <div class="card">
-          <h2>${icon('hard-drive')}Setup</h2>
+          <h2>${icon('hard-drive')}Install</h2>
           <dl class="kv">
             <dt>Game files</dt>
-            <dd>${chosen ? `${chosen.kind === 'base' ? 'Base game' : 'Update ' + esc(chosen.version)}<div class="path">${esc(chosen.path)}</div>` : '<span class="faint">not set</span>'}</dd>
-            <dt>Shaders</dt>
-            <dd>${setup.complete ? 'ready' : setup.shaders_total || setup.progress.state === 'running' ? esc(shaderLine(setup)) : '<span class="faint">not set up</span>'}</dd>
-            <dt>Game folder</dt>
-            <dd>${ov.exe_exists ? `${esc(game.exe)} found` : `<span class="faint">${esc(game.exe)} missing</span>`}<div class="path">${esc(ov.game_dir)}</div></dd>
+            <dd>${chosen ? `${chosen.kind === 'update' ? 'Update ' + esc(chosen.version) : chosen.kind === 'base' ? 'Base game' : 'Folder'}<div class="path">${esc(chosen.path)}</div>` : '<span class="faint">not set</span>'}</dd>
+            <dt>Setup</dt>
+            <dd>${setup && setup.complete ? 'complete' : `<span class="faint">${left.length ? 'to do: ' + esc(left.join(', ')) : 'not started'}</span>`}</dd>
+            <dt>fefw.exe</dt>
+            <dd>${ov.exe_exists ? 'built' : '<span class="faint">not built yet</span>'}<div class="path">${esc(ov.exe)}</div></dd>
+            <dt>Run folder</dt>
+            <dd><span class="faint">fefw.ini, controls.ini, fefw.log and save/</span><div class="path">${esc(ov.game_dir)}</div></dd>
           </dl>
           <div class="row" style="margin-top: var(--space-4)">
-            <button class="btn" id="open-dir">${icon('folder-open')}Open game folder</button>
-            <button class="btn quiet" id="change">Change game files</button>
+            <button class="btn" id="open-dir" ${ov.repo_ok ? '' : 'disabled'}>${icon('folder-open')}Open run folder</button>
           </div>
         </div>
+        <p class="faint">In the game: F1 opens the runtime's settings overlay. Settings here edit fefw.ini and controls.ini and apply at the next start.</p>
       </div>`;
     refreshIcons();
-
-    el.querySelector('#play')?.addEventListener('click', async () => {
-      try {
-        await api('play');
-      } catch (e) {
-        toast(errText(e), 'error');
-      }
-    });
+    el.querySelector('#play')?.addEventListener('click', () => api('play').catch((e) => toast(errText(e), 'error')));
     el.querySelector('#to-setup')?.addEventListener('click', () => ctx.go('setup'));
-    el.querySelector('#change')?.addEventListener('click', () => ctx.go('setup'));
     el.querySelector('#open-dir')?.addEventListener('click', () => api('open_game_dir').catch((e) => toast(errText(e), 'error')));
     el.querySelectorAll('[data-open]').forEach((b) =>
       b.addEventListener('click', () => api('open_game_file', { name: b.dataset.open }).catch((e) => toast(errText(e), 'error'))),
@@ -112,15 +87,6 @@ export async function render(el, ctx) {
 
   ctx.onStatus((s) => {
     status = s;
-    draw();
-  });
-  // setup keeps translating shaders in the background: redraw when the percentage or the state changes
-  let shown = `${shaderPct(setup)}|${setup.progress.state}`;
-  ctx.onSetup(async (p) => {
-    setup = p.state === 'running' && p.phase !== 'check' ? { ...setup, progress: p } : await api('setup_status');
-    const now = `${shaderPct(setup)}|${setup.progress.state}`;
-    if (now === shown) return;
-    shown = now;
     draw();
   });
   draw();

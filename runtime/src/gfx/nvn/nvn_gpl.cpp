@@ -217,7 +217,7 @@ VkPipeline build_pre(VkShaderModule vs, VkShaderModule gs, const ProgLayout& pl,
     uint32_t n = 0;
     auto add = [&](VkShaderStageFlagBits bit, VkShaderModule m) {
         if (!m) return;
-        st[n] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        st[n] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, ubo_robustness()};
         st[n].stage = bit;
         st[n].module = m;
         st[n].pName = "main";
@@ -249,7 +249,7 @@ VkPipeline build_pre(VkShaderModule vs, VkShaderModule gs, const ProgLayout& pl,
 }
 
 VkPipeline build_fs(VkShaderModule fs, const ProgLayout& pl) {
-    VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, ubo_robustness()};
     st.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     st.module = fs;
     st.pName = "main";

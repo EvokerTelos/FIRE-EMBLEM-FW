@@ -4,11 +4,7 @@ param([switch]$Clean)
 $ErrorActionPreference = 'Stop'
 $root  = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $build = Join-Path $root 'build\release'
-$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-$vsdir = if (Test-Path $vswhere) { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath }
-if (-not $vsdir) { $vsdir = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools' }
-$vcvars = Join-Path $vsdir 'VC\Auxiliary\Build\vcvars64.bat'
-$env:PATH = $env:PATH -replace '"', ''   # a stray quote in PATH breaks vcvars64.bat
+$vcvars = Join-Path (& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) 'VC\Auxiliary\Build\vcvars64.bat'
 foreach ($line in (cmd /c "`"$vcvars`" >nul 2>&1 && set")) {
     $i = $line.IndexOf('=')
     if ($i -gt 0) { Set-Item -Path ("Env:" + $line.Substring(0, $i)) -Value $line.Substring($i + 1) }

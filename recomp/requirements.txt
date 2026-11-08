@@ -5,3 +5,5 @@ unicorn==2.1.4      # reference CPU for the differential and end-to-end oracles
 capstone==5.0.9     # instruction decode for the tier-2 lifter and for corpus shape names
 lz4                 # NSO segment decompression (nxrecomp/nso.py)
 pyelftools          # ELF reading for test programs
+zbic                # ZBIC-compressed NSOs (tools/nso: the console's main of some Switch 2 games); https://github.com/kinnay/zbic, GPLv2
+zstandard           # *.zst archives in the romfs (tools/shaders/ampere/extract_corpus.py)

@@ -38,8 +38,8 @@ option(NXRT_BUILD_GFX "Build the graphics shell (SDL3 + Vulkan + NVN front end, 
 # Game modules (games/<id>/, docs/GAME_BOUNDARY.md): the title-specific code a game exe links. The test executables register one of them, so
 # the tests of the base run against that game's tables (title facts, sites, probes, hooks) as the game exe does.
 option(NXRT_BUILD_GAMES "Build the game modules in games/" ON)
-set(NXRT_GAMES "mpr" CACHE STRING "ids of the game modules to build (games/<id>/), a list")
-set(NXRT_TEST_GAME "mpr" CACHE STRING "id of the game module the test executables register (empty: none)")
+set(NXRT_GAMES "fefw" CACHE STRING "ids of the game modules to build (games/<id>/), a list")
+set(NXRT_TEST_GAME "fefw" CACHE STRING "id of the game module the test executables register (empty: none)")
 if(NOT NXRT_BUILD_GAMES OR NOT NXRT_TEST_GAME IN_LIST NXRT_GAMES)
     set(NXRT_TEST_GAME "")      # the test game must be one of the modules built
 endif()
@@ -64,7 +64,8 @@ if(NXRT_BUILD_TESTS)
     endif()
     add_executable(nxrt_tests ${NXRT_TEST_SOURCES})
     target_include_directories(nxrt_tests PRIVATE tests)
-    target_link_libraries(nxrt_tests PRIVATE nxrt nxrt_gfx)   # core references gfx (switch2.cpp HDR, testtools screenshots)
+    # nxrt calls into the graphics shell (switch2.cpp: HDR metadata, tt_core.cpp: screenshot writes), so the tests link it when it is built
+    target_link_libraries(nxrt_tests PRIVATE nxrt $<TARGET_NAME_IF_EXISTS:nxrt_gfx>)
     target_compile_definitions(nxrt_tests PRIVATE NXRT_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
     # A linker map next to the exe: the crash handler and the watchdog name host code from it. Keep host allocations low
     # (HIGHENTROPYVA:NO) so the guest ranges at 0x71_0000_0000 and up are free; a 64 MiB main stack.

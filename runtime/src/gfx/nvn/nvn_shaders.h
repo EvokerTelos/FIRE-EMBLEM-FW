@@ -12,6 +12,7 @@
 // Everything above "the runtime cache" is plain C++ with no dependency on the rest of the runtime.
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -24,8 +25,6 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-#include "nvn_shader_worker.h"
 
 namespace nxrt::nvn::be {
 
@@ -67,7 +66,10 @@ struct ShaderControl {
     // NVN2 compute only: the slot counts of the program's c[0] resource table (bytes +0xb1 uniform blocks, +0xb2 storage
     // buffers, +0xb3 textures, +0xb6 images). See apply_nvn2_compute_table.
     uint8_t c0_ubos = 0, c0_ssbos = 0, c0_textures = 0, c0_images = 0;
-    uint16_t c0_table_size = 0;   // u16 +0xba: the table's size, header included (the header is 0x10 or 0x80 bytes)
+    // NVN2 compute only: byte +0xa9, the 32-bit words of push constant data between the 0x10-byte header and the table (0 or 28 in
+    // Fortune's Weave), and u16 +0xba, the bytes of header, push data and table together.
+    uint8_t c0_push_words = 0;
+    uint16_t c0_table_size = 0;
 };
 
 ShaderControl read_control(const uint8_t* control);
@@ -110,9 +112,12 @@ enum class NvnSource : uint8_t {
     StorageBuffer,    // the address in c[0] descriptor `c0_offset`: nvnCommandBufferBindStorageBuffer(stage, n)
     UniformAsStorage, // compute: the c[0] descriptor of uniform block n, read through a storage buffer
     SamplerBinding,   // texture whose handle is c[2] byte 0x20 + 8n: nvnCommandBufferBindTexture(stage, n)
-    ImageBinding,     // image whose handle is c[2] byte 0x120 + 8n: nvnCommandBufferBindImage(stage, n) (inferred)
+    ImageBinding,     // image whose handle is c[2] byte 0x120 + 8n: nvnCommandBufferBindImage(stage, n) (inferred); on a texture binding of an
+                      // NVN2 compute shader: that image sampled through its handle (apply_nvn2_compute_table)
     HandleInUniform,  // texture whose handle the game wrote into uniform block `index` (c[bank]), at byte word * 4
-    ColorTransform,   // c[24]: NVN2 fragment output colour transform the driver supplies (nvn2-cbank24-color-transform.patch)
+    PushConstants,    // c[24 + n] (NVN2 graphics): the data of nvnCommandBufferPushGraphicsConstants slot n = `index`
+    TexturePoolArray, // the texture pool as an array indexed by texture id: a handle the translator could not pin to one binding
+    SamplerPoolArray, // the sampler pool as an array indexed by sampler id (handle >> 20)
 };
 
 struct NvnMeaning {
@@ -123,11 +128,11 @@ struct NvnMeaning {
     int sb_slot = -1;    // storage buffers: the translator's slot (order found), from the name "<stage>_s<slot>"
     int c0_offset = -1;  // storage buffers: byte offset of the descriptor in c[0]; -1 = not known (see apply_harness)
     bool default_bank = false;  // texture handle bank given by the translator as "the texture bank" (-1), i.e. c[2]
-    bool from_image = false;    // SamplerBinding read from an image slot (NVN2 compute TEX on an image handle): index is an image binding
 };
 
 struct DescriptorBinding {
     uint32_t set = 0, binding = 0;
+    uint32_t declared_set = 0, declared_binding = 0;   // as translated (results.tsv); pool arrays are moved to kPoolSet (move_pool_arrays)
     DescriptorType type = DescriptorType::UniformBuffer;
     uint32_t count = 1;  // array length; 0 = runtime array
     std::string name;    // OpName, e.g. "fp_c3", "fp_t_tcb_8", "fp_t_cb7_20", "cp_s0", "cp_i_cb2_4A_r32ui"
@@ -193,6 +198,21 @@ bool apply_harness(ShaderReflection& refl, const std::vector<HarnessResource>& r
 // The "resources" text the harness would print for this reflection (after apply_harness); the test compares it.
 std::string describe_like_harness(const ShaderReflection& refl);
 std::string sampler_type_text(const ImageShape& s);  // Ryujinx SamplerType text of an image shape
+
+// ---- texture and sampler pools as descriptor arrays ---------------------------------------------------------------------
+// A handle the translator cannot pin to one constant-buffer word indexes the pools (harness `tex<Type>[c0:1073741824x65536]`, SPIR-V
+// "<stage>_t2d_cb0_40000000" / "_tcube_" / "_s_" in set 2 from binding 640, texture id = handle & 0xfffff, sampler id = handle >> 20, both
+// clamped to the array). The runtime moves these arrays to a set of their own, one per pool pair, shared by every program and kept up to
+// date from the pools' registrations (nvn_pipeline.cpp, pool_set), at fixed bindings by image shape. Other shapes are refused at load.
+constexpr uint32_t kPoolSet = 4;
+constexpr uint32_t kPoolHandleWord = 0x40000000;     // the translator's word for "the pool" (Ryujinx TextureHandleType.Direct marker)
+constexpr uint32_t kPoolTextureCount = 65536, kPoolSamplerCount = 4096;   // the arrays the harness declares (--texture-pool / --sampler-pool)
+enum PoolBinding : uint32_t { kPoolSamplers = 0, kPoolTex2D = 1, kPoolTexCube = 2, kPoolBindingCount = 3 };
+int pool_binding_of(const DescriptorBinding& b);    // its binding in kPoolSet; -1 when the shape has none
+// Moves the pool arrays of a module to kPoolSet: rewrites their DescriptorSet / Binding decorations, found by the translator's numbers
+// (declared_set / declared_binding, so words read again can be moved with a reflection moved before), and the reflection. False with a
+// reason when an array has a shape or length the set does not have.
+bool move_pool_arrays(std::vector<uint32_t>& spirv, ShaderReflection& refl, std::string* error = nullptr);
 
 // ---- Ryujinx's support buffer ---------------------------------------------------------------------------------------
 // Set 0, binding 0 of every stage (std140), declared by every translated shader. Layout copied from Ryujinx
@@ -274,14 +294,7 @@ public:
     // loads <hash>.spv on first use and keeps the ShaderInfo for the life of the process (the pointer stays valid).
     // Null if there is no usable .spv (logged once per hash) or the control section is malformed.
     // Hashing costs a pass over the block: call it when the program is set, not per draw.
-    // On-demand translation (start_translator): a block the cache has no record of goes to the translator and find() returns null with
-    // miss->pending set (and miss->hash); call find() again once translator_state(hash) is no longer Pending. A block the translator
-    // could not translate is then an ordinary miss.
-    struct FindMiss {
-        bool pending = false;
-        std::string hash;
-    };
-    const ShaderInfo* find(const uint8_t* code, const uint8_t* control, FindMiss* miss = nullptr);
+    const ShaderInfo* find(const uint8_t* code, const uint8_t* control);
     // A ShaderInfo that find() already loaded, or null. Never loads: a ShaderInfo needs the code block (its control
     // section and constant data come from it).
     const ShaderInfo* find_by_hash(const std::string& hash);
@@ -292,17 +305,6 @@ public:
     // load_stub. Null if the hash has no usable .spv. Any thread.
     const ShaderInfo* load_stub(const std::string& hash);
     void release_stub_spirv(const ShaderInfo* s);   // frees the words; the caller guarantees nobody is using them (single threaded point)
-    // On-demand translation: a persistent spirv_harness --serve process that writes into this cache. Config [nvn] shader_translator
-    // (default <exe folder>/tools/spirv_harness/spirv_harness.exe; "off" disables), [nvn] shader_corpus (default <cache>/../corpus),
-    // [nvn] shader_translate_jobs. False (logged) when there is no harness: misses then stay misses, as before.
-    bool start_translator();
-    bool translator_on() const { return worker_ && worker_->running(); }
-    uint64_t translator_generation() const { return worker_ ? worker_->generation() : 0; }
-    ShaderTranslatorClient::State translator_state(const std::string& hash) const {
-        return worker_ ? worker_->state(hash) : ShaderTranslatorClient::State::Unknown;
-    }
-    size_t translator_pending() const { return worker_ ? worker_->pending() : 0; }
-    uint64_t translator_done() const { return worker_ ? worker_->done() : 0; }
     size_t loaded() const;   // ShaderInfos built so far
     size_t missing() const;  // hashes asked for that have no usable .spv (or do not reflect)
     bool is_open() const;
@@ -329,6 +331,27 @@ private:
     void flush_order(const std::string& lines);
     std::unique_ptr<Preloaded> take_preloaded(const std::string& hash);
 
+    // The preload pack (<dir>.preload.pack, nvn_shaders.cpp "the preload pack"): the order file's .spv files in one file, zstd-compressed,
+    // written by the runtime after a run's boot preload and read instead of the separate files by the runs after it.
+    struct PackEntry {
+        uint64_t offset;
+        uint32_t csize, usize;
+    };
+    void pack_open();                                                  // open(), lock_ held
+    bool pack_read(const std::string& hash, std::string& out);         // any thread, no lock
+    bool read_spv(const std::string& hash, std::string& out);          // the pack, else <dir>/<hash>.spv
+    void pack_prefetch();                                              // own thread
+    void preload_done();                                               // the last preload worker as it ends
+    void pack_build(size_t missing);                                   // own thread
+    void* pack_file_ = nullptr;                                        // HANDLE of preload.pack; set in open(), then read-only
+    uint64_t pack_data_end_ = 0;
+    std::unordered_map<std::string, PackEntry> pack_;                  // the usable entries; set in open(), then read-only
+    std::atomic<bool> pack_stop_{false};
+    std::thread pack_prefetch_thread_, pack_build_thread_;
+    std::atomic<int> pre_live_{0};                                     // preload workers still running
+    std::atomic<uint64_t> pre_from_pack_{0}, pre_from_files_{0};       // .spv reads served by the pack / by separate files
+    uint64_t pre_start_ms_ = 0;
+
     std::mutex pre_mu_;
     std::condition_variable pre_cv_;                                        // a worker finished a read / an entry was taken / stop
     std::unordered_set<std::string> pre_inflight_;                          // hashes a worker is reading right now (pre_mu_)
@@ -343,9 +366,6 @@ private:
     std::string order_path_;
     std::unordered_set<std::string> order_known_;                           // in the order file (lock_)
     std::string order_pending_;                                             // new lines not yet appended (lock_)
-
-    void add_record(const std::string& hash, const std::string& row);   // a row the translator appended to results.tsv
-    std::unique_ptr<ShaderTranslatorClient> worker_;
 
     mutable std::mutex lock_;
     std::string dir_;

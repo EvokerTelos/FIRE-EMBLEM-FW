@@ -9,6 +9,7 @@
 #     [KIND nso|nx_elf|static_elf] default: guessed from the file's magic
 #     [SHARDS <n>]                 exactly n translation units c_000.cpp ... (default 16)
 #     [JOBS <n>]                   lifter processes (default: all cores)
+#     [JOB_POOL <pool>]            Ninja job pool of the lift step (declared by the caller in the JOB_POOLS global property)
 #     [PATCHES <file>]             instruction patch list
 #     [SITES <file>]               site list: patches, inline callouts, function hooks (nxrecomp/program.py load_sites)
 #     [OUTDIR <dir>])              where the generated sources go (default: <build>/gen/<target>)
@@ -25,6 +26,7 @@
 set(NXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." CACHE PATH "recomp/ folder")
 set(NX_PYTHON "${NXRECOMP_ROOT}/../tools/.venv/Scripts/python.exe" CACHE FILEPATH "Python with the nxrecomp requirements")
 set(NX_OPT "/O1" CACHE STRING "optimisation flag of the lifted code (clang-cl syntax)")
+set(NX_EXTRA_FLAGS "" CACHE STRING "more compile flags of the lifted code, space-separated (a profile-guided build: -fprofile-instr-generate, then -fprofile-instr-use=<file>)")
 option(NX_USE_LAUNCHER "wrap lifted-code compiles in cmake/nx_cc_launcher.py (time-limit fallback to optnone / -O0)" OFF)
 
 file(GLOB NX_LIFTER_SOURCES CONFIGURE_DEPENDS
@@ -32,7 +34,7 @@ file(GLOB NX_LIFTER_SOURCES CONFIGURE_DEPENDS
      "${NXRECOMP_ROOT}/include/nxrecomp/*.h")
 
 function(nxrecomp_add_module target)
-  cmake_parse_arguments(A "" "INPUT;NAME;BASE;INDEX;GAME;KIND;SHARDS;JOBS;OUTDIR;PATCHES;SITES" "" ${ARGN})
+  cmake_parse_arguments(A "" "INPUT;NAME;BASE;INDEX;GAME;KIND;SHARDS;JOBS;JOB_POOL;OUTDIR;PATCHES;SITES" "" ${ARGN})
   if(NOT A_NAME)
     set(A_NAME main)
   endif()
@@ -66,6 +68,10 @@ function(nxrecomp_add_module target)
   if(A_SITES)
     list(APPEND extra --sites ${A_SITES})
   endif()
+  set(pool "")
+  if(A_JOB_POOL)
+    set(pool JOB_POOL ${A_JOB_POOL})
+  endif()
   set(outs "${A_OUTDIR}/funcs.h" "${A_OUTDIR}/module_${A_NAME}.cpp")
   set(shard_srcs "")
   math(EXPR last "${A_SHARDS} - 1")
@@ -88,12 +94,18 @@ function(nxrecomp_add_module target)
     WORKING_DIRECTORY "${NXRECOMP_ROOT}"
     DEPENDS "${A_INPUT}" ${A_SITES} ${NX_LIFTER_SOURCES} ${game_deps}
     COMMENT "nxrecomp: lifting ${A_NAME} (${A_INPUT})"
+    ${pool}
     VERBATIM)
   add_library(${target} STATIC ${shard_srcs} "${A_OUTDIR}/module_${A_NAME}.cpp")
   target_include_directories(${target} PUBLIC "${NXRECOMP_ROOT}/include" "${A_OUTDIR}")
   target_compile_features(${target} PUBLIC cxx_std_20)
   if(MSVC)   # clang-cl
-    target_compile_options(${target} PRIVATE ${NX_OPT} /w /EHs-c- /GR- -fno-strict-aliasing -ffp-contract=off -mcx16)
+    # clang-cl ignores -ffp-contract=off ("unknown argument"; the compiler then contracts): it takes the clang spelling through /clang:.
+    # -fno-math-errno: sqrtf and friends become instructions (the guest's errno is guest memory, the host's is never read). /GS-: no stack
+    # cookie in every lifted function that has a local array.
+    target_compile_options(${target} PRIVATE ${NX_OPT} /w /EHs-c- /GR- /GS- -fno-strict-aliasing /clang:-ffp-contract=off -fno-math-errno -mcx16)
+    separate_arguments(extra_flags NATIVE_COMMAND "${NX_EXTRA_FLAGS}")
+    target_compile_options(${target} PRIVATE ${extra_flags})
   else()
     target_compile_options(${target} PRIVATE -O1 -w -fno-exceptions -fno-rtti -fno-strict-aliasing -ffp-contract=off -mcx16)
   endif()

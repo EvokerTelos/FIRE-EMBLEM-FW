@@ -13,6 +13,27 @@ class XFp:
     def i_fmulx(self, f, i, ops):
         return self.fbin(i, ops, "nx::fpm_mulx(a, b)")
 
+    def sign_op(self, i, ops, neg):
+        """FNEG / FABS change only the sign bit: no rounding, and a NaN is not quietened. The half-precision forms (FEAT_FP16:
+        v.4h, v.8h, h) are written on the integer lanes, because V128 has no half-precision view and the ported scalar path goes
+        through f16_to_f32, which quietens a signalling NaN (debug note 010). Single and double precision keep the ported path."""
+        d, n = self.regop(i, ops[0]), self.regop(i, ops[1])
+        if self.is_vec(i, ops[0]):
+            bits, lanes = self.vinfo(ops[0])
+        else:
+            bits, lanes = (16, 1) if d.kind == "h" else (0, 0)
+        if bits != 16:
+            return self.fun(i, ops, "-a" if neg else "std::fabs(a)")
+        e = "S.u16[k] ^ 0x8000u" if neg else "S.u16[k] & 0x7fffu"
+        return (f"{{ V128 S = c->v[{n.n}]; V128 r = nx::vzero(); for (int k = 0; k < {lanes}; k++) "
+                f"r.u16[k] = uint16_t({e}); c->v[{d.n}] = r; }}")
+
+    def i_fneg(self, f, i, ops):
+        return self.sign_op(i, ops, True)
+
+    def i_fabs(self, f, i, ops):
+        return self.sign_op(i, ops, False)
+
     def i_frecpx(self, f, i, ops):
         d, n = self.regop(i, ops[0]), self.regop(i, ops[1])
         if d.kind not in ("s", "d"):

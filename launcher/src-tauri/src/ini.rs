@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! A careful line editor for the runtime's ini files (the game ini, controls.ini).
+//! A careful line editor for the runtime's ini files (fefw.ini, controls.ini).
 //!
 //! It never rebuilds the file from a parsed model. Lines are kept as they are; `set` changes only the
 //! value text of one `key = value` line (keeping the key spelling, the spacing and any trailing comment)
 //! or inserts a new line. Comments, blank lines, unknown keys and the line-ending style survive.
-//! Section and key names are case-insensitive, as in the runtime (nx/runtime/docs/CONFIG.md).
+//! Section and key names are case-insensitive, as in the runtime (runtime/docs/CONFIG.md).
 
 pub struct Ini {
     lines: Vec<String>,

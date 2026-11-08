@@ -111,14 +111,10 @@ void nvnProgramSetDebugLabel(NVNprogram* program, const char* label) {
 NVNboolean nvnProgramSetShaders(NVNprogram* program, int count, const NVNshaderData* shaders) {
     Program* p = host_of<Program>(program);
     if (!p) return 0;
-    std::lock_guard pending_lk(p->pending_mu);   // the replay thread's program_resolve_pending
     for (int s = 0; s < 6; ++s) {
         p->stage[s] = nullptr;
         p->code_hash[s] = 0;
     }
-    p->pending.clear();
-    p->has_pending.store(false, std::memory_order_release);
-    p->missing_hard = false;
     p->missing[0] = 0;
     ++p->serial;
     p->linked = false;
@@ -130,15 +126,8 @@ NVNboolean nvnProgramSetShaders(NVNprogram* program, int count, const NVNshaderD
     for (int k = 0; k < count; ++k) {
         const uint8_t* code = host_ptr(shaders[k].data);
         const uint8_t* control = static_cast<const uint8_t*>(shaders[k].control);
-        ShaderCache::FindMiss miss;
-        const ShaderInfo* si = (code && control) ? shader_cache().find(code, control, &miss) : nullptr;
-        if (!si && miss.pending) {   // being translated on demand: the program's draws wait for it (program_resolve_pending)
-            p->pending.push_back(Program::PendingBlock{code, control, miss.hash});
-            all_found = false;
-            continue;
-        }
+        const ShaderInfo* si = (code && control) ? shader_cache().find(code, control) : nullptr;
         if (!si) {
-            p->missing_hard = true;
             report_missing(code, control);
             if (code && control) {   // remembered for the trace of the program's binds and dispatches
                 const std::string key = missing_key(code, control);
@@ -153,14 +142,12 @@ NVNboolean nvnProgramSetShaders(NVNprogram* program, int count, const NVNshaderD
         if (stage < 0) {
             if (first_report("stage:" + si->hash))
                 NXLOG_W("nvn", "nvnProgramSetShaders: block %s is a stage the back end does not run; program not linked", si->hash.c_str());
-            p->missing_hard = true;
             all_found = false;
             continue;
         }
         p->stage[stage] = si;
         p->code_hash[stage] = parse_hash(si->hash);
     }
-    p->has_pending.store(!p->pending.empty(), std::memory_order_release);
     p->linked = all_found;
     if (all_found && gpu::active()) gpu::prewarm_program_shaders(p->stage);
     // A block missing from the shader cache leaves the program unlinked (its draws are skipped). The call still reports success: the game treats a
@@ -169,52 +156,6 @@ NVNboolean nvnProgramSetShaders(NVNprogram* program, int count, const NVNshaderD
     static const bool accept_unlinked = config_get_bool("nvn", "accept_unlinked", true);
     return (all_found || (accept_unlinked && addresses_ok)) ? 1 : 0;
 }
-
-}  // namespace
-
-bool be::program_resolve_pending(Program* p) {
-    if (!p || !p->has_pending.load(std::memory_order_acquire)) return false;
-    std::unique_lock lk(p->pending_mu, std::try_to_lock);
-    if (!lk.owns_lock()) return true;   // SetShaders is replacing the program right now
-    using St = ShaderTranslatorClient::State;
-    ShaderCache& cache = shader_cache();
-    std::vector<Program::PendingBlock> keep;
-    bool changed = false;
-    for (Program::PendingBlock& b : p->pending) {
-        if (cache.translator_state(b.hash) == St::Pending) {   // cheap: no pass over the block until the translator answered
-            keep.push_back(std::move(b));
-            continue;
-        }
-        ShaderCache::FindMiss miss;
-        const ShaderInfo* si = cache.find(b.code, b.control, &miss);
-        if (!si) {
-            if (miss.pending) {
-                keep.push_back(std::move(b));
-            } else {
-                p->missing_hard = true;   // the translator could not do it: missing, as without on-demand translation
-                report_missing(b.code, b.control);
-            }
-            continue;
-        }
-        const int stage = nvn_stage_of(si->stage);
-        if (stage < 0) {
-            p->missing_hard = true;
-            continue;
-        }
-        p->stage[stage] = si;
-        p->code_hash[stage] = parse_hash(si->hash);
-        changed = true;
-    }
-    p->pending = std::move(keep);
-    if (changed) ++p->serial;
-    if (!p->pending.empty()) return true;
-    p->has_pending.store(false, std::memory_order_release);
-    p->linked = !p->missing_hard;
-    p->gpl_bound.store(0, std::memory_order_relaxed);   // the next bind queues the new stages' pipeline parts
-    return false;
-}
-
-namespace {
 
 // The Ext entry: NVNshaderData plus one more word (see the header comment).
 struct ShaderDataExt {
@@ -244,25 +185,8 @@ NVNboolean nvnProgramSetSubroutineLinkage(NVNprogram* program, int stage, const 
 
 // Assumed signature (see the header comment). The back end keeps no sample-shading state yet, so this only validates.
 void nvnProgramSetSampleShading(NVNprogram* program, int mode) {
-    // sdk 0x5E5DB0: the mode is a 4-bit field (bits 28..31 of the program word at +0x80). Kept on the program; pipelines do not use it.
-    if (Program* p = host_of<Program>(program)) p->sample_shading = static_cast<uint32_t>(mode) & 0xFu;
-}
-
-// NVN2 only: nvnProgramInitializeFromBuilder(program, builder) (sdk 0x5E6CB0). Initialize + the builder's shaders (count at +0x28, NVNshaderData
-// array at +0x30) + its sample shading (+0x18). The ray-tracing modules and recursion depths in the builder are not used by this back end.
-NVNboolean nvnProgramInitializeFromBuilder(NVNprogram* program, const NVNprogramBuilder* builder) {
-    if (!program || !builder) return 0;
-    const uint8_t* b = reinterpret_cast<const uint8_t*>(builder);
-    int32_t count;
-    uint64_t shaders;
-    uint32_t sample;
-    std::memcpy(&sample, b + 0x18, 4);
-    std::memcpy(&count, b + 0x28, 4);
-    std::memcpy(&shaders, b + 0x30, 8);
-    if (!nvnProgramInitialize(program, nullptr)) return 0;
-    nvnProgramSetSampleShading(program, static_cast<int>(sample));
-    if (count <= 0) return 1;
-    return nvnProgramSetShaders(program, count, reinterpret_cast<const NVNshaderData*>(static_cast<uintptr_t>(shaders)));
+    (void)mode;
+    if (!host_of<Program>(program)) return;
 }
 
 // NVN 55 name the game asks for and never calls (signature assumed): the sub-tile size is not modelled; it reports 0 x 0.
@@ -270,6 +194,53 @@ int nvnProgramGetSubtileSize(const NVNprogram*, int* width, int* height) {
     if (width) *width = 0;
     if (height) *height = 0;
     return 0;
+}
+
+// NVN2's program builder (not in the NVN1 table). nn::gfx 22.2 builds every program with SetDefaults, SetDevice, SetShaders and
+// nvnProgramInitializeFromBuilder, which replaces nvnProgramInitialize + nvnProgramSetShaders and must return 1 (Fortune's Weave main
+// 0x604CB8-0x604D40, a 0x80-byte zeroed builder on the stack). The sdk keeps the shader count and array at +0x28/+0x30
+// (docs/nvn2_abi.md); the other fields are this layout's own. The builder only holds pointers: the array is read at initialise time.
+struct ProgramBuilder {
+    NVNdevice* device;                  // +0x00
+    int32_t sample_shading;             // +0x08
+    int32_t linkage_count;              // +0x0C
+    const void* linkage;                // +0x10
+    uint64_t reserved[2];               // +0x18
+    int32_t shader_count;               // +0x28
+    int32_t pad;
+    const NVNshaderData* shaders;       // +0x30
+};
+static_assert(sizeof(ProgramBuilder) <= 0x40, "within the bytes the game gives the builder");
+
+void nvnProgramBuilderSetDefaults(ProgramBuilder* b) {
+    if (b) std::memset(b, 0, sizeof *b);
+}
+void nvnProgramBuilderSetDevice(ProgramBuilder* b, NVNdevice* device) { if (b) b->device = device; }
+NVNdevice* nvnProgramBuilderGetDevice(const ProgramBuilder* b) { return b ? b->device : nullptr; }
+void nvnProgramBuilderSetShaders(ProgramBuilder* b, int count, const NVNshaderData* shaders) {
+    if (!b) return;
+    b->shader_count = count;
+    b->shaders = shaders;
+}
+const NVNshaderData* nvnProgramBuilderGetShaders(const ProgramBuilder* b) { return b ? b->shaders : nullptr; }
+int nvnProgramBuilderGetShaderCount(const ProgramBuilder* b) { return b ? b->shader_count : 0; }
+void nvnProgramBuilderSetSampleShading(ProgramBuilder* b, int mode) { if (b) b->sample_shading = mode; }
+int nvnProgramBuilderGetSampleShading(const ProgramBuilder* b) { return b ? b->sample_shading : 0; }
+void nvnProgramBuilderSetSubroutineLinkage(ProgramBuilder* b, int count, const void* linkage) {
+    if (!b) return;
+    b->linkage_count = count;
+    b->linkage = linkage;
+}
+const void* nvnProgramBuilderGetSubroutineLinkage(const ProgramBuilder* b) { return b ? b->linkage : nullptr; }
+int nvnProgramBuilderGetSubroutineLinkageCount(const ProgramBuilder* b) { return b ? b->linkage_count : 0; }
+
+NVNboolean nvnProgramInitializeFromBuilder(NVNprogram* program, const ProgramBuilder* b) {
+    if (!program || !b) return 0;
+    if (!nvnProgramInitialize(program, b->device)) return 0;
+    if (b->linkage_count > 0 && first_report("subroutine-linkage"))
+        NXLOG_W("nvn", "nvnProgramInitializeFromBuilder: subroutines are not supported; the linkage is ignored");
+    nvnProgramSetSampleShading(program, b->sample_shading);
+    return nvnProgramSetShaders(program, b->shader_count, b->shaders);
 }
 
 }  // namespace
@@ -283,6 +254,17 @@ void register_api_program() {
     NVN_REG(nvnProgramSetShadersExt);
     NVN_REG(nvnProgramSetSubroutineLinkage);
     NVN_REG(nvnProgramSetSampleShading);
+    NVN2_REG(nvnProgramBuilderSetDefaults);
+    NVN2_REG(nvnProgramBuilderSetDevice);
+    NVN2_REG(nvnProgramBuilderGetDevice);
+    NVN2_REG(nvnProgramBuilderSetShaders);
+    NVN2_REG(nvnProgramBuilderGetShaders);
+    NVN2_REG(nvnProgramBuilderGetShaderCount);
+    NVN2_REG(nvnProgramBuilderSetSampleShading);
+    NVN2_REG(nvnProgramBuilderGetSampleShading);
+    NVN2_REG(nvnProgramBuilderSetSubroutineLinkage);
+    NVN2_REG(nvnProgramBuilderGetSubroutineLinkage);
+    NVN2_REG(nvnProgramBuilderGetSubroutineLinkageCount);
     NVN2_REG(nvnProgramInitializeFromBuilder);
 }
 

@@ -81,12 +81,12 @@ namespace Nx.Shaders.Ampere
         public Operand Label(long target) => new(OperandKind.Label, Offset: target);
 
         /// c[bank][offset] in the 32..59 slot; bit 91 set = bank is a UReg at 32..38 (cx[URn]).
-        public Operand CBuf(int start = 32, bool neg = false, bool abs = false, int cxBit = 91, string? sfx = null)
+        public Operand CBuf(int start = 32, bool neg = false, bool abs = false, int cxBit = 91, string? sfx = null, bool not = false)
         {
             long off = (long)F(start + 6, 16);
             if (cxBit >= 0 && B(cxBit))
-                return new Operand(OperandKind.CBuf, Neg: neg, Abs: abs, Bank: I(start, 6), BankIsUReg: true, Offset: off, Suffixes: Sfx(false, sfx));
-            return new Operand(OperandKind.CBuf, Neg: neg, Abs: abs, Bank: I(start + 22, 5), Offset: off, Suffixes: Sfx(false, sfx));
+                return new Operand(OperandKind.CBuf, Neg: neg, Abs: abs, Not: not, Bank: I(start, 6), BankIsUReg: true, Offset: off, Suffixes: Sfx(false, sfx));
+            return new Operand(OperandKind.CBuf, Neg: neg, Abs: abs, Not: not, Bank: I(start + 22, 5), Offset: off, Suffixes: Sfx(false, sfx));
         }
 
         public Operand Imm32(ImmKind k, int start = 32)
@@ -107,13 +107,17 @@ namespace Nx.Shaders.Ampere
 
         /// abs/neg bit positions: src A 73/72, B slot 62/63, C slot 74/75 (fp16 ops: 83/84). -1 = not used by this op.
         public int AAbs = 73, ANeg = 72, BAbs = 62, BNeg = 63, CAbs = 74, CNeg = 75;
+        /// the negate bits are a bitwise NOT (printed "~"): the carry-in (.X) forms of IADD3, IMAD and LEA [NAK OpIAdd3X/OpIMad .X, oracle]
+        public bool NegIsNot;
         public ImmKind ImmK = ImmKind.Hex;
         public Func<Ctx, int, string?>? Swz; // fp16 swizzle suffix for a source slot (24, 32, 64)
 
         bool Bit(int b) => b >= 0 && B(b);
+        bool Neg(int b) => !NegIsNot && Bit(b);
+        bool Not(int b) => NegIsNot && Bit(b);
 
-        public Operand SrcA() => U ? UR(24, Bit(ANeg), Bit(AAbs)) : R(24, Bit(ANeg), Bit(AAbs), sfx: Swz?.Invoke(this, 24));
-        public Operand SrcRegC() => U ? UR(64, Bit(CNeg), Bit(CAbs)) : R(64, Bit(CNeg), Bit(CAbs), sfx: Swz?.Invoke(this, 64));
+        public Operand SrcA() => U ? UR(24, Neg(ANeg), Bit(AAbs), Not(ANeg)) : R(24, Neg(ANeg), Bit(AAbs), Not(ANeg), sfx: Swz?.Invoke(this, 24));
+        public Operand SrcRegC() => U ? UR(64, Neg(CNeg), Bit(CAbs), Not(CNeg)) : R(64, Neg(CNeg), Bit(CAbs), Not(CNeg), sfx: Swz?.Invoke(this, 64));
         /// destination register at 16 (UR for uniform ops)
         public Operand D() => U ? UR(16) : R(16);
         /// predicate (UP for uniform ops)
@@ -124,10 +128,10 @@ namespace Nx.Shaders.Ampere
         {
             switch (Form)
             {
-                case 1: return U ? UR(32, Bit(BNeg), Bit(BAbs)) : R(32, Bit(BNeg), Bit(BAbs), sfx: Swz?.Invoke(this, 32), slot: Src2Slot);
+                case 1: return U ? UR(32, Neg(BNeg), Bit(BAbs), Not(BNeg)) : R(32, Neg(BNeg), Bit(BAbs), Not(BNeg), sfx: Swz?.Invoke(this, 32), slot: Src2Slot);
                 case 2: case 4: return Imm32(ImmK);
-                case 3: case 5: return CBuf(32, Bit(BNeg), Bit(BAbs), sfx: Swz?.Invoke(this, 32));
-                case 6: case 7: return UR(32, Bit(BNeg), Bit(BAbs), sfx: Swz?.Invoke(this, 32));
+                case 3: case 5: return CBuf(32, Neg(BNeg), Bit(BAbs), sfx: Swz?.Invoke(this, 32), not: Not(BNeg));
+                case 6: case 7: return UR(32, Neg(BNeg), Bit(BAbs), Not(BNeg), sfx: Swz?.Invoke(this, 32));
                 default: Unknown = true; return Text("?form" + Form);
             }
         }
@@ -140,7 +144,7 @@ namespace Nx.Shaders.Ampere
         }
 
         // when the register at 64 is printed second its modifiers are the C ones still, its reuse bit is B's [oracle]
-        Operand SrcRegCAsB() => U ? UR(64, Bit(CNeg), Bit(CAbs)) : R(64, Bit(CNeg), Bit(CAbs), sfx: Swz?.Invoke(this, 64), slot: 1);
+        Operand SrcRegCAsB() => U ? UR(64, Neg(CNeg), Bit(CAbs), Not(CNeg)) : R(64, Neg(CNeg), Bit(CAbs), Not(CNeg), sfx: Swz?.Invoke(this, 64), slot: 1);
 
         /// second source of a two-source ALU op (FMUL/FADD/...): the 32..64 slot for every form.
         public Operand Src2() => SrcBSlot();

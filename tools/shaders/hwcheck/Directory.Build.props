@@ -1,7 +1,0 @@
-<Project>
-  <!-- Build products go to tools/shaders/build (git-ignored), next to spirv_harness.dll. -->
-  <PropertyGroup>
-    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)../build/obj/$(MSBuildProjectName)/</BaseIntermediateOutputPath>
-    <BaseOutputPath>$(MSBuildThisFileDirectory)../build/bin/</BaseOutputPath>
-  </PropertyGroup>
-</Project>

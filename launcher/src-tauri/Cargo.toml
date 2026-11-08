@@ -1,8 +1,9 @@
 [package]
-name = "recomp-launcher"
-version = "0.1.1"
-description = "Launcher for a static recompilation PC port (game-independent: the game manifest game.toml next to it says which)"
+name = "fefw-launcher"
+version = "0.1.3"
+description = "Launcher for the fefw static recompilation: set up from your own dump, build, configure and play"
 edition = "2021"
+authors = ["Goldoire"]
 license = "GPL-3.0-or-later"
 
 [build-dependencies]
@@ -13,7 +14,8 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "1"
+zstd = "0.13"
+sha2 = "0.10"
 
 [profile.release]
 opt-level = "s"

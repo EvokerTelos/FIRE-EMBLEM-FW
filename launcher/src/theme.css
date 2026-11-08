@@ -13,12 +13,12 @@
   color-scheme: dark;
 
   /* surfaces */
-  --color-bg: #12161d;
-  --color-surface: #1a202b;
-  --color-surface-raised: #222a38;
-  --color-surface-sunken: #0f1319;
-  --color-border: #2c3646;
-  --color-border-strong: #3d4a60;
+  --color-bg: #14152a;
+  --color-surface: #1c1d38;
+  --color-surface-raised: #262848;
+  --color-surface-sunken: #0f1020;
+  --color-border: #33355a;
+  --color-border-strong: #474a78;
 
   /* text */
   --color-text: #e6ebf3;
@@ -26,11 +26,11 @@
   --color-text-faint: #6b768a;
 
   /* brand and state */
-  --color-accent: #5ad1a6;
-  --color-accent-strong: #3fb98d;
+  --color-accent: #40ccba;
+  --color-accent-strong: #2fae9e;
   --color-on-accent: #0b1a14;
-  --color-ok: #5ad1a6;
-  --color-warn: #f0b95a;
+  --color-ok: #40ccba;
+  --color-warn: #ecb44e;
   --color-danger: #f0707a;
   --color-focus: #8ab4ff;
 
@@ -38,7 +38,7 @@
   --bg-image: none;
   --bg-size: cover;
   --bg-position: center;
-  --bg-overlay: rgba(18, 22, 29, 0.82);
+  --bg-overlay: rgba(20, 21, 42, 0.82);
 
   /* type */
   --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;

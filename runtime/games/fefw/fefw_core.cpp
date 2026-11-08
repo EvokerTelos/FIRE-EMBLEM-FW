@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Fire Emblem: Fortune's Weave, the core part of the game module (fefw_game.h): the data part plus the title facts.
+// Fire Emblem: Fortune's Weave, the core part of the game module (fefw_game.h): the data part plus the title facts. Needs the runtime
+// library, not the graphics one.
 #include "fefw_game.h"
 
-#include "nxrt/game.h"
 #include "nxrt/services.h"
 
 namespace nxrt::games::fefw {
 
 namespace {
 
-// main.npdm of the v131072 update (SDK 22.2.0); save sizes are placeholders until the boot log shows what the game asks for.
+// main.npdm of update 131072: main thread 1 MiB / priority 44 / core 0, SystemResourceSize 64 MiB (the SDK's VAMM is on), ThreadInfo
+// priorities 28..59 on cores 0..5. Save sizes are placeholders until control.nacp is known (the boot log shows what the game asks for).
 void title_defaults(services::TitleProfile& p) {
     p.program_id = data_info().program_id;
     p.name = data_info().title;
@@ -22,10 +23,14 @@ void title_defaults(services::TitleProfile& p) {
     p.main_thread_stack = 0x100000;
     p.main_thread_priority = 44;
     p.main_thread_core = 0;
-    p.firmware = "22.2.0";
+    // main.npdm says 0x4000000, which turns on the SDK's VAMM: the game then reserves 36 GiB (after a 62 GiB probe that maps all free
+    // memory once) in the alias region, 8 GiB here. 0 makes the SDK take its other, equally supported path: SetMemoryHeapSize(free memory)
+    // + AllocateMemoryBlock (main 0x651EBC), i.e. the runtime's heap section, which NVN pools import from. notes/boot.md, VAMM.
+    p.system_resource_size = 0;
+    p.firmware = "23.0.0";                     // built with SDK 22.2.0; Eden-NS2, which runs the game, reports 23.0.0
     p.user_nickname = "Player";
     p.user_uid_hi = 0x0000000000000001ull;
-    p.user_uid_lo = 0x5745465752656370ull;     // "pceRWFEW"
+    p.user_uid_lo = 0x4645465752636d70ull;     // "FEFWRcmp"
 }
 
 }  // namespace

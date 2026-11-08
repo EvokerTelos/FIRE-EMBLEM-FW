@@ -38,7 +38,7 @@ HANDLE g_slot_mutex = nullptr;
 // The physical cores of processor group 0 inside `proc`, fastest first (a hybrid CPU reports a higher EfficiencyClass for its performance cores), each
 // as the mask of ONE hardware thread of the core (its lowest): a guest thread never shares a core with another guest thread, and never lands on an
 // efficiency core while a performance core is free. Empty when the system call fails.
-std::vector<uint64_t> cores_fastest_first(uint64_t proc) {
+std::vector<uint64_t> cores_fastest_first(uint64_t proc, bool full = false) {
     std::vector<uint64_t> out;
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
@@ -51,11 +51,11 @@ std::vector<uint64_t> cores_fastest_first(uint64_t proc) {
         auto* e = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + off);
         if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount >= 1 && e->Processor.GroupMask[0].Group == 0) {
             const uint64_t m = static_cast<uint64_t>(e->Processor.GroupMask[0].Mask) & proc;
-            if (m) cores.push_back({e->Processor.EfficiencyClass, m & (~m + 1)});
+            if (m) cores.push_back({e->Processor.EfficiencyClass, full ? m : m & (~m + 1)});
         }
         off += e->Size;
     }
-    std::stable_sort(cores.begin(), cores.end(), [](const C& a, const C& b) { return a.eff > b.eff || (a.eff == b.eff && a.first < b.first); });
+    std::stable_sort(cores.begin(), cores.end(), [](const C& a, const C& b) { return a.eff > b.eff || (a.eff == b.eff && (a.first & (~a.first + 1)) < (b.first & (~b.first + 1))); });
     for (const C& c : cores) out.push_back(c.first);
     return out;
 }
@@ -148,7 +148,7 @@ void init_locked() {
     if (g_done) return;
     g_done = true;
     g_info = SchedInfo{};
-    g_info.cores = game::info().platform == game::Platform::Switch2 ? 6 : 3;
+    g_info.cores = app_core_count();            // 3 / 6, or [sched] app_cores
     const int nc = g_info.cores;
     if (!config_get_bool("sched", "console_cores", true)) {
         NXLOG_I("sched", "console core model off ([sched] console_cores = 0)");
@@ -178,6 +178,29 @@ void init_locked() {
         if (!top) {
             const std::vector<uint64_t> cores = cores_fastest_first(usable);
             if (cores.size() >= static_cast<size_t>(nc)) chosen = take_core_slot(cores, static_cast<size_t>(nc), &slot);
+            else if (g_info.soft && cores.size() >= 2 && nc <= static_cast<int>(2 * cores.size())) {
+                // [sched] app_cores above the physical cores: cores 0..P-1 take the first hardware thread of each physical core as before
+                // (core 0 the highest), cores P.. the SMT siblings, starting with the sibling of the last core's processor (core P-1: the
+                // console's system-side core, lightly loaded) and ending with main's (core 0). Ideal processors only: the affinity is the pool.
+                const std::vector<uint64_t> full = cores_fastest_first(usable, true);
+                const int P = static_cast<int>(cores.size());
+                uint64_t firsts = 0;
+                for (uint64_t c : cores) firsts |= c;
+                int k = 0;
+                for (int b = 63; b >= 0 && k < P; b--)
+                    if (firsts >> b & 1) g_info.host_masks[k++] = 1ull << b;
+                for (int i = P; i < nc; i++) {
+                    const uint64_t first = g_info.host_masks[P - 1 - (i - P) % P];
+                    uint64_t sib = first;
+                    for (uint64_t f : full)
+                        if (f & first) { const uint64_t rest = f & ~first; if (rest) sib = rest & (~rest + 1); }
+                    g_info.host_masks[i] = sib;
+                }
+                g_info.active = true;
+                NXLOG_I("sched", "[sched] app_cores = %d on %d physical cores: cores %d..%d have SMT siblings as ideal processors", nc, P, P, nc - 1);
+                log_model();
+                return;
+            }
         }
         if (chosen) {
             int k = 0;
@@ -300,7 +323,7 @@ void sched_apply(KThread& t) {
         t.host_affinity.store(m, std::memory_order_relaxed);
     } else if (si.active) {
         DWORD_PTR m = 0;
-        for (int i = 0; i < 6; i++)                 // a core the model lacks (core 3..5 under a 3-core model) shares a host processor
+        for (int i = 0; i < 16; i++)                // a core the model lacks (core 3..5 under a 3-core model) shares a host processor
             if (t.core_mask >> i & 1) m |= static_cast<DWORD_PTR>(si.host_masks[i % si.cores]);
         if (!m) m = static_cast<DWORD_PTR>(si.host_masks[0]);
         SetThreadAffinityMask(h, m);

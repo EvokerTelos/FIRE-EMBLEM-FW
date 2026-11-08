@@ -22,6 +22,7 @@
 #include "nxrt/kernel.h"
 #include "nxrt/log.h"
 #include "nxrt/module.h"
+#include "kernel_internal.h"
 
 namespace nxrt::kernel {
 namespace {
@@ -64,6 +65,8 @@ void install_spin_hint() {
 }
 
 void install_busy_mutex_hle() {
+    install_thread_diag();   // [kernel] thread_log (off by default); installed here with the other nn::os replacements
+    install_host_placement();   // [sched] render_place / place_log (off by default)
     if (!config_get_bool("sched", "busy_mutex_hle", true)) {
         NXLOG_I("sched", "[sched] busy_mutex_hle = 0: nn::os::LockBusyMutex stays the SDK's spin loop");
         return;

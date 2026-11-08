@@ -1,80 +1,132 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+//! Launcher for the fefw recomp (fefw.exe). It works on a checkout of this repository: it reads the player's own dump, runs the
+//! repository's own lift and build scripts on this PC, writes fefw.ini in a run folder and starts the game. It ships no game files.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod dlss;
 mod dump;
-mod gamebuild;
 mod ini;
-mod manifest;
+mod nup;
 mod play;
-mod rawdump;
 mod settings;
-mod shaders;
+mod setup;
+mod update;
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
-/// The launcher's own options, stored in the user's app config folder.
+/// The launcher's own options, in the user's app config folder.
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
 struct Config {
-    /// Root of the decrypted dump (the folder with base/ and updates/).
+    /// The repository checkout. Empty: found from the launcher's own location.
+    repo_dir: String,
+    /// The dump folder the player picked (exefs/ and romfs/, or base/ and updates/).
     dump_dir: String,
-    /// Folder with the game exe. Empty: the folder the launcher is in.
+    /// Where fefw.ini, controls.ini, the log and the saves live. Empty: <repo>/work/play.
     game_dir: String,
+    /// Build processes. 0: one fewer than the CPU threads.
+    jobs: u32,
     minimize_on_play: bool,
-    /// Raw dump mode: the player's NSP / XCI files. When set, Set up first extracts them into `<game>/dump` (rawdump.rs), which is
-    /// then `dump_dir`. Choosing a dump folder clears it.
-    raw_inputs: Vec<String>,
-    /// prod.keys and optionally title.keys for raw_inputs (paths only; the launcher never reads them).
-    key_files: Vec<String>,
+    /// do not ask GitHub for a newer release when the launcher starts
+    skip_update_check: bool,
 }
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
-    // %APPDATA%\<launcher.identifier>: one settings folder per game, whatever app id the build was given
-    let id = manifest::get()?.launcher.identifier.clone();
-    let dir = app.path().config_dir().map_err(|e| e.to_string())?.join(id);
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
     Ok(dir.join("launcher.json"))
 }
 
 fn load_config(app: &AppHandle) -> Config {
-    config_path(app)
-        .ok()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    config_path(app).ok().and_then(|p| fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
 fn exe_dir() -> PathBuf {
     std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn game_dir_of(cfg: &Config) -> PathBuf {
+/// The release package's tools/ folder, when the launcher runs from the release zip (tools/build/fefw_build.py next to it).
+fn package_tools() -> Option<PathBuf> {
+    let t = exe_dir().join("tools");
+    t.join("build").join("fefw_build.py").is_file().then_some(t)
+}
+
+fn is_repo(dir: &Path) -> bool {
+    dir.join("recomp").join("games").join("fefw").join("config.py").is_file() && dir.join("runtime").join("CMakeLists.txt").is_file()
+}
+
+/// The checkout the launcher runs in: the configured one, else the first parent of the launcher's exe that is one.
+fn repo_of(cfg: &Config) -> Option<PathBuf> {
+    if package_tools().is_some() {
+        // the release package: the install folder plays the checkout's part
+        return Some(if cfg.game_dir.trim().is_empty() { exe_dir() } else { PathBuf::from(cfg.game_dir.trim()) });
+    }
+    if !cfg.repo_dir.trim().is_empty() {
+        let p = PathBuf::from(cfg.repo_dir.trim());
+        return is_repo(&p).then_some(p);
+    }
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors().skip(1).take(8).find(|d| is_repo(d)).map(|d| d.to_path_buf())
+}
+
+fn game_dir_of(cfg: &Config, repo: &Path) -> PathBuf {
     if cfg.game_dir.trim().is_empty() {
-        exe_dir()
+        if package_tools().is_some() {
+            return exe_dir();
+        }
+        repo.join("work").join("play")
     } else {
         PathBuf::from(cfg.game_dir.trim())
     }
 }
 
-#[derive(Serialize)]
-struct Overview {
-    game_dir: String,
-    default_game_dir: String,
-    exe_exists: bool,
+fn need_repo(cfg: &Config) -> Result<PathBuf, String> {
+    repo_of(cfg).ok_or_else(|| "The repository was not found. Build the launcher inside a checkout of this project, or set the repository folder in Settings.".to_string())
 }
 
-/// The game manifest as the pages need it.
-#[tauri::command]
-fn get_game() -> Result<manifest::GameInfo, String> {
-    Ok(manifest::get()?.info())
+/// Setup's paths from the configuration, when the dump is usable.
+fn paths(cfg: &Config) -> Result<setup::Paths, String> {
+    let repo = need_repo(cfg)?;
+    let report = dump::scan(&cfg.dump_dir, &builds_of(&repo));
+    let chosen = report.chosen.ok_or_else(|| {
+        if cfg.dump_dir.trim().is_empty() { "Choose your game files first.".to_string() } else { format!("The game files at {} are not usable: {}", cfg.dump_dir, report.errors.join(" ")) }
+    })?;
+    let game_dir = game_dir_of(cfg, &repo);
+    Ok(setup::Paths { repo, exefs: PathBuf::from(chosen.exefs), romfs: PathBuf::from(chosen.romfs), game_dir, package: package_tools() })
+}
+
+/// The supported builds of main: the package's dump_hashes.json, else the checkout's recomp/games/fefw/config.py.
+fn builds_of(repo: &Path) -> Vec<(String, String)> {
+    if let Some(t) = package_tools() {
+        let v: serde_json::Value = fs::read_to_string(t.join("build").join("dump_hashes.json")).ok().and_then(|x| serde_json::from_str(&x).ok()).unwrap_or_default();
+        if let (Some(id), Some(ver)) = (v["main_build_id"].as_str(), v["version"].as_str()) {
+            return vec![(id.to_uppercase(), ver.to_string())];
+        }
+        return vec![];
+    }
+    dump::supported_builds(repo)
+}
+
+fn jobs_of(cfg: &Config) -> usize {
+    if cfg.jobs > 0 {
+        return cfg.jobs as usize;
+    }
+    std::thread::available_parallelism().map(|n| n.get().saturating_sub(1)).unwrap_or(2).max(1)
+}
+
+#[derive(Serialize)]
+struct Overview {
+    repo_dir: String,
+    repo_ok: bool,
+    game_dir: String,
+    exe: String,
+    exe_exists: bool,
 }
 
 #[tauri::command]
@@ -85,17 +137,24 @@ fn get_config(app: AppHandle) -> Config {
 #[tauri::command]
 fn save_config(app: AppHandle, config: Config) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    fs::write(config_path(&app)?, text).map_err(|e| format!("cannot save launcher settings: {}", e))
+    settings::write_atomic(&config_path(&app)?, &text).map_err(|e| format!("cannot save launcher settings: {e}"))
 }
 
 #[tauri::command]
 fn get_overview(app: AppHandle) -> Overview {
     let cfg = load_config(&app);
-    let dir = game_dir_of(&cfg);
-    Overview {
-        game_dir: dump::fwd(&dir),
-        default_game_dir: dump::fwd(&exe_dir()),
-        exe_exists: manifest::get().map_or(false, |m| dir.join(&m.files.exe).is_file()),
+    match repo_of(&cfg) {
+        Some(repo) => {
+            let exe = if package_tools().is_some() { game_dir_of(&cfg, &repo).join("fefw.exe") } else { setup::exe_path(&repo) };
+            Overview {
+                repo_dir: dump::fwd(&repo),
+                repo_ok: true,
+                game_dir: dump::fwd(&game_dir_of(&cfg, &repo)),
+                exe_exists: exe.is_file(),
+                exe: dump::fwd(&exe),
+            }
+        }
+        None => Overview { repo_dir: cfg.repo_dir.clone(), repo_ok: false, game_dir: String::new(), exe: String::new(), exe_exists: false },
     }
 }
 
@@ -109,224 +168,160 @@ async fn pick_folder(app: AppHandle, title: String, start: Option<String>) -> Op
 }
 
 #[tauri::command]
-fn validate_dump(path: String) -> dump::DumpReport {
-    dump::scan(&path)
+async fn pick_nup(app: AppHandle, start: Option<String>) -> Option<String> {
+    let mut dlg = app.dialog().file().set_title("Choose your .nup package").add_filter("NUP package", &["nup"]);
+    if let Some(s) = start.filter(|s| PathBuf::from(s).is_dir()) {
+        dlg = dlg.set_directory(s);
+    }
+    dlg.blocking_pick_file().and_then(|p| p.into_path().ok()).map(|p| dump::fwd(&p))
 }
 
-/// Validates, stores the dump folder, and points `[fs] romfs` in the game ini at the chosen romfs.
+#[derive(Serialize, Clone)]
+struct NupProgress {
+    done: u64,
+    total: u64,
+    file: String,
+}
+
+/// Unpacks a .nup (https://github.com/a55uka/nup) into `<repo>/game/nup_dump` (base/ and updates/<version>/, the layout of a dump
+/// folder) and returns that folder. Emits "nup-progress". A finished unpack of the same package is reused.
+#[tauri::command]
+async fn import_nup(app: AppHandle, state: State<'_, Arc<setup::Shared>>, path: String) -> Result<String, String> {
+    if state.progress.lock().unwrap().state == "running" {
+        return Err("Setup is running. Pause it first.".into());
+    }
+    let cfg = load_config(&app);
+    let repo = need_repo(&cfg)?;
+    let out = if package_tools().is_some() { game_dir_of(&cfg, &repo).join("nup_dump") } else { repo.join("game").join("nup_dump") };
+    let src = PathBuf::from(path.trim());
+    let emitter = app.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        let mut last = 0u64;
+        nup::extract(
+            &src,
+            &out,
+            &mut |done, total, file| {
+                if total == 0 || done == total || done - last >= total / 100 {
+                    last = done;
+                    let _ = emitter.emit("nup-progress", NupProgress { done, total, file: file.to_string() });
+                }
+            },
+            &|| false,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(dump::fwd(&res))
+}
+
+#[tauri::command]
+fn validate_dump(app: AppHandle, path: String) -> Result<dump::DumpReport, String> {
+    Ok(dump::scan(&path, &builds_of(&need_repo(&load_config(&app))?)))
+}
+
 #[tauri::command]
 fn save_dump(app: AppHandle, path: String) -> Result<dump::DumpReport, String> {
-    let report = dump::scan(&path);
-    let chosen = report.chosen.clone().ok_or_else(|| report.errors.join(" "))?;
-    let m = manifest::get()?;
     let mut cfg = load_config(&app);
+    let report = dump::scan(&path, &builds_of(&need_repo(&cfg)?));
+    if report.chosen.is_none() {
+        return Err(report.errors.join(" "));
+    }
     cfg.dump_dir = report.path.clone();
-    cfg.raw_inputs.clear();
-    cfg.key_files.clear();
-    save_config(app.clone(), cfg.clone())?;
-    settings::apply(
-        &game_dir_of(&cfg),
-        &m.files.ini,
-        &[
-            settings::Edit { file: "game".into(), section: "fs".into(), key: "exefs".into(), value: chosen.exefs },
-            settings::Edit { file: "game".into(), section: "fs".into(), key: "romfs".into(), value: chosen.romfs },
-        ],
-    )?;
+    save_config(app, cfg)?;
     Ok(report)
 }
 
 #[tauri::command]
-async fn pick_files(app: AppHandle, title: String, filter_name: String, extensions: Vec<String>, multiple: bool) -> Vec<String> {
-    let exts: Vec<&str> = extensions.iter().map(|e| e.as_str()).collect();
-    let dlg = app.dialog().file().set_title(title).add_filter(filter_name, &exts);
-    let picked = if multiple { dlg.blocking_pick_files().unwrap_or_default() } else { dlg.blocking_pick_file().into_iter().collect() };
-    picked.into_iter().filter_map(|p| p.into_path().ok()).map(|p| dump::fwd(&p)).collect()
-}
-
-/// Raw dump mode: what the dump files hold, read with the player's keys (nothing is written).
-#[tauri::command]
-async fn check_raw(inputs: Vec<String>, keys: Vec<String>) -> Result<rawdump::Found, String> {
-    let tool = rawdump::find_tool(&exe_dir().join("tools"))?;
-    let title_id = manifest::get()?.game.title_id.clone();
-    tauri::async_runtime::spawn_blocking(move || rawdump::check(&tool, &inputs, &keys, &title_id)).await.map_err(|e| e.to_string())?
-}
-
-/// Raw dump mode: checks and stores the dump files and keys; Set up extracts them into `<game>/dump` and uses that folder.
-#[tauri::command]
-async fn save_raw(app: AppHandle, inputs: Vec<String>, keys: Vec<String>) -> Result<rawdump::Found, String> {
-    let found = check_raw(inputs.clone(), keys.clone()).await?;
-    let mut cfg = load_config(&app);
-    cfg.raw_inputs = inputs;
-    cfg.key_files = keys;
-    cfg.dump_dir = dump::fwd(&game_dir_of(&cfg).join(rawdump::OUT_REL));
-    save_config(app, cfg)?;
-    Ok(found)
-}
-
-#[tauri::command]
 fn read_settings(app: AppHandle) -> Result<settings::SettingsDump, String> {
-    Ok(settings::read(&game_dir_of(&load_config(&app)), &manifest::get()?.files.ini))
+    let cfg = load_config(&app);
+    Ok(settings::read(&game_dir_of(&cfg, &need_repo(&cfg)?)))
 }
 
 #[tauri::command]
 fn write_settings(app: AppHandle, edits: Vec<settings::Edit>) -> Result<(), String> {
-    settings::apply(&game_dir_of(&load_config(&app)), &manifest::get()?.files.ini, &edits)
-}
-
-#[tauri::command]
-fn play(app: AppHandle) -> Result<(), String> {
     let cfg = load_config(&app);
-    if cfg.dump_dir.trim().is_empty() {
-        return Err("Choose your game files first (Setup).".into());
-    }
-    let report = dump::scan(&cfg.dump_dir);
-    let chosen = report.chosen.ok_or_else(|| format!("The game files at {} are not usable: {}", cfg.dump_dir, report.errors.join(" ")))?;
-    let m = manifest::get()?;
-    let dir = game_dir_of(&cfg);
-    if gamebuild::is_package_b(&exe_dir().join("tools")) && !gamebuild::is_built(&dir, &m.files.exe) {
-        return Err("Build the game first (Game files, Set up).".into());
-    }
-    // the shader cache may be incomplete: the runtime translates missing shaders while the game runs
-    settings::ensure_play_paths(&dir, &m.files.ini, &chosen.exefs, &chosen.romfs)?;
-    play::start(&app, &dir, cfg.minimize_on_play)
-}
-
-/// Shader setup: the running job's progress and its cancel flag.
-#[derive(Default)]
-struct SetupState {
-    progress: Mutex<shaders::Progress>,
-    cancel: AtomicBool,
+    settings::apply(&game_dir_of(&cfg, &need_repo(&cfg)?), &edits)
 }
 
 #[derive(Serialize)]
 struct SetupStatus {
-    progress: shaders::Progress,
-    /// setup.json says finished and the cache is there
+    progress: setup::Progress,
+    steps: Vec<setup::StepState>,
     complete: bool,
-    /// an earlier setup started (Set up continues it)
-    started: bool,
-    /// the game exe is built: Play works, the shader cache may still be filling
-    playable: bool,
-    shaders_done: u64,
-    shaders_total: u64,
+    tools: Vec<setup::Tool>,
+    log: Vec<String>,
+    jobs: usize,
+    /// running from the release package (no build tools needed)
+    package: bool,
 }
 
 #[tauri::command]
-fn setup_status(app: AppHandle, state: State<Arc<SetupState>>) -> Result<SetupStatus, String> {
-    let m = manifest::get()?;
-    let dir = game_dir_of(&load_config(&app));
+fn setup_status(app: AppHandle, state: State<Arc<setup::Shared>>) -> SetupStatus {
+    let cfg = load_config(&app);
     let mut progress = state.progress.lock().unwrap().clone();
     if progress.state.is_empty() {
         progress.state = "idle".into();
     }
-    let built = !gamebuild::is_package_b(&exe_dir().join("tools")) || gamebuild::is_built(&dir, &m.files.exe);
-    let started = !shaders::read_marker(&dir).romfs.is_empty() || dir.join("build").join("state.json").is_file();
-    let (shaders_done, shaders_total) = shaders::cache_progress(&dir);
-    Ok(SetupStatus { progress, complete: built && shaders::is_complete(&dir), started, playable: built && dir.join(&m.files.exe).is_file(), shaders_done, shaders_total })
+    let running = (progress.state == "running").then(|| progress.step.clone());
+    let steps = paths(&cfg).map(|p| setup::steps(&p, running.as_deref())).unwrap_or_default();
+    SetupStatus {
+        complete: !steps.is_empty() && steps.iter().all(|s| s.state == "done"),
+        steps,
+        progress,
+        tools: setup::check_tools(package_tools().is_some()),
+        package: package_tools().is_some(),
+        log: state.log.lock().unwrap().iter().cloned().collect(),
+        jobs: jobs_of(&cfg),
+    }
 }
 
-/// First-run setup: (0) in raw dump mode, the NSP / XCI files extracted into `<game>/dump` (rawdump.rs), (a) the game ini paths,
-/// (b) in a model (b) release, the game exe built from the player's dump (gamebuild.rs; ZBIC modules converted to plain NSOs first),
-/// (c) the shader cache in shader_cache/spirv, on a worker thread with "setup-status" events.
 #[tauri::command]
-fn start_setup(app: AppHandle, state: State<Arc<SetupState>>) -> Result<(), String> {
-    let m = manifest::get()?;
+fn start_setup(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> {
     let cfg = load_config(&app);
-    let raw = !cfg.raw_inputs.is_empty();
-    if !raw {
-        dump::scan(&cfg.dump_dir).chosen.ok_or_else(|| "Choose usable game files first.".to_string())?;
-    }
-    let dir = game_dir_of(&cfg);
-    let tools_dir = exe_dir().join("tools");
-    let package_b = gamebuild::is_package_b(&tools_dir);
-    if !package_b && !dir.join(&m.files.exe).is_file() {
-        return Err(format!("{0} was not found in {1}. Put the launcher next to {0} or set the game folder in Settings.", m.files.exe, dump::fwd(&dir)));
-    }
-    let extract_tool = if raw { Some(rawdump::find_tool(&tools_dir)?) } else { rawdump::find_tool(&tools_dir).ok() };
+    let p = paths(&cfg)?;
     {
-        let mut p = state.progress.lock().unwrap();
-        if p.state == "running" {
+        let mut pr = state.progress.lock().unwrap();
+        if pr.state == "running" {
             return Err("Setup is already running.".into());
         }
-        *p = shaders::Progress { state: "running".into(), phase: "check".into(), message: "Checking the setup tools...".into(), ..Default::default() };
+        *pr = setup::Progress { state: "running".into(), step: "python".into(), message: "Starting...".into(), ..Default::default() };
     }
-    let st = state.inner().clone();
-    st.cancel.store(false, Ordering::SeqCst);
-    let jobs = std::thread::available_parallelism().map(|n| n.get().saturating_sub(1)).unwrap_or(2).max(1);
+    let shared = state.inner().clone();
+    shared.cancel.store(false, Ordering::SeqCst);
+    let jobs = jobs_of(&cfg);
     std::thread::spawn(move || {
-        let emit = |p: shaders::Progress| {
-            *st.progress.lock().unwrap() = p.clone();
-            let _ = app.emit("setup-status", p);
+        let a1 = app.clone();
+        let a2 = app.clone();
+        let emit = move |p: setup::Progress| {
+            let _ = a1.emit("setup-status", p);
         };
-        let result = (|| -> Result<bool, String> {
-            if raw {
-                let out = dir.join(rawdump::OUT_REL);
-                if !rawdump::is_extracted(&out, &cfg.raw_inputs) {
-                    let tool = extract_tool.as_deref().ok_or("The dump extractor is missing.")?;
-                    let done = rawdump::extract(tool, &cfg.raw_inputs, &cfg.key_files, &m.game.title_id, &out, &st.cancel, |t| {
-                        let message = match t.phase.as_str() {
-                            "verify" => "Checking your dump files...".to_string(),
-                            "romfs" => "Extracting the game data from your dump...".to_string(),
-                            _ => t.message,
-                        };
-                        emit(shaders::Progress { state: "running".into(), phase: "dump".into(), done: t.done, total: t.total, message })
-                    })?;
-                    if !done {
-                        return Ok(false);
-                    }
-                }
-            }
-            let report = dump::scan(&cfg.dump_dir);
-            let chosen = report.chosen.ok_or_else(|| format!("The game files at {} are not usable: {}", cfg.dump_dir, report.errors.join(" ")))?;
-            settings::ensure_play_paths(&dir, &m.files.ini, &chosen.exefs, &chosen.romfs)?;
-            // the lifter and the shader extractor read plain NSOs; the runtime reads ZBIC itself, so the ini keeps the dump's ExeFS
-            let exefs = rawdump::exefs_for_build(extract_tool.as_deref(), &PathBuf::from(&chosen.exefs), &dir)?;
-            if package_b && !gamebuild::is_built(&dir, &m.files.exe) {
-                let tools = gamebuild::find_tools(&tools_dir, &m.runtime_lib())?;
-                let build_job = gamebuild::Job { game_dir: dir.clone(), exefs: exefs.clone(), jobs: jobs + 1 };
-                let built = gamebuild::run(&build_job, &tools, &st.cancel, |t| {
-                    emit(shaders::Progress { state: "running".into(), phase: t.phase, done: t.done, total: t.total, message: t.message })
-                })?;
-                if !built {
-                    return Ok(false);
-                }
-            }
-            let tools = shaders::find_tools(&tools_dir)?;
-            let job = shaders::Job { game_dir: dir.clone(), romfs: PathBuf::from(&chosen.romfs), main: exefs.join(m.main_file()), jobs: 0, limit: 0 };
-            shaders::run(&job, &tools, &st.cancel, |p| emit(p))
-        })();
-        let end = match result {
-            Ok(true) => shaders::Progress { state: "done".into(), phase: "finish".into(), message: "Setup finished.".into(), ..Default::default() },
-            Ok(false) => shaders::Progress { state: "cancelled".into(), message: "Setup paused. Set up again continues where it stopped.".into(), ..Default::default() },
-            Err(e) => shaders::Progress { state: "error".into(), message: e, ..Default::default() },
+        let emit_log = move |lines: Vec<String>| {
+            let _ = a2.emit("setup-log", lines);
         };
-        emit(end);
+        let end = setup::run(&shared, &p, jobs, &emit, &emit_log);
+        let _ = app.emit("setup-status", end);
     });
     Ok(())
 }
 
 #[tauri::command]
-fn cancel_setup(state: State<Arc<SetupState>>) {
+fn cancel_setup(state: State<Arc<setup::Shared>>) {
     state.cancel.store(true, Ordering::SeqCst);
+    setup::kill_tree(state.pid.load(Ordering::SeqCst));
 }
 
 #[tauri::command]
-fn dlss_status(app: AppHandle) -> dlss::Status {
-    dlss::status(&game_dir_of(&load_config(&app)), &exe_dir().join("tools"))
-}
-
-/// Downloads NVIDIA's nvngx_dlss.dll (see dlss.rs) on a worker thread, with "dlss-progress" events.
-#[tauri::command]
-async fn fetch_dlss(app: AppHandle) -> Result<(), String> {
-    let dir = game_dir_of(&load_config(&app));
-    let tools_dir = exe_dir().join("tools");
-    tauri::async_runtime::spawn_blocking(move || {
-        dlss::fetch(&dir, &tools_dir, |p| {
-            let _ = app.emit("dlss-progress", p);
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())?
+fn play(app: AppHandle, state: State<Arc<setup::Shared>>) -> Result<(), String> {
+    if state.progress.lock().unwrap().state == "running" {
+        return Err("Setup is running. Wait for it or pause it first.".into());
+    }
+    let cfg = load_config(&app);
+    let p = paths(&cfg)?;
+    if !setup::complete(&p) {
+        return Err("Setup is not finished: open Setup and press Set up.".into());
+    }
+    settings::ensure_play_paths(&p.game_dir, &p)?;
+    play::start(&app, &p.exe(), &p.game_dir, cfg.minimize_on_play)
 }
 
 #[tauri::command]
@@ -336,77 +331,153 @@ fn game_status(state: State<play::PlayState>) -> play::Status {
 
 #[tauri::command]
 fn open_game_file(app: AppHandle, name: String) -> Result<(), String> {
-    if !manifest::get()?.report_files().contains(&name) {
+    if !play::REPORT_FILES.contains(&name.as_str()) {
         return Err("That file cannot be opened from here.".into());
     }
-    let path = game_dir_of(&load_config(&app)).join(&name);
+    let cfg = load_config(&app);
+    let path = game_dir_of(&cfg, &need_repo(&cfg)?).join(&name);
     if !path.is_file() {
-        return Err(format!("{} does not exist.", name));
+        return Err(format!("{name} does not exist."));
     }
     play::open_with_shell(&path)
 }
 
 #[tauri::command]
 fn open_game_dir(app: AppHandle) -> Result<(), String> {
-    play::open_with_shell(&game_dir_of(&load_config(&app)))
+    let cfg = load_config(&app);
+    let dir = game_dir_of(&cfg, &need_repo(&cfg)?);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    play::open_with_shell(&dir)
 }
 
-
-/// Test runs only (<ID>_LAUNCHER_EVAL_FILE set, the id of the manifest uppercased): the page writes a result next to the eval file, <file>.out.
 #[tauri::command]
-fn test_report(text: String) -> Result<(), String> {
-    let path = std::env::var(manifest::get()?.eval_env_name()).map_err(|_| "not a test run".to_string())?;
-    std::fs::write(format!("{path}.out"), text).map_err(|e| e.to_string())
+fn open_setup_log(app: AppHandle) -> Result<(), String> {
+    let cfg = load_config(&app);
+    let repo = need_repo(&cfg)?;
+    let log = if package_tools().is_some() { game_dir_of(&cfg, &repo).join("setup.log") } else { repo.join("work").join("setup.log") };
+    if !log.is_file() {
+        return Err("There is no setup log yet.".into());
+    }
+    play::open_with_shell(&log)
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) -> Result<update::Check, String> {
+    // FEFW_LAUNCHER_PRETEND_VERSION: test the update path against the published release from an older-looking launcher
+    let current = std::env::var("FEFW_LAUNCHER_PRETEND_VERSION").ok().filter(|v| update::parse_version(v).is_some()).unwrap_or_else(|| app.package_info().version.to_string());
+    let package = package_tools().is_some();
+    tauri::async_runtime::spawn_blocking(move || update::check(&current, package)).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn update_status(state: State<Arc<update::Shared>>) -> update::Status {
+    let mut s = state.status.lock().unwrap().clone();
+    if s.state.is_empty() {
+        s.state = "idle".into();
+    }
+    s
+}
+
+#[tauri::command]
+fn start_update(
+    app: AppHandle,
+    state: State<Arc<update::Shared>>,
+    setup_state: State<Arc<setup::Shared>>,
+    play_state: State<play::PlayState>,
+    release: update::Release,
+) -> Result<(), String> {
+    if package_tools().is_none() {
+        return Err("Updates are for the release package. In a checkout, use git.".into());
+    }
+    if setup_state.progress.lock().unwrap().state == "running" {
+        return Err("Setup is running. Wait for it or pause it first.".into());
+    }
+    if play_state.0.lock().unwrap().state == "running" {
+        return Err("The game is running. Close it first.".into());
+    }
+    {
+        let mut s = state.status.lock().unwrap();
+        if s.state == "running" {
+            return Err("An update is already running.".into());
+        }
+        *s = update::Status { state: "running".into(), phase: "download".into(), message: "Starting".into(), version: release.version.clone(), ..Default::default() };
+    }
+    let cfg = load_config(&app);
+    let install = exe_dir();
+    let game_dir = repo_of(&cfg).map(|r| game_dir_of(&cfg, &r)).unwrap_or_else(|| install.clone());
+    let shared = state.inner().clone();
+    shared.cancel.store(false, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let a = app.clone();
+        let emit = move |s: update::Status| {
+            let _ = a.emit("update-status", s);
+        };
+        let run = update::Run { shared: &shared, install, game_dir, emit: &emit };
+        let end = match run.run(&release) {
+            Ok(s) => s,
+            Err(e) => update::Status { state: "error".into(), message: e, version: release.version.clone(), ..Default::default() },
+        };
+        *shared.status.lock().unwrap() = end.clone();
+        let _ = app.emit("update-status", end);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_update(state: State<Arc<update::Shared>>) {
+    state.cancel.store(true, Ordering::SeqCst);
+}
+
+/// Starts the (new) launcher from the install folder and closes this one.
+#[tauri::command]
+fn restart_launcher(app: AppHandle) -> Result<(), String> {
+    let exe = exe_dir().join("fefw-launcher.exe");
+    std::process::Command::new(&exe).current_dir(exe_dir()).spawn().map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+    app.exit(0);
+    Ok(())
 }
 
 fn main() {
+    if package_tools().is_some() {
+        update::cleanup(&exe_dir());
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(play::PlayState::default())
-        .manage(Arc::new(SetupState::default()))
-        .setup(|app| {
-            // The window carries the game's launcher title from the manifest (tauri.conf.json has a neutral one).
-            if let (Ok(m), Some(win)) = (manifest::get(), app.get_webview_window("main")) {
-                let _ = win.set_title(&m.launcher.window_title);
+        .manage(Arc::new(setup::Shared::default()))
+        .manage(Arc::new(update::Shared::default()))
+        .on_window_event(|window, event| {
+            // closing the window pauses a running setup rather than leaving its compilers behind
+            if let tauri::WindowEvent::Destroyed = event {
+                let st = window.state::<Arc<setup::Shared>>();
+                st.cancel.store(true, Ordering::SeqCst);
+                setup::kill_tree(st.pid.load(Ordering::SeqCst));
             }
-            // Test runs drive the page without input: <ID>_LAUNCHER_EVAL_FILE=<path>. A JS file written there is run in the page once and
-            // deleted; it reports back through document.title (the window title). WebView2's DevTools port does not open for Tauri apps here.
-            if let Some(path) = manifest::get().ok().and_then(|m| std::env::var(m.eval_env_name()).ok()) {
-                if let Some(win) = app.get_webview_window("main") {
-                    std::thread::spawn(move || loop {
-                        std::thread::sleep(std::time::Duration::from_millis(300));
-                        if let Ok(js) = std::fs::read_to_string(&path) {
-                            let _ = std::fs::remove_file(&path);
-                            let _ = win.eval(&js);
-                        }
-                    });
-                }
-            }
-            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            test_report,
-            get_game,
             get_config,
             save_config,
             get_overview,
             pick_folder,
-            pick_files,
-            check_raw,
-            save_raw,
+            pick_nup,
+            import_nup,
             validate_dump,
             save_dump,
             read_settings,
             write_settings,
-            play,
             setup_status,
             start_setup,
             cancel_setup,
-            dlss_status,
-            fetch_dlss,
+            play,
             game_status,
             open_game_file,
             open_game_dir,
+            open_setup_log,
+            check_update,
+            update_status,
+            start_update,
+            cancel_update,
+            restart_launcher,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the launcher");

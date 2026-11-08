@@ -13,7 +13,6 @@
 //   play_defaults    factory controls.ini text and the bindings added by later revisions (play_types.h)       games/mpr/mpr_defaults.cpp
 //   play             play-mode hooks: aim, camera, lock-on, display, menu pointer, F1 entries (play_game.h)     games/mpr/mpr_play.cpp
 //   prompts          the game's button icon textures (play/prompt_resolve.h, PromptGame)                      games/mpr/mpr_prompts.cpp
-//   poll_sleeps      SleepThread calls inside the game's own polling loops, shortened (PollSleep below)        games/pkp/pkp_core.cpp
 // The registry is header-only, so programs that do not link the runtime library (the launcher) use it too.
 #pragma once
 #include <cstdint>
@@ -26,15 +25,6 @@ namespace play { struct GamePlay; struct GameDefaults; struct PromptGame; }
 }  // namespace nxrt
 
 namespace nxrt::game {
-
-// One nn::os::SleepThread call that sits in a polling loop of the game: the loop re-checks its condition after every sleep, so a shorter
-// sleep only checks more often (a 1 s poll for work that takes milliseconds costs up to a second each time). `ret` is the return address
-// of the call (the instruction after the bl), as an offset in main; `ns` the sleep it gets instead, when that is shorter than the request.
-// The kernel's SleepThread looks the caller up while [sched] poll_sleeps is on (default on).
-struct PollSleep {
-    uint64_t ret = 0;
-    int64_t ns = 0;
-};
 
 // The console the game was built for. Switch 2 games run on the same Horizon model with a few platform facts that differ
 // (system tick 31.25 MHz instead of 19.2 MHz, the NVN2 graphics API).
@@ -51,6 +41,17 @@ struct Info {
     uint64_t main_base = 0x7100000000ull;   // where main is mapped (the lifter's base for it): hook offsets are relative to this
     uint32_t languages = 0;                 // control.nacp SupportedLanguage: bit n = services::Language n (0: American English only)
     Platform platform = Platform::Switch1;  // the console the game targets
+    int nvn_api_minor = 30;                 // Switch 2: the NVN2 driver is part of the game's sdk, version 231.<this> (Pokopia 30, SDK 22.2 40);
+                                            // nvnDeviceGetInteger answers that driver's constants (gfx/nvn/api_device.cpp)
+    bool movie_fail_at_open = false;        // Switch 2 without a host video decoder (core/switch2.cpp): false = nn::movie::Initialize fails and
+                                            // the game leaves its movies out; true = the game's player aborts on that, so opening each movie
+                                            // fails instead and the game moves on as after a skip
+    bool movie_video_decoder = false;       // Switch 2: the game's player takes movie::VideoDecoder from its movie module; the host one decodes
+                                            // AV1 into the player's CPU frames (media/movie_vdec.cpp, [media] movies = host; skip = the above)
+    bool vi_hdr_status_sdr = false;         // Switch 2: nn::vi::QueryDisplayHdrStatus answers an SDR display on the host (core/switch2.cpp)
+    int present_interval_hz = 0;            // the game paces itself by the console's vsync and steps its logic by a fixed amount per frame:
+                                            // the frame limiter holds it to this rate / the NVN window's present interval (60: interval 2 is
+                                            // 30 fps), as the console's display does ([nvn] present_interval_hz, gfx/nvn/nvn_present.cpp). 0 = off
 
     // ---- files and branding ----
     const char* exe_name = "";              // the game exe: "mpr.exe"
@@ -67,11 +68,6 @@ struct Info {
     const play::GameDefaults* play_defaults = nullptr;
     const play::GamePlay* play = nullptr;
     const play::PromptGame* prompts = nullptr;
-    const PollSleep* poll_sleeps = nullptr;
-    uint32_t poll_sleep_count = 0;
-    // Called on the game's thread at every nvnQueuePresentTexture, before the present: a place for per-frame pokes of guest state (the
-    // game's frame-rate target, render scale) for games without play-mode hooks. Null: nothing.
-    void (*on_present)() = nullptr;
 };
 
 // The registered game, or nullptr. One slot per program (the function-local static is shared by every translation unit that inlines it).

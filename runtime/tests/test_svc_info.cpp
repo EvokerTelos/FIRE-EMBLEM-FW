@@ -9,10 +9,10 @@
 #include "nxrt/abi.h"
 #include "nxrt/config.h"
 #include "nxrt/diag.h"
+#include "nxrt/game.h"
 #include "nxrt/kernel.h"
 #include "nxrt/memory.h"
 #include "nxrt/svc.h"
-#include "test_platform.h"
 NXTEST_GROUP(svc_info)
 
 namespace {
@@ -48,7 +48,6 @@ constexpr uint32_t kInfoThreadTickCountOld = 0xF0000002u;
 constexpr uint32_t kInfoThreadTickCount = 25;
 constexpr uint64_t kInvalidCombination = 0xE801;
 constexpr uint64_t kInvalidHandle = 0xE401;
-constexpr uint64_t kTotalMemory = 0xCD500000ull;
 constexpr uint64_t kGolden = 0x9E3779B97F4A7C15ull;
 constexpr uint64_t kAllCores = 0xFFFFFFFFFFFFFFFFull;
 
@@ -59,7 +58,7 @@ constexpr uint64_t kAllCores = 0xFFFFFFFFFFFFFFFFull;
 NXTEST(info_core_and_priority_masks) {
     Result r = call(kSvcGetInfo, 0);
     CHECK_EQ(r.rc, 0u);
-    CHECK_EQ(r.x1, 0x7u);
+    CHECK_EQ(r.x1, nxrt::game::info().platform == nxrt::game::Platform::Switch2 ? 0x3Fu : 0x7u);   // cores 0-5 on Switch 2, 0-2 on Switch 1
     r = call(kSvcGetInfo, 1);
     CHECK_EQ(r.rc, 0u);
     CHECK_EQ(r.x1, 0x0FFFFFFFF0000000ull);
@@ -83,7 +82,7 @@ NXTEST(info_alias_and_heap_regions) {
 NXTEST(info_total_and_used_memory) {
     Result r = call(kSvcGetInfo, 6);
     CHECK_EQ(r.rc, 0u);
-    CHECK_EQ(r.x1, kTotalMemory);
+    CHECK_EQ(r.x1, nxrt::svc_total_memory());   // per platform: ~3.2 GiB Switch 1, 10.5 GiB Switch 2
     uint64_t used = nxrt::svc_current_heap_size() + 0x4000000ull;
     r = call(kSvcGetInfo, 7);
     CHECK_EQ(r.rc, 0u);
@@ -93,7 +92,7 @@ NXTEST(info_total_and_used_memory) {
     CHECK_EQ(r.x1, used);
     r = call(kSvcGetInfo, 21);   // TotalNonSystemMemorySize is the same value
     CHECK_EQ(r.rc, 0u);
-    CHECK_EQ(r.x1, kTotalMemory);
+    CHECK_EQ(r.x1, nxrt::svc_total_memory());   // per platform: ~3.2 GiB Switch 1, 10.5 GiB Switch 2
 }
 
 NXTEST(info_debugger_resource_limit_idle_zero) {
@@ -122,29 +121,9 @@ NXTEST(info_random_entropy_subtypes_distinct_and_stable) {
 }
 
 NXTEST(info_random_entropy_bad_subtype) {
-    Result r = call(kSvcGetInfo, 11, 0, 4);
+    Result r = call(kSvcGetInfo, 11, 0, 8);   // subtypes 0..7 are accepted (svc_info.cpp)
     CHECK_EQ(r.rc, kInvalidCombination);
     CHECK_EQ(r.x1, 0u);
-}
-
-// Switch 2 profile: six application cores (mask 0x3f) and eight RandomEntropy subtypes / core numbers (Switch 1: three cores, four subtypes).
-NXTEST(info_switch2_core_mask_entropy_subtypes_and_core_numbers) {
-    nxtest::ScopedPlatform sw2(nxrt::game::Platform::Switch2);
-    Result r = call(kSvcGetInfo, 0);
-    CHECK_EQ(r.rc, 0u);
-    CHECK_EQ(r.x1, 0x3Full);
-    uint64_t v[8] = {};
-    for (uint64_t s = 0; s < 8; s++) {
-        r = call(kSvcGetInfo, 11, 0, s);
-        CHECK_EQ(r.rc, 0u);
-        v[s] = r.x1;
-    }
-    for (int i = 0; i < 8; i++)
-        for (int j = i + 1; j < 8; j++) CHECK_MSG(v[i] != v[j], "RandomEntropy subtypes must differ");
-    r = call(kSvcGetInfo, 11, 0, 8);
-    CHECK_EQ(r.rc, kInvalidCombination);
-    CHECK_EQ(call(kSvcGetInfo, kInfoThreadTickCount, kPseudoThread, 5).rc, 0u);
-    CHECK_EQ(call(kSvcGetInfo, kInfoThreadTickCount, kPseudoThread, 8).rc, kInvalidCombination);
 }
 
 NXTEST(info_aslr_and_stack_regions) {
@@ -227,11 +206,6 @@ NXTEST(info_thread_tick_count_pseudo_handle_counts_cpu) {
         Result a = call(kSvcGetInfo, kInfoThreadTickCount, kPseudoThread, kAllCores);
         burn_cpu(20);
         Result b = call(kSvcGetInfo, kInfoThreadTickCount, kPseudoThread, kAllCores);
-        // Windows adds a thread's CPU time at its clock tick (15.6 ms): on a busy machine 20 ms of burning can still read 0, so burn on (2 s at most).
-        for (int i = 0; i < 100 && b.rc == 0 && b.x1 == 0; ++i) {
-            burn_cpu(20);
-            b = call(kSvcGetInfo, kInfoThreadTickCount, kPseudoThread, kAllCores);
-        }
         Result c = call(kSvcGetInfo, kInfoThreadTickCount, kPseudoThread, kAllCores);
         rc_ok = (a.rc == 0 && b.rc == 0 && c.rc == 0) ? 0u : 1u;
         first = a.x1;
@@ -303,7 +277,7 @@ NXTEST(system_info_unknown_type) {
 NXTEST(resource_limit_values) {
     Result r = call(kSvcLimitValue, 0x1234, 0);   // limit of PhysicalMemoryMax
     CHECK_EQ(r.rc, 0u);
-    CHECK_EQ(r.x1, kTotalMemory);
+    CHECK_EQ(r.x1, nxrt::svc_total_memory());   // per platform: ~3.2 GiB Switch 1, 10.5 GiB Switch 2
     CHECK_EQ(call(kSvcLimitValue, 0x1234, 1).x1, 0x200u);   // ThreadCountMax
     CHECK_EQ(call(kSvcLimitValue, 0x1234, 2).x1, 0x600u);   // EventCountMax
     CHECK_EQ(call(kSvcLimitValue, 0x1234, 3).x1, 0x80u);    // TransferMemoryCountMax

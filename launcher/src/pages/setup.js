@@ -1,141 +1,136 @@
 import { listen } from '@tauri-apps/api/event';
 import { api, esc, icon, refreshIcons, toast, errText } from '../util.js';
-import { shaderLine } from './play.js';
 
-let GAME = null; // the game manifest (ctx.game), set by render()
+// one listener for the session; the page being shown sets the handler
+let nupHandler = null;
+listen('nup-progress', (ev) => nupHandler && nupHandler(ev.payload));
+const nupPct = (p) => (p && p.total ? Math.min(100, Math.floor((100 * p.done) / p.total)) : 0);
+const nupMsg = (p) => (p && p.total ? `Unpacking the .nup: ${nupPct(p)}%${p.file ? ` (${p.file})` : ''}` : 'Reading the .nup...');
 
-// one listener for the whole session; the page being shown sets the handler
-let dlssHandler = null;
-listen('dlss-progress', (ev) => dlssHandler && dlssHandler(ev.payload));
+const MAX_LOG = 600;
 
 function candidateHtml(c, chosen) {
-  const title = c.kind === 'base' ? 'Base game' : `Update ${esc(c.version)}`;
+  const title = c.kind === 'base' ? 'Base game' : c.kind === 'update' ? `Update ${esc(c.version)}` : 'This folder';
   const used = chosen && chosen.path === c.path;
+  const unneeded = chosen && !used && !c.ok;
+  const chip = used
+    ? `<span class="chip ok">${icon('circle-check')}Will be used</span>`
+    : c.ok ? '<span class="chip">Valid</span>'
+    : unneeded ? '<span class="chip">Not needed</span>'
+    : `<span class="chip danger">${icon('circle-x')}Not usable</span>`;
   return `
     <div class="candidate ${used ? 'chosen' : ''}">
-      <div class="row between">
-        <h3>${title}</h3>
-        ${used ? `<span class="chip ok">${icon('circle-check')}Will be used</span>` : c.ok ? '<span class="chip">Valid, older</span>' : `<span class="chip danger">${icon('circle-x')}Incomplete</span>`}
-      </div>
+      <div class="row between"><h3>${title}</h3>${chip}</div>
       <div class="path">${esc(c.path)}</div>
-      <ul class="checks">
-        ${c.checks.map((k) => `<li class="${k.ok ? 'ok' : 'bad'}">${icon(k.ok ? 'circle-check' : 'circle-x')}${esc(k.label)}</li>`).join('')}
-      </ul>
+      ${unneeded ? '' : `<ul class="checks">${c.checks.map((k) => `<li class="${k.ok ? 'ok' : 'bad'}">${icon(k.ok ? 'circle-check' : 'circle-x')}${esc(k.label)}</li>`).join('')}</ul>`}
     </div>`;
 }
 
-// Raw dump mode: NSP / XCI files plus the player's keys, extracted by Set up into <game folder>/dump.
-function rawHtml(raw) {
-  const list = (items, empty) =>
-    items.length
-      ? `<ul class="checks">${items.map((f, i) => `<li class="ok">${icon('file-text')}${esc(f)} <button class="btn quiet" data-del="${i}">Remove</button></li>`).join('')}</ul>`
-      : `<p class="faint">${empty}</p>`;
-  const keyList = raw.keys.length
-    ? `<ul class="checks">${raw.keys.map((f) => `<li class="ok">${icon('shield-check')}${esc(f)}</li>`).join('')}</ul>`
-    : '<p class="faint">No keys file chosen.</p>';
-  const f = raw.found;
+function toolsHtml(tools) {
+  const missing = tools.filter((t) => !t.ok);
   return `
-    <div class="card" id="raw-card">
-      <h2>${icon('hard-drive')}Or: dump files (NSP / XCI)</h2>
-      <div class="stack">
-        <p class="dim">Pick the game's <code>.nsp</code> or <code>.xci</code> and, if the game needs it, its update <code>.nsp</code>, plus the <code>prod.keys</code> (and <code>title.keys</code>, if you have one) dumped from your own console. Set up decrypts and extracts them into <code>dump/</code> in the game folder (about as much space as the game) and then carries on as with a dump folder. The keys files are only read by the extractor; nothing copies, uploads or logs them.</p>
-        ${list(raw.inputs, 'No dump files chosen.')}
-        <div class="row">
-          <button class="btn" id="raw-add">${icon('folder-open')}Add dump files</button>
-          <button class="btn" id="raw-keys">${icon('shield-check')}Choose keys</button>
-          ${raw.inputs.length || raw.keys.length ? '<button class="btn quiet" id="raw-clear">Clear</button>' : ''}
-        </div>
-        ${keyList}
-        ${raw.error ? `<div class="banner danger">${icon('circle-x')}<div style="white-space: pre-wrap">${esc(raw.error)}</div></div>` : ''}
-        ${f ? `<p class="dim">${icon('circle-check')} Found ${f.dir === 'base' ? 'the base game' : `update ${esc(f.display_version || String(f.version))}`} (program build ${esc(f.build_id.slice(0, 16).toLowerCase())}..., ${f.files} data files, ${(f.bytes / 1e9).toFixed(1)} GB)${f.zbic_modules ? `, ${f.zbic_modules} ZBIC module(s)` : ''}.</p>` : ''}
-        ${f && f.notes.length ? `<ul class="checks">${f.notes.map((n) => `<li>${icon('circle-alert')}${esc(n)}</li>`).join('')}</ul>` : ''}
-        <div class="row">
-          <button class="btn ${raw.saved ? '' : 'primary'}" id="raw-use" ${raw.inputs.length && raw.keys.length && !raw.busy ? '' : 'disabled'}>${icon('circle-check')}${raw.busy ? 'Checking...' : 'Use these dump files'}</button>
-          ${raw.saved ? `<span class="chip ok">${icon('circle-check')}In use</span>` : ''}
-        </div>
+    <div class="card">
+      <h2>${icon('list-checks')}Build tools on this PC</h2>
+      <p class="dim">Setup compiles the game on your PC from your own dump, so it needs a C++ toolchain. ${missing.length ? `${missing.length} missing: install ${missing.length > 1 ? 'them' : 'it'}, then come back.` : 'Everything was found.'}</p>
+      <div class="tools">
+        ${tools.map((t) => `<span class="${t.ok ? 'ok' : 'bad'}">${icon(t.ok ? 'circle-check' : 'circle-x')} ${esc(t.name)}</span><span class="${t.ok ? 'faint' : 'dim'}">${esc(t.ok ? t.found : t.hint)}</span>`).join('')}
       </div>
     </div>`;
 }
 
-function shadersHtml(s, saved) {
+function stepsHtml(s) {
   const p = s.progress;
   const running = p.state === 'running';
   const pct = p.total ? Math.floor((100 * p.done) / p.total) : 0;
-  let body = '';
-  if (running) {
-    body = `<p class="dim">${esc(p.message)}</p>
-      <progress max="100" value="${p.total ? pct : ''}"></progress>
-      <p class="faint">${p.total ? `${pct}%. ` : ''}You can pause and continue later; finished work is kept.</p>
-      ${s.playable ? `<p class="dim">${icon('circle-check')} ${esc(shaderLine(s))}</p>` : ''}`;
-  } else if (p.state === 'error') {
-    body = `<div class="banner danger">${icon('circle-x')}<div style="white-space: pre-wrap">${esc(p.message)}</div></div>`;
-  } else if (s.complete) {
-    body = `<p class="dim">${icon('circle-check')} Done. ${esc(GAME.exe)} is built and the game's shaders are in <code>shader_cache/spirv</code> next to it.</p>`;
-  } else {
-    body = `<p class="dim">${p.state === 'cancelled' ? esc(p.message) : `Checks your game files, builds ${esc(GAME.exe)} from them on this PC (the download contains no game code; the compile takes a while and needs a few GB free while it runs), then translates the game's shaders from your romfs (about 100,000 shaders; needs about 36 GB free while it runs and keeps about 26 GB). You can play as soon as ${esc(GAME.exe)} is built: the shaders keep being translated in the background, and any the game needs first are made while you play. You can pause and continue later.`}</p>`;
-  }
-  const label = s.complete ? 'Set up again' : s.started ? 'Continue setup' : 'Set up';
+  const label = s.complete ? 'Check again' : s.steps.some((x) => x.state === 'done') ? 'Continue setup' : 'Set up';
+  const stepIcon = (x) => (x.state === 'done' ? 'circle-check' : x.state === 'running' ? 'loader-circle' : 'circle');
   return `
-    <div class="card">
-      <h2>${icon('wrench')}Set up</h2>
+    <div class="card" id="steps-card">
+      <h2>${icon('hammer')}Set up</h2>
       <div class="stack">
-        ${body}
+        <ul class="steps">${s.steps.map((x) => `<li class="${x.state}">${icon(stepIcon(x), x.state === 'running' ? 'spin' : '')}${esc(x.title)}</li>`).join('')}</ul>
+        ${running ? `<p class="dim">${esc(p.message)}</p><progress max="100" ${p.total ? `value="${pct}"` : ''}></progress>
+          <p class="faint">${p.total ? `${p.done} of ${p.total}. ` : ''}Pause stops the tools; finished work is kept and Set up continues from there.</p>` : ''}
+        ${p.state === 'error' ? `<div class="banner danger">${icon('circle-x')}<div style="white-space: pre-wrap">${esc(p.message)}</div></div>` : ''}
+        ${p.state === 'cancelled' || p.state === 'done' ? `<p class="dim">${esc(p.message)}</p>` : ''}
+        ${!running && !s.complete && p.state !== 'error' ? `<p class="faint">The first run takes a long time: the recompile of the game code is the biggest step (an hour or more on 8 cores, with ${s.jobs} build processes here) and needs about 30 GB free. Later runs only redo what changed.</p>` : ''}
         <div class="row">
           ${running
             ? `<button class="btn" id="setup-cancel">${icon('circle-x')}Pause</button>`
-            : `<button class="btn ${s.complete ? '' : 'primary'}" id="setup-run" ${saved ? '' : 'disabled'}>${icon('wrench')}${label}</button>`}
-          ${(s.complete && !running) || (s.playable && running) ? `<button class="btn primary" id="to-play">${icon('play')}Go to Play</button>` : ''}
-        </div>
-      </div>
-    </div>`;
-}
-
-function dlssHtml(d, busy, p) {
-  if (!d.available) return '';
-  const pct = p && p.total ? Math.min(100, Math.floor((100 * p.done) / p.total)) : 0;
-  return `
-    <div class="card" id="dlss-card">
-      <h2>${icon('monitor')}NVIDIA DLSS (optional)</h2>
-      <div class="stack">
-        <p class="dim">FSR 3 is included and needs nothing more. DLSS and DLAA need an NVIDIA RTX GPU and one more file, <code>nvngx_dlss.dll</code>, which NVIDIA licenses separately, so it is not in the download. This button gets it from NVIDIA's own DLSS repository on GitHub (version 310.9.16, checked against a fixed hash) and puts it in <code>${esc(d.dir)}</code>. By downloading it you accept the NVIDIA RTX SDKs licence: <code>licenses/LICENSE.NVIDIA-RTX-SDKs.txt</code>, also at github.com/NVIDIA/DLSS.</p>
-        ${busy ? `<p class="dim">${esc(p?.message || 'Starting...')}</p><progress max="100" value="${pct}"></progress>` : ''}
-        <div class="row">
-          ${d.present ? `<span class="chip ok">${icon('circle-check')}nvngx_dlss.dll is installed</span>` : ''}
-          <button class="btn ${d.present ? '' : 'primary'}" id="dlss-get" ${busy ? 'disabled' : ''}>${icon('monitor')}${d.present ? 'Download again' : 'Download DLSS from NVIDIA'}</button>
+            : `<button class="btn ${s.complete ? '' : 'primary'}" id="setup-run">${icon('hammer')}${label}</button>`}
+          ${s.complete && !running ? `<button class="btn primary" id="to-play">${icon('play')}Go to Play</button>` : ''}
+          <button class="btn quiet" id="open-log">${icon('file-text')}Open full log</button>
         </div>
       </div>
     </div>`;
 }
 
 export async function render(el, ctx) {
-  GAME = ctx.game;
-  const cfg = await api('get_config');
+  const [cfg, ov] = await Promise.all([api('get_config'), api('get_overview')]);
   let path = cfg.dump_dir || '';
   let saved = path;
-  let report = path ? await api('validate_dump', { path }) : null;
-  let setup = await api('setup_status');
-  let dlss = await api('dlss_status');
-  let dlssBusy = false;
-  let dlssProgress = null;
-  const raw = { inputs: [...(cfg.raw_inputs || [])], keys: [...(cfg.key_files || [])], found: null, error: '', busy: false, saved: (cfg.raw_inputs || []).length > 0 };
+  let report = null;
+  let status = null;
+  let log = [];
+  let nupBusy = false;
+  let nupProgress = null;
+  const refresh = async () => {
+    report = path && ov.repo_ok ? await api('validate_dump', { path }) : null;
+    status = ov.repo_ok ? await api('setup_status') : null;
+    if (status) log = status.log.slice();
+  };
+  await refresh();
+
+  function drawLog() {
+    const box = el.querySelector('#log');
+    if (!box) return;
+    const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+    box.textContent = log.join('\n');
+    if (atEnd) box.scrollTop = box.scrollHeight;
+  }
+
+  function bindSteps() {
+    el.querySelector('#setup-run')?.addEventListener('click', async () => {
+      try {
+        await api('start_setup');
+        status = await api('setup_status');
+        draw();
+      } catch (e) {
+        toast(errText(e), 'error');
+      }
+    });
+    el.querySelector('#setup-cancel')?.addEventListener('click', () => api('cancel_setup'));
+    el.querySelector('#to-play')?.addEventListener('click', () => ctx.go('play'));
+    el.querySelector('#open-log')?.addEventListener('click', () => api('open_setup_log').catch((e) => toast(errText(e), 'error')));
+  }
 
   function draw() {
     const ok = report && report.chosen;
+    if (!ov.repo_ok) {
+      el.innerHTML = `<div class="page"><div class="hero"><h1>Setup</h1></div>
+        <div class="banner danger">${icon('circle-x')}<div>The repository was not found next to the launcher. Build the launcher inside a checkout of this project (launcher/), or set the repository folder in Settings.</div></div></div>`;
+      refreshIcons();
+      return;
+    }
     el.innerHTML = `
       <div class="page">
         <div class="hero">
-          <h1>${ctx.firstRun ? 'Welcome. Set up your game files.' : 'Game files'}</h1>
-          <p class="dim">${esc(GAME.launcher_name)} does not include the game. You need your own legally dumped copy: a decrypted dump folder, or your NSP / XCI files with your own keys. The launcher only reads them and never writes to them.</p>
+          <h1>${ctx.firstRun ? 'Welcome. Set up from your own dump.' : 'Setup'}</h1>
+          <p class="dim">This project contains no game files and no game code. Point it at your own legally dumped, decrypted copy of the game: setup reads it (it never writes to it), recompiles the game code on this PC and translates the shaders, all on this PC.</p>
         </div>
 
         <div class="card">
-          <h2>${icon('folder-search')}Dump folder</h2>
+          <h2>${icon('folder-search')}Your dump</h2>
           <div class="stack">
             <div class="row">
-              <input type="text" id="path" spellcheck="false" placeholder="C:/path/to/${esc(GAME.short_title)}_dump" value="${esc(path)}" />
-              <button class="btn" id="browse">${icon('folder-open')}Browse</button>
+              <input type="text" id="path" spellcheck="false" placeholder="folder with exefs/ and romfs/" value="${esc(path)}" />
+              <button class="btn" id="browse" ${nupBusy ? 'disabled' : ''}>${icon('folder-open')}Browse</button>
+              <button class="btn" id="browse-nup" ${nupBusy ? 'disabled' : ''}>${icon('file-archive')}.nup</button>
             </div>
-            <p class="faint">Expected layout: <code>base/</code> and <code>updates/&lt;version&gt;/</code>, each with <code>exefs/</code> (${esc(GAME.exefs_files.join(', '))}) and <code>romfs/</code>. The highest valid update is used, otherwise the base game.</p>
+            ${nupBusy ? `<p class="dim" id="nup-msg">${nupMsg(nupProgress)}</p><progress max="100" value="${nupPct(nupProgress)}"></progress>` : ''}
+            <p class="faint">Or pick a <code>.nup</code> package (the NUP format of github.com/a55uka/nup): it is unpacked once into a <code>nup_dump</code> folder and used from there, so it needs the free space of the whole game.</p>
+            <p class="faint">Either the folder holding <code>exefs/</code> and <code>romfs/</code> of the supported update, or a dump root with <code>base/</code> and <code>updates/&lt;version&gt;/</code>. The ExeFS needs main, sdk, subsdk0, subsdk1, subsdk2 and rtld.</p>
+            ${status.package ? '<p class="faint">Everything the setup needs is in this package: nothing else to install.</p>' : ''}
           </div>
         </div>
 
@@ -143,145 +138,91 @@ export async function render(el, ctx) {
         ${report && report.candidates.length ? `<div class="stack">${report.candidates.map((c) => candidateHtml(c, report.chosen)).join('')}</div>` : ''}
 
         <div class="row">
-          <button class="btn ${ok && saved !== path ? 'primary' : ''}" id="use" ${ok && setup.progress.state !== 'running' ? '' : 'disabled'}>${icon('circle-check')}Use these game files</button>
-          ${ctx.firstRun ? '' : '<button class="btn quiet" id="cancel">Back</button>'}
+          <button class="btn ${ok && saved !== path ? 'primary' : ''}" id="use" ${ok && status.progress.state !== 'running' ? '' : 'disabled'}>${icon('circle-check')}Use these game files</button>
         </div>
 
-        ${rawHtml(raw)}
+        ${status.package ? "" : toolsHtml(status.tools)}
+        ${ok && saved === path ? stepsHtml(status) : ''}
 
-        ${shadersHtml(setup, raw.saved || (ok && saved === path && !(cfg.raw_inputs || []).length))}
-
-        ${dlssHtml(dlss, dlssBusy, dlssProgress)}
+        <div class="card">
+          <h2>${icon('terminal')}Log</h2>
+          <div class="logbox" id="log"></div>
+        </div>
       </div>`;
     refreshIcons();
-
+    drawLog();
     const input = el.querySelector('#path');
     const check = async () => {
       path = input.value.trim();
-      report = path ? await api('validate_dump', { path }) : null;
+      report = path ? await api('validate_dump', { path }).catch((e) => ({ errors: [errText(e)], candidates: [], chosen: null })) : null;
       draw();
     };
     input.addEventListener('change', check);
     input.addEventListener('keydown', (e) => e.key === 'Enter' && check());
     el.querySelector('#browse').addEventListener('click', async () => {
-      const picked = await api('pick_folder', { title: `Choose your decrypted ${GAME.short_title} dump folder`, start: input.value || null });
+      const picked = await api('pick_folder', { title: 'Choose your decrypted dump folder', start: input.value || null });
       if (picked) {
         input.value = picked;
         check();
       }
     });
+    el.querySelector('#browse-nup').addEventListener('click', async () => {
+      const picked = await api('pick_nup', { start: null });
+      if (!picked) return;
+      nupBusy = true;
+      nupProgress = null;
+      draw();
+      try {
+        path = await api('import_nup', { path: picked });
+        report = await api('validate_dump', { path });
+      } catch (e) {
+        toast(errText(e), 'error');
+      }
+      nupBusy = false;
+      draw();
+    });
     el.querySelector('#use').addEventListener('click', async () => {
       try {
         await api('save_dump', { path });
         saved = path;
-        cfg.raw_inputs = [];
-        cfg.key_files = [];
-        raw.saved = false;
+        status = await api('setup_status');
         toast('Game files saved. Next: Set up.', 'ok');
         draw();
       } catch (e) {
         toast(errText(e), 'error');
       }
     });
-    const rawChanged = () => {
-      raw.saved = false;
-      raw.found = null;
-      raw.error = '';
-      draw();
-    };
-    el.querySelector('#raw-add').addEventListener('click', async () => {
-      const files = await api('pick_files', { title: 'Choose your dump files (base game and update)', filterName: 'Switch dumps', extensions: ['nsp', 'xci', 'nsz', 'xcz'], multiple: true });
-      for (const f of files) if (!raw.inputs.includes(f)) raw.inputs.push(f);
-      if (files.length) rawChanged();
-    });
-    el.querySelector('#raw-keys').addEventListener('click', async () => {
-      const files = await api('pick_files', { title: 'Choose prod.keys (and title.keys, if you have one)', filterName: 'Keys', extensions: ['keys', 'txt'], multiple: true });
-      if (files.length) {
-        // prod.keys first: the extractor reads them in order
-        raw.keys = files.sort((a, b) => Number(/title\.keys$/i.test(a)) - Number(/title\.keys$/i.test(b)));
-        rawChanged();
-      }
-    });
-    el.querySelector('#raw-clear')?.addEventListener('click', () => {
-      raw.inputs = [];
-      raw.keys = [];
-      rawChanged();
-    });
-    el.querySelectorAll('[data-del]').forEach((b) =>
-      b.addEventListener('click', () => {
-        raw.inputs.splice(Number(b.dataset.del), 1);
-        rawChanged();
-      }),
-    );
-    el.querySelector('#raw-use').addEventListener('click', async () => {
-      raw.busy = true;
-      raw.error = '';
-      draw();
-      try {
-        raw.found = await api('save_raw', { inputs: raw.inputs, keys: raw.keys });
-        raw.saved = true;
-        cfg.raw_inputs = [...raw.inputs];
-        cfg.key_files = [...raw.keys];
-        toast('Dump files saved. Next: Set up.', 'ok');
-      } catch (e) {
-        raw.error = errText(e);
-      }
-      raw.busy = false;
-      draw();
-    });
-    el.querySelector('#cancel')?.addEventListener('click', () => ctx.go('play'));
-    el.querySelector('#to-play')?.addEventListener('click', () => ctx.go('play'));
-    el.querySelector('#setup-run')?.addEventListener('click', async () => {
-      try {
-        await api('start_setup');
-        setup = await api('setup_status');
-        draw();
-      } catch (e) {
-        toast(errText(e), 'error');
-      }
-    });
-    el.querySelector('#setup-cancel')?.addEventListener('click', () => api('cancel_setup'));
-    el.querySelector('#dlss-get')?.addEventListener('click', async () => {
-      dlssBusy = true;
-      dlssProgress = null;
-      draw();
-      try {
-        await api('fetch_dlss');
-        toast('nvngx_dlss.dll downloaded and verified. Restart the game to use DLSS.', 'ok');
-      } catch (e) {
-        toast(errText(e), 'error');
-      }
-      dlssBusy = false;
-      dlss = await api('dlss_status');
-      draw();
-    });
+    bindSteps();
   }
 
-  dlssHandler = (p) => {
-    dlssProgress = p;
-    const card = el.querySelector('#dlss-card');
-    if (card && dlssBusy) {
-      card.outerHTML = dlssHtml(dlss, true, p);
-      refreshIcons();
+  nupHandler = (p) => {
+    nupProgress = p;
+    const msg = el.querySelector('#nup-msg');
+    if (msg) {
+      msg.textContent = nupMsg(p);
+      const bar = msg.nextElementSibling;
+      if (bar) bar.value = nupPct(p);
     }
   };
-
+  ctx.onLog((lines) => {
+    log.push(...lines);
+    if (log.length > MAX_LOG) log = log.slice(log.length - MAX_LOG);
+    drawLog();
+  });
   ctx.onSetup(async (p) => {
-    const was = setup.progress.state;
-    // a new phase (the game build finished, shaders started): fetch the whole status, Play may have become possible
-    setup = p.state === 'running' && p.phase === setup.progress.phase ? { ...setup, progress: p } : await api('setup_status');
-    // progress ticks only touch the setup card's text, so the path field keeps its focus
-    if (was === 'running' && p.state === 'running' && el.querySelector('progress')) {
-      const card = el.querySelector('#setup-cancel')?.closest('.card');
-      if (card) {
-        card.outerHTML = shadersHtml(setup, true);
-        refreshIcons();
-        el.querySelector('#setup-cancel')?.addEventListener('click', () => api('cancel_setup'));
-        el.querySelector('#to-play')?.addEventListener('click', () => ctx.go('play'));
-        return;
-      }
+    if (p.state === 'running' && status && status.progress.state === 'running' && status.progress.step === p.step) {
+      status = { ...status, progress: p };
+    } else {
+      status = await api('setup_status');
     }
-    draw();
+    const card = el.querySelector('#steps-card');
+    if (card) {
+      card.outerHTML = stepsHtml(status);
+      refreshIcons();
+      bindSteps();
+    } else {
+      draw();
+    }
   });
   draw();
 }

@@ -4,7 +4,12 @@
 // Ryujinx for the result codes (module 128: result = module | description << 9), not read from the service.
 #include <filesystem>
 #include <windows.h>
+#include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include "nxrt/config.h"
 #include "nxrt/kernel.h"
@@ -349,6 +354,140 @@ NXTEST(am_error_and_shop_applets_close) {
     CHECK_EQ(shop.call(30).result, 0x2C80u);
 }
 
+namespace {
+// A new storage holding `bytes`, as a raw handle for PushInData's move (a Session would close it after the move).
+uint32_t make_storage(nxsvc::Session& creator, const std::vector<uint8_t>& bytes) {
+    // ponytail: leaked on purpose, the push moves the handle away
+    auto* st = new nxsvc::Session(creator.sub(creator.call(10, nxsvc::Args().i64(static_cast<int64_t>(bytes.size())))));
+    nxsvc::Session acc = st->sub(st->call(0));
+    acc.call(10, nxsvc::Args().i64(0).buf_a(bytes.data(), bytes.size()));
+    return st->handle();
+}
+}  // namespace
+
+// The 0x530-byte keyboard config of library version 0x140010 (Pokopia's name entry) keeps use_utf8 at 0x3AA, not at the 0x3BD of the
+// older layout: the answer must come back as UTF-8, or the game reads "Josh" as "J" (fork issue #6).
+NXTEST(am_swkbd_packed_config_utf8) {
+    nxsvc::Env env;
+    config_set("applet", "swkbd_text", "Josh");
+    nxsvc::Session proxy = open_proxy();
+    REQUIRE(proxy.valid());
+    nxsvc::Session creator = proxy.sub(proxy.call(11));
+    REQUIRE(creator.valid());
+    nxsvc::Session kb = creator.sub(creator.call(0, nxsvc::Args().u32(0x11).u32(0)));
+    REQUIRE(kb.valid());
+    std::vector<uint8_t> common(0x20, 0), cfg(0x530, 0);
+    const uint32_t version = 0x140010, max_len = 12;
+    std::memcpy(common.data() + 8, &version, 4);
+    std::memcpy(cfg.data() + 0x3AC, &max_len, 4);
+    cfg[0x3AA] = 1;                                   // use_utf8
+    CHECK_EQ(kb.call(100, nxsvc::Args().hmove(make_storage(creator, common))).result, 0u);
+    CHECK_EQ(kb.call(100, nxsvc::Args().hmove(make_storage(creator, cfg))).result, 0u);
+    CHECK_EQ(kb.call(10).result, 0u);
+    nxsvc::Reply out = kb.call(101);
+    REQUIRE(out.ok());
+    nxsvc::Session os = kb.sub(out);
+    nxsvc::Session acc = os.sub(os.call(0));
+    uint8_t buf[12] = {0xEE};
+    CHECK_EQ(acc.call(11, nxsvc::Args().i64(0).buf_b(buf, sizeof buf)).result, 0u);
+    const uint8_t want[12] = {0, 0, 0, 0, 'J', 'o', 's', 'h', 0, 0, 0, 0};   // SwkbdResult Ok, then UTF-8 with its NUL
+    CHECK(std::memcmp(buf, want, sizeof want) == 0);
+    clear_config();
+}
+
+// With use_text_check on (0x48D of the 0x530 config), the text goes to the game's check first, in the config's encoding: UTF-8 "Josh"
+// with its byte size (NUL included). Before this, UTF-16 here made the game read "J" and refuse the name (fork issue #6).
+NXTEST(am_swkbd_text_check_utf8) {
+    nxsvc::Env env;
+    config_set("applet", "swkbd_text", "Josh");
+    nxsvc::Session proxy = open_proxy();
+    REQUIRE(proxy.valid());
+    nxsvc::Session creator = proxy.sub(proxy.call(11));
+    REQUIRE(creator.valid());
+    nxsvc::Session kb = creator.sub(creator.call(0, nxsvc::Args().u32(0x11).u32(0)));
+    REQUIRE(kb.valid());
+    std::vector<uint8_t> common(0x20, 0), cfg(0x530, 0);
+    const uint32_t version = 0x140010, max_len = 12;
+    std::memcpy(common.data() + 8, &version, 4);
+    std::memcpy(cfg.data() + 0x3AC, &max_len, 4);
+    cfg[0x3AA] = 1;                                   // use_utf8
+    cfg[0x48D] = 1;                                   // use_text_check
+    CHECK_EQ(kb.call(100, nxsvc::Args().hmove(make_storage(creator, common))).result, 0u);
+    CHECK_EQ(kb.call(100, nxsvc::Args().hmove(make_storage(creator, cfg))).result, 0u);
+    CHECK_EQ(kb.call(10).result, 0u);
+    {
+        nxsvc::Reply check = kb.call(104);           // PopInteractiveOutData: the text check request
+        REQUIRE(check.ok());
+        nxsvc::Session cs = kb.sub(check);
+        nxsvc::Session acc = cs.sub(cs.call(0));
+        uint8_t buf[16] = {0xEE};
+        CHECK_EQ(acc.call(11, nxsvc::Args().i64(0).buf_b(buf, sizeof buf)).result, 0u);
+        const uint8_t want[16] = {5, 0, 0, 0, 0, 0, 0, 0, 'J', 'o', 's', 'h', 0, 0, 0, 0};   // u64 size 5, then UTF-8 with its NUL
+        CHECK(std::memcmp(buf, want, sizeof want) == 0);
+    }
+    std::vector<uint8_t> verdict(0x7D8, 0);           // SwkbdTextCheck: Success
+    CHECK_EQ(kb.call(103, nxsvc::Args().hmove(make_storage(creator, verdict))).result, 0u);
+    nxsvc::Reply out = kb.call(101);
+    REQUIRE(out.ok());
+    nxsvc::Session os = kb.sub(out);
+    nxsvc::Session acc = os.sub(os.call(0));
+    uint8_t buf[12] = {0xEE};
+    CHECK_EQ(acc.call(11, nxsvc::Args().i64(0).buf_b(buf, sizeof buf)).result, 0u);
+    const uint8_t want[12] = {0, 0, 0, 0, 'J', 'o', 's', 'h', 0, 0, 0, 0};   // SwkbdResult Ok, then UTF-8
+    CHECK(std::memcmp(buf, want, sizeof want) == 0);
+    clear_config();
+}
+
+// The on-screen keyboard's handoff (swkbd_prompt.cpp): ask() waits on its own thread, pending() shows the open question to the keyboard,
+// answer() with that id returns the text; a stale id changes nothing; a cancel returns false and leaves the text alone.
+NXTEST(swkbdui_ask_answer) {
+    namespace sk = services::swkbdui;
+    CHECK(sk::pending(nullptr) == 0);
+    auto wait_open = [] {
+        uint64_t id = 0;
+        for (int i = 0; i < 5000 && !(id = sk::pending(nullptr)); ++i) Sleep(1);
+        return id;
+    };
+    sk::Request req;
+    req.header = "Your name?";
+    req.initial = "Jo";
+    req.max_len = 10;
+    std::string got;
+    std::atomic<bool> done{false};
+    bool ok = false;
+    std::thread t([&] { ok = sk::ask(req, &got); done = true; });
+    const uint64_t id = wait_open();
+    CHECK(id != 0);
+    if (!id) { t.detach(); return; }
+    sk::Request seen;
+    CHECK(sk::pending(&seen) == id);
+    CHECK(seen.header == "Your name?");
+    CHECK(seen.initial == "Jo");
+    CHECK(seen.max_len == 10u);
+    sk::answer(id + 1, true, "wrong");               // not the open question: ignored
+    Sleep(30);
+    CHECK(!done.load());
+    CHECK(sk::pending(nullptr) == id);
+    sk::answer(id, true, "Josh");
+    t.join();
+    CHECK(ok);
+    CHECK(got == "Josh");
+    CHECK(sk::pending(nullptr) == 0);
+
+    std::string got2 = "unchanged";
+    bool ok2 = true;
+    std::thread t2([&] { ok2 = sk::ask(req, &got2); });
+    const uint64_t id2 = wait_open();
+    CHECK(id2 > id);
+    if (!id2) { t2.detach(); return; }
+    sk::answer(id2, false, "ignored");
+    t2.join();
+    CHECK(!ok2);
+    CHECK(got2 == "unchanged");
+    sk::answer(id2, true, "late");                   // already answered: no effect
+    CHECK(sk::pending(nullptr) == 0);
+}
+
 NXTEST(am_desired_language) {
     nxsvc::Env env;
     clear_config();
@@ -384,7 +523,8 @@ NXTEST(am_application_functions_fixed_replies) {
     nxsvc::Reply dv = app.call(23);
     CHECK_EQ(dv.result, 0u);
     REQUIRE(dv.out.size() >= 16);
-    const uint8_t want_dv[16] = {'1', '.', '0', '.', '0', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint8_t want_dv[16] = {};   // the registered game's display version, NUL padded
+    std::memcpy(want_dv, services::profile().display_version.c_str(), std::min<size_t>(services::profile().display_version.size(), 15));
     CHECK(std::memcmp(dv.out.data(), want_dv, 16) == 0);
 
     // NotifyRunning returns 1.
@@ -446,12 +586,14 @@ NXTEST(am_ensure_save_data) {
     CHECK_EQ(r.result, 0u);
     CHECK_EQ(r.get<uint64_t>(0), 0ull);
     CHECK_EQ(services::fsapi::account_save_size(1, 2, &size, &journal), 0u);
-    CHECK_EQ(size, 4ll << 20);
+    const int64_t want_size = static_cast<int64_t>(services::profile().account_save_size);
+    const int64_t want_journal = static_cast<int64_t>(services::profile().account_save_journal);
+    CHECK_EQ(size, want_size);
     // GetSaveDataSize(type 1 = account, Uid) -> normal, journal
     r = app.call(26, nxsvc::Args().u8(1).align(8).u64(1).u64(2));
     CHECK_EQ(r.result, 0u);
-    CHECK_EQ(r.get<int64_t>(0), 4ll << 20);
-    CHECK_EQ(r.get<int64_t>(8), 1ll << 20);
+    CHECK_EQ(r.get<int64_t>(0), want_size);
+    CHECK_EQ(r.get<int64_t>(8), want_journal);
     std::filesystem::remove_all(dir);
     clear_config();
 }

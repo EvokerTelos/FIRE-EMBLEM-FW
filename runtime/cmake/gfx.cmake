@@ -16,19 +16,41 @@ endif()
 add_library(nxrt_tiling STATIC "${NXRT_TOOLS_DIR}/tiling/src/tegra_tiling.cpp")
 target_include_directories(nxrt_tiling PUBLIC "${NXRT_TOOLS_DIR}/tiling/include")
 
-# ASTC -> BC7 transcoder (tools/textures): the prebuilt static libraries of the tools repository (scripts/build.ps1 there) and the
-# decoder DLLs that astc2bc7 loads at run time (copied next to every executable that links nxrt_gfx).
+# ASTC -> BC7 transcoder (tools/textures): the prebuilt static libraries of its ISPC build (scripts/build.ps1 -Ispc there)
+# and the decoder DLLs that astc2bc7 loads at run time (copied next to every executable that links nxrt_gfx). Without that build it is
+# compiled here from source: bc7e translated to C++ and the astcenc decoder linked in (tools/textures/cmake/a2b_cpp.cmake; no ISPC, no DLLs).
+# NXRT_ASTC2BC7=OFF builds without it (src/gfx/nvn/nvn_a2b_off.cpp): for a machine without tools/textures/third_party; ASTC textures then fail.
+option(NXRT_ASTC2BC7 "Link the ASTC -> BC7 transcoder of tools/textures (OFF: ASTC textures are not prepared)" ON)
 set(NXRT_A2B_DIR "${NXRT_TOOLS_DIR}/textures/build/release" CACHE PATH "Build folder of tools/textures (astc2bc7.lib, bc7e_ispc.lib, astcdec-*.dll)")
-if(NOT EXISTS "${NXRT_A2B_DIR}/astc2bc7.lib" OR NOT EXISTS "${NXRT_A2B_DIR}/bc7e_ispc.lib")
-    message(FATAL_ERROR "astc2bc7.lib not found in ${NXRT_A2B_DIR}: build tools/textures first (pwsh tools/textures/scripts/build.ps1) or set NXRT_A2B_DIR")
+set(NXRT_A2B_DLLS "")
+if(NXRT_ASTC2BC7)
+    include("${NXRT_TOOLS_DIR}/textures/cmake/a2b_cpp.cmake" OPTIONAL)
+    set(_nxrt_a2b_src FALSE)
+    if(COMMAND a2b_cpp_sources_present)
+        a2b_cpp_sources_present(_nxrt_a2b_src)
+    endif()
+    if(EXISTS "${NXRT_A2B_DIR}/astc2bc7.lib" AND EXISTS "${NXRT_A2B_DIR}/bc7e_ispc.lib")
+        add_library(nxrt_astc2bc7 INTERFACE)
+        target_include_directories(nxrt_astc2bc7 INTERFACE "${NXRT_TOOLS_DIR}/textures/include")
+        target_link_libraries(nxrt_astc2bc7 INTERFACE "${NXRT_A2B_DIR}/astc2bc7.lib" "${NXRT_A2B_DIR}/bc7e_ispc.lib")
+        file(GLOB NXRT_A2B_DLLS "${NXRT_A2B_DIR}/astcdec-*-shared.dll")
+    elseif(_nxrt_a2b_src)
+        message(STATUS "nxrt: ASTC transcoder built from source (bc7e in C++; no ISPC build in ${NXRT_A2B_DIR})")
+        a2b_add_cpp_library(nxrt_astc2bc7)
+    else()
+        message(FATAL_ERROR "no ASTC transcoder: neither the ISPC build of tools/textures in ${NXRT_A2B_DIR} nor its sources (tools/textures/scripts/fetch_third_party.ps1); set NXRT_A2B_DIR, or configure with -DNXRT_ASTC2BC7=OFF")
+    endif()
+else()
+    message(STATUS "nxrt: NXRT_ASTC2BC7=OFF: no ASTC transcoder (ASTC textures are not prepared)")
+    add_library(nxrt_astc2bc7 STATIC "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/nvn/nvn_a2b_off.cpp")
+    target_include_directories(nxrt_astc2bc7 PUBLIC "${NXRT_TOOLS_DIR}/textures/include")
 endif()
-add_library(nxrt_astc2bc7 INTERFACE)
-target_include_directories(nxrt_astc2bc7 INTERFACE "${NXRT_TOOLS_DIR}/textures/include")
-target_link_libraries(nxrt_astc2bc7 INTERFACE "${NXRT_A2B_DIR}/astc2bc7.lib" "${NXRT_A2B_DIR}/bc7e_ispc.lib")
-file(GLOB NXRT_A2B_DLLS "${NXRT_A2B_DIR}/astcdec-*-shared.dll")
+# also for a project that adds the runtime as a subdirectory and copies the DLLs next to its own exe (game-build/fefw)
+set(NXRT_A2B_DLLS "${NXRT_A2B_DLLS}" CACHE INTERNAL "astcdec DLLs of the prebuilt ISPC transcoder, copied next to the executables")
 
 file(GLOB_RECURSE NXRT_GFX_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/gfx/*.cpp")
 list(FILTER NXRT_GFX_SOURCES EXCLUDE REGEX "nvn_gpu_stub[.]cpp$")   # unit-test stand-in of the GPU boundary (scripts/nvn_unit.ps1)
+list(FILTER NXRT_GFX_SOURCES EXCLUDE REGEX "nvn_a2b_off[.]cpp$")    # the transcoder's stand-in (NXRT_ASTC2BC7=OFF above)
 add_library(nxrt_gfx STATIC ${NXRT_GFX_SOURCES})
 # The About page of the F1 menu shows the commit this build was made from (read when CMake configures; absent without git).
 find_package(Git QUIET)
@@ -40,7 +62,10 @@ if(GIT_FOUND)
     endif()
 endif()
 target_include_directories(nxrt_gfx PUBLIC include src/gfx/nvn/third_party PRIVATE src/gfx src/gfx/nvn)
-target_link_libraries(nxrt_gfx PUBLIC nxrt nxrt_volk nxrt_vma nxrt_imgui nxrt_tiling nxrt_astc2bc7 SDL3::SDL3-static)
+target_link_libraries(nxrt_gfx PUBLIC nxrt nxrt_volk nxrt_vma nxrt_imgui nxrt_tiling nxrt_astc2bc7 nxrt_zstd SDL3::SDL3-static)
+# The core calls into the graphics shell (src/core/switch2.cpp: the HDR layer luminance; src/testtools: the screenshot wait), so whatever
+# links nxrt (nxrt_tests, the liftrun_* tests) links nxrt_gfx too, as the game exe does. Static libraries may depend on each other.
+target_link_libraries(nxrt INTERFACE nxrt_gfx)
 target_compile_definitions(nxrt_gfx PUBLIC VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
 
 add_executable(nxrt_gfx_demo apps/gfx_demo.cpp)
@@ -52,6 +77,9 @@ endforeach()
 
 if(NXRT_BUILD_TESTS)
     file(GLOB_RECURSE NXRT_GFX_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/gfx/*.cpp")
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/games/mpr")   # the prompt icon test reads Metroid's paks through games/mpr's pak reader
+        list(FILTER NXRT_GFX_TEST_SOURCES EXCLUDE REGEX "test_prompts[.]cpp$")
+    endif()
     # The tests of the registered test game's own code (games/<id>/tests) run in the same executable (docs/GAME_BOUNDARY.md).
     if(NXRT_TEST_GAME)
         file(GLOB NXRT_GAME_TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/games/${NXRT_TEST_GAME}/tests/*.cpp")

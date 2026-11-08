@@ -8,10 +8,14 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <string>
 
+#include "extras/framegen.h"
 #include "extras/temporal.h"
+#include "nxrt/config.h"
 #include "nxrt/extras.h"
 #include "nxrt/gfx.h"
 #include "nxrt/log.h"
@@ -116,22 +120,43 @@ public:
         Sl& s = sl_state();
         if (failed_) return false;
         const sl::ViewportHandle vp(0u);
-        sl::FrameToken* frame = nullptr;
-        if (s.token(frame, nullptr) != sl::Result::eOk || !frame) return fail("slGetNewFrameToken");
-        // the mode from the size ratio (DLAA at the same size)
-        const double r = static_cast<double>(f.out.width) / static_cast<double>(f.render.width);
-        sl::DLSSOptions o;
-        o.mode = (dlaa_ || r < 1.01) ? sl::DLSSMode::eDLAA : r < 1.55 ? sl::DLSSMode::eMaxQuality : r < 1.8 ? sl::DLSSMode::eBalanced
-               : r < 2.2 ? sl::DLSSMode::eMaxPerformance : sl::DLSSMode::eUltraPerformance;
-        o.outputWidth = f.out.width;
-        o.outputHeight = f.out.height;
-        o.colorBuffersHDR = sl::Boolean::eTrue;
-        o.useAutoExposure = sl::Boolean::eTrue;
-        if (o.mode != last_mode_ || f.out.width != last_out_.width || f.out.height != last_out_.height) {
-            if (s.set_options(vp, o) != sl::Result::eOk) return fail("slDLSSSetOptions");
-            last_mode_ = o.mode;
+        sl::FrameToken* frame = static_cast<sl::FrameToken*>(sl_frame_token());
+        if (!frame) return fail("slGetNewFrameToken");
+        // The mode: kept while the input size stays in its dynamic range (the game may change its render size per frame), else the one
+        // whose scale is nearest the actual ratio and whose range holds the input (DLAA at the same size).
+        const bool same_out = f.out.width == last_out_.width && f.out.height == last_out_.height;
+        if (!same_out || !in_range(range_, f.render)) {
+            sl::DLSSMode m = sl::DLSSMode::eDLAA;
+            Range rg{f.out.width, f.out.height, f.out.width, f.out.height};
+            const double r = static_cast<double>(f.out.width) / static_cast<double>(f.render.width);
+            if (!dlaa_ && r >= 1.01) {
+                static constexpr struct { sl::DLSSMode m; double scale; } kModes[] = {
+                    {sl::DLSSMode::eUltraQuality, 1.3}, {sl::DLSSMode::eMaxQuality, 1.5}, {sl::DLSSMode::eBalanced, 1.0 / 0.58},
+                    {sl::DLSSMode::eMaxPerformance, 2.0}, {sl::DLSSMode::eUltraPerformance, 3.0}};
+                double best = 1e9;
+                bool best_holds = false;
+                for (const auto& k : kModes) {
+                    Range kr;
+                    if (!range_for(s, k.m, f.out, &kr)) continue;
+                    const bool holds = in_range(kr, f.render);
+                    const double d = std::fabs(std::log(r / k.scale));
+                    if ((holds && !best_holds) || (holds == best_holds && d < best)) {
+                        best = d;
+                        best_holds = holds;
+                        m = k.m;
+                        rg = kr;
+                    }
+                }
+            }
+            if ((m != last_mode_ || !same_out) && s.set_options(vp, options(m, f.out)) != sl::Result::eOk) return fail("slDLSSSetOptions");
+            if (m != last_mode_ || !same_out)
+                NXLOG_I(kTag, "%s: mode %s, %ux%u -> %ux%u (input range %ux%u .. %ux%u)", name(), mode_name(m), f.render.width, f.render.height, f.out.width,
+                        f.out.height, rg.min_w, rg.min_h, rg.max_w, rg.max_h);
+            if (!in_range(rg, f.render) && !same_out)
+                NXLOG_W(kTag, "%s: input %ux%u is outside every mode's range for %ux%u", name(), f.render.width, f.render.height, f.out.width, f.out.height);
+            last_mode_ = m;
             last_out_ = f.out;
-            NXLOG_I(kTag, "%s: mode %u, %ux%u -> %ux%u", name(), static_cast<unsigned>(o.mode), f.render.width, f.render.height, f.out.width, f.out.height);
+            range_ = rg;
         }
         sl::Constants c;
         c.cameraViewToClip = mat(f.view_to_clip);
@@ -171,6 +196,41 @@ public:
     }
 
 private:
+    struct Range {
+        uint32_t min_w = 0, min_h = 0, max_w = 0, max_h = 0;
+    };
+    static bool in_range(const Range& r, VkExtent2D e) {
+        return e.width >= r.min_w && e.height >= r.min_h && e.width <= r.max_w && e.height <= r.max_h && r.max_w;
+    }
+    static sl::DLSSOptions options(sl::DLSSMode m, VkExtent2D out) {
+        sl::DLSSOptions o;
+        o.mode = m;
+        o.outputWidth = out.width;
+        o.outputHeight = out.height;
+        o.colorBuffersHDR = sl::Boolean::eTrue;
+        o.useAutoExposure = sl::Boolean::eTrue;
+        return o;
+    }
+    static bool range_for(Sl& s, sl::DLSSMode m, VkExtent2D out, Range* r) {
+        sl::DLSSOptimalSettings os;
+        if (!s.optimal || s.optimal(options(m, out), os) != sl::Result::eOk || !os.optimalRenderWidth) return false;
+        r->min_w = os.renderWidthMin ? os.renderWidthMin : os.optimalRenderWidth;
+        r->min_h = os.renderHeightMin ? os.renderHeightMin : os.optimalRenderHeight;
+        r->max_w = os.renderWidthMax ? os.renderWidthMax : os.optimalRenderWidth;
+        r->max_h = os.renderHeightMax ? os.renderHeightMax : os.optimalRenderHeight;
+        return true;
+    }
+    static const char* mode_name(sl::DLSSMode m) {
+        switch (m) {
+            case sl::DLSSMode::eMaxPerformance: return "Performance";
+            case sl::DLSSMode::eBalanced: return "Balanced";
+            case sl::DLSSMode::eMaxQuality: return "Quality";
+            case sl::DLSSMode::eUltraPerformance: return "Ultra Performance";
+            case sl::DLSSMode::eUltraQuality: return "Ultra Quality";
+            case sl::DLSSMode::eDLAA: return "DLAA";
+            default: return "?";
+        }
+    }
     static constexpr float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     bool fail(const char* what, int code = -1) {
         NXLOG_E(kTag, "%s failed (%d): DLSS off", what, code);
@@ -181,6 +241,7 @@ private:
     bool dlaa_ = false, failed_ = false;
     sl::DLSSMode last_mode_ = sl::DLSSMode::eCount;
     VkExtent2D last_out_ = {};
+    Range range_;
 };
 
 }  // namespace
@@ -191,9 +252,22 @@ bool temporal_dlss_available() {
 }
 bool temporal_dlss_started() { return sl_state().started; }
 
+// The NVN2 DLSS API's host upscaler (src/gfx/nvn/api_dlss_replay.cpp) wants Streamline with [dlss] upscaler = dlss, and with auto when the
+// DLLs are there.
+static bool nvn_dlss_wants_streamline() {
+    std::string u = config_get_str("dlss", "upscaler", "taau");
+    for (char& c : u) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return u == "dlss" || (u == "auto" && temporal_dlss_available()) || framegen_dlss();
+}
+
+void* streamline_proc(const char* name) {
+    Sl& s = sl_state();
+    return s.started && s.mod ? reinterpret_cast<void*>(GetProcAddress(s.mod, name)) : nullptr;
+}
+
 PFN_vkGetInstanceProcAddr streamline_preinit() {
     const UpscaleMode m = settings().upscale.mode;
-    if (m != UpscaleMode::Dlss && m != UpscaleMode::Dlaa) return nullptr;
+    if (m != UpscaleMode::Dlss && m != UpscaleMode::Dlaa && !nvn_dlss_wants_streamline()) return nullptr;
     Sl& s = sl_state();
     const std::wstring dir = sl_dir();
     const std::wstring dll = dir + L"sl.interposer.dll";
@@ -228,7 +302,10 @@ PFN_vkGetInstanceProcAddr streamline_preinit() {
     static std::wstring plugin_dir;
     plugin_dir = dir;
     paths[0] = plugin_dir.c_str();
-    static const sl::Feature features[] = {sl::kFeatureDLSS};
+    static const sl::Feature features[] = {sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL};
+    const bool fg = framegen_dlss();
+    if (fg && !(exists(dir + L"sl.dlss_g.dll") && exists(dir + L"sl.reflex.dll") && exists(dir + L"sl.pcl.dll") && exists(dir + L"nvngx_dlssg.dll")))
+        NXLOG_W(kTag, "[dlss] frame_gen: sl.dlss_g.dll, sl.reflex.dll, sl.pcl.dll or nvngx_dlssg.dll is missing in %s", narrow(dir).c_str());
     sl::Preferences pref;
     pref.showConsole = false;
     pref.logLevel = sl::LogLevel::eDefault;
@@ -239,7 +316,7 @@ PFN_vkGetInstanceProcAddr streamline_preinit() {
     // no over-the-air downloads; the host restores no command buffer state (the replay rebinds everything after the evaluation)
     pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
     pref.featuresToLoad = features;
-    pref.numFeaturesToLoad = 1;
+    pref.numFeaturesToLoad = fg ? 4 : 1;
     pref.engine = sl::EngineType::eCustom;
     pref.engineVersion = "1.0";
     pref.projectId = "5a1f0c2e-8f3b-4e61-9d4c-7b2e6a90c3d5";
@@ -262,7 +339,7 @@ TemporalBackend* temporal_dlss(void* gfx_device, bool dlaa) {
     if (!tried && gfx_device) {
         tried = true;
         if (!s.started) {
-            NXLOG_W(kTag, "DLSS needs Streamline from the start: choose DLSS or DLAA and restart (the DLLs must be in upscalers\\streamline next to the executable or in [upscale] dlss_dll)");
+            NXLOG_W(kTag, "DLSS needs Streamline from the start: choose DLSS or DLAA ([upscale] mode, or [dlss] upscaler for the NVN2 DLSS API) and restart (the DLLs must be in upscalers\\streamline next to the executable or in [upscale] dlss_dll)");
             return nullptr;
         }
         gfx::Device& dev = *static_cast<gfx::Device*>(gfx_device);

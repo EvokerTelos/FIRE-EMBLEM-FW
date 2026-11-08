@@ -112,6 +112,14 @@ void set_settings(const Settings& s) {
     set_picture_live(s.picture);
 }
 
+PictureSettings picture_clamped(PictureSettings p) {
+    p.contrast = std::clamp(p.contrast, 0.5, 1.5);
+    p.saturation = std::clamp(p.saturation, 0.0, 2.0);
+    p.black = std::clamp(p.black, -0.5, 0.25);
+    p.gamma = std::clamp(p.gamma, 0.5, 2.0);
+    return p;
+}
+
 void set_picture_live(const PictureSettings& in) {
     const PictureSettings p = picture_clamped(in);
     g_pic_contrast.store(static_cast<float>(p.contrast), std::memory_order_relaxed);
@@ -240,7 +248,6 @@ void after_note() {
 }
 }  // namespace
 
-static const bool g_luminance_sink_set = (layer_luminance_sink = hdr_note_layer_luminance, true);
 void hdr_note_layer_luminance(bool extended, unsigned min_nits, unsigned max_nits) {
     std::lock_guard<std::mutex> lk(g_note_mu);
     HdrState hs = hdr_state();

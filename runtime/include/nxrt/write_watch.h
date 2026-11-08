@@ -36,15 +36,14 @@ bool arm(Region* r, uint64_t first, uint64_t count);
 // Owner: true when every page of the run is armed and nobody wrote it since.
 bool all_valid(const Region* r, uint64_t first, uint64_t count);
 bool page_valid(const Region* r, uint64_t page);
+// Owner: some page of [first, first + count) is valid (pages past the region are not); word by word (rt agent).
+bool any_valid(const Region* r, uint64_t first, uint64_t count);
 bool page_banned(const Region* r, uint64_t page);
 // Owner: the owner changed the pages itself (the GPU wrote them): no longer valid, still armed (the next arm() re-validates them).
 void invalidate(Region* r, uint64_t first, uint64_t count);
 // Owner: appends the pages written by the CPU since the last call (page indices) and clears that record.
 void take_written(Region* r, std::vector<uint64_t>& out);
 
-// memory.cpp, inside its OsWriteScope, before it changes the mapping or protection of [p, p + n): an arm() that read memory.cpp's page
-// table before this asks VirtualQuery instead.
-void protection_changed(const void* p, uint64_t n);
 // Any thread: the operating system is about to write [p, p + n) (a file read into guest memory): armed pages in the range become writable
 // and count as written. Cheap when no region exists.
 void before_os_write(const void* p, uint64_t n);
@@ -91,16 +90,13 @@ void set_guard_handler(GuardHandler fn);
 // Owner: guards pages [first, first + count). False when a page is not armed (written since, never armed, banned) or a file read is
 // in progress there: nothing is guarded then. Pages already guarded stay so.
 bool guard(Region* r, uint64_t first, uint64_t count);
-
-// Crash reports: every region holding addr and that page's bits (prot guard valid ban written), plus the releasing count. Lock-free reads,
-// so it can run from an exception handler. Writes at most n bytes into out (NUL-terminated); returns the number of regions found.
-int describe(uint64_t addr, char* out, size_t n);
 // Any thread: the guarded pages among [first, first + count) become read-only (armed) again.
 void unguard(Region* r, uint64_t first, uint64_t count);
 // Owner: true when every page of the run is still armed (read-only or guarded: the CPU did not write it since it was armed).
 bool all_armed(const Region* r, uint64_t first, uint64_t count);
-// Every page of [first, first + count) is valid, or set in `extra` (a caller's bitmap over the same pages) and armed: word by word.
-bool all_valid_or_armed(const Region* r, const std::atomic<uint64_t>* extra, uint64_t first, uint64_t count);
+// Owner: true when every page of the run is valid, or still armed with its bit set in `alt` (one bit per page of the region, the caller's
+// own bitmap). A word of 64 pages at a time: the NVN back end asks this for every buffer a draw binds.
+bool all_valid_or_armed(const Region* r, uint64_t first, uint64_t count, const std::atomic<uint64_t>* alt);
 uint64_t guard_faults();   // accesses that hit a guarded page (statistics)
 
 uint64_t faults();     // write faults handled so far (statistics)

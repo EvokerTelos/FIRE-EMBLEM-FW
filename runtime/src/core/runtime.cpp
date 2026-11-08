@@ -19,6 +19,7 @@
 #include "nxrt/memory.h"
 #include "nxrt/module.h"
 #include "nxrt/movie.h"
+#include "nxrt/movie_vdec.h"
 #include "nxrt/video_codec.h"
 #include "nxrt/nxmodule.h"
 #include "nxrt/services.h"
@@ -60,9 +61,9 @@ bool init(const InitOptions& opt) {
     if (opt.services) {
         services::register_all();
         kernel::install_busy_mutex_hle();   // the SDK's spin lock yields under the console core model
-        install_libc_hle();           // the SDK's string and memory functions as host code ([hle] libc)
         media::install_movie_hle();   // movie:: on Media Foundation ([media] movie = off keeps the library in subsdk0); Switch 1 only
         media::install_video_codec_hle();   // Switch 2: nn::codec VP9/VP8 decoders + fences on libvpx (src/media/video_codec.cpp)
+        media::install_movie_decoder_hle();   // Switch 2: movie::VideoDecoder on dav1d for AV1 movies (src/media/movie_vdec.cpp)
         install_switch2_hle();        // Switch 2: the GPU driver boot answers on the host (src/core/switch2.cpp)
         trace_sites_install();        // [diag] trace_sites: bring-up register probes at mid hook sites (src/diag/trace_sites.cpp)
     }

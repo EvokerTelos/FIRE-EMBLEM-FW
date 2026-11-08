@@ -2,16 +2,17 @@ import './theme.css';
 import './layout.css';
 import './components.css';
 import { listen } from '@tauri-apps/api/event';
-import { api, esc, icon, refreshIcons, errText, toast } from './util.js';
+import { api, icon, refreshIcons, errText, toast } from './util.js';
 import * as play from './pages/play.js';
 import * as settings from './pages/settings.js';
 import * as setup from './pages/setup.js';
 import * as about from './pages/about.js';
+import { upd, notify, checkNow, available } from './update.js';
 
 const PAGES = {
   play: { mod: play, label: 'Play', icon: 'play' },
+  setup: { mod: setup, label: 'Setup', icon: 'hammer' },
   settings: { mod: settings, label: 'Settings', icon: 'settings' },
-  setup: { mod: setup, label: 'Game files', icon: 'folder-open' },
   about: { mod: about, label: 'About', icon: 'info' },
 };
 
@@ -20,20 +21,26 @@ const view = document.getElementById('view');
 let current = null;
 let statusHandler = null;
 let setupHandler = null;
+let logHandler = null;
 
 const ctx = {
-  game: null, // the game manifest as the pages need it (get_game), set in boot()
   go,
   onStatus(fn) { statusHandler = fn; },
   onSetup(fn) { setupHandler = fn; },
+  onLog(fn) { logHandler = fn; },
 };
 
 function drawNav() {
   nav.innerHTML =
-    `<div class="brand">${icon('gamepad-2', 'mark')}<span class="name">${esc(ctx.game ? ctx.game.launcher_name : 'Launcher')}</span></div>` +
+    `<div class="brand"><img class="mark" src="/icon.png" alt=""><span class="name">fefw recomp</span></div>` +
     Object.entries(PAGES)
       .map(([id, p]) => `<button class="nav-item ${id === current ? 'active' : ''}" data-page="${id}">${icon(p.icon)}<span class="label">${p.label}</span></button>`)
-      .join('');
+      .join('') +
+    (available() || upd.status.state === 'done'
+      ? `<button class="nav-item update-pill" data-page="about">${icon('circle-arrow-up')}<span class="label">${
+          upd.status.state === 'done' ? 'Restart to update' : `Update to ${upd.check.latest.version}`
+        }</span></button>`
+      : '');
   nav.querySelectorAll('[data-page]').forEach((b) => b.addEventListener('click', () => go(b.dataset.page)));
   refreshIcons();
 }
@@ -42,6 +49,7 @@ async function go(page, opts = {}) {
   current = page;
   statusHandler = null;
   setupHandler = null;
+  logHandler = null;
   drawNav();
   view.scrollTop = 0;
   try {
@@ -54,18 +62,14 @@ async function go(page, opts = {}) {
 }
 
 async function boot() {
-  try {
-    ctx.game = await api('get_game');
-    document.title = ctx.game.window_title;
-  } catch (e) {
-    // no usable game.toml next to the launcher: nothing else can work
-    drawNav();
-    view.innerHTML = `<div class="page"><div class="banner danger">${icon('circle-x')}<div>${esc(errText(e))}</div></div></div>`;
-    refreshIcons();
-    return;
-  }
   await listen('game-status', (ev) => statusHandler && statusHandler(ev.payload));
   await listen('setup-status', (ev) => setupHandler && setupHandler(ev.payload));
+  await listen('setup-log', (ev) => logHandler && logHandler(ev.payload));
+  await listen('update-status', (ev) => {
+    upd.status = ev.payload;
+    notify();
+  });
+  upd.listeners.add(drawNav);
   let cfg = { dump_dir: '' };
   try {
     cfg = await api('get_config');
@@ -74,6 +78,7 @@ async function boot() {
   }
   // first run: no game files chosen yet
   go(cfg.dump_dir ? 'play' : 'setup', { firstRun: !cfg.dump_dir });
+  if (!cfg.skip_update_check) checkNow(); // quietly: a failure only shows on the About page
 }
 
 boot();

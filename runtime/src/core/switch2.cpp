@@ -5,19 +5,20 @@
 // remote-memory path (CanBootWithRemoteMemory returns 1): nn::gsv (the GraphicsSupervisor TIPC session), nn::nvsrv and
 // nn::gpu::sdk boot the console GPU driver. nxrt implements NVN on the host (nvnBootstrapLoader), so no driver is needed: the
 // boot calls answer on the host and return, and the guest's graphics allocator registration still runs as game code.
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 
 #include "nxrt/abi.h"
+#include "nxrt/config.h"
 #include "nxrt/dispatch.h"
 #include "nxrt/extras.h"
 #include "nxrt/game.h"
 #include "nxrt/log.h"
 #include "nxrt/module.h"
 #include "nxrt/services_api.h"
+#include "nxrt/movie_vdec.h"
 #include "nxrt/video_codec.h"
-
-namespace nxrt::extras { void (*layer_luminance_sink)(bool, unsigned, unsigned) = nullptr; }
 
 namespace nxrt {
 
@@ -77,6 +78,16 @@ void movie_initialize_unavailable(::Ctx* c) {
     c->x[0] = 0x1a4cb;   // stand-in non-zero nn::Result
 }
 
+// The same without a host decoder, for a game whose movie player requires nn::movie::Initialize (which only allocates a TLS slot on the
+// console, so it is left to the SDK): game::Info movie_fail_at_open. nn::movie::MediaExtractor::SetUriMedia(const char* uri, int) fails, so
+// the movie does not open and the game moves on as after a skip (Fortune's Weave: the player returns 0xF from main 0x19070E0 and the
+// cutscene goes on). Failing later, at the video decoder, leaves the game waiting for frames that never come.
+void movie_open_unavailable(::Ctx* c) {
+    const char* uri = reinterpret_cast<const char*>(static_cast<uintptr_t>(c->x[1]));
+    NXLOG_I("switch2", "nn::movie::MediaExtractor::SetUriMedia(%s) -> unavailable (no host video decoder): the movie is skipped", uri ? uri : "?");
+    c->x[0] = 0x1a4cb;   // stand-in non-zero nn::Result
+}
+
 // nn::nifm::HandleNetworkRequestErrorResult shows the network connection applet (library applet 0x0F) so the user can fix a failed
 // network request. Library applets do not exist here and the SDK aborts when creating one fails, so the call answers as if the user
 // backed out of the applet: a non-zero nn::Result (nifm, module 110), and the game carries on offline (Mario Kart World: Time Trials).
@@ -114,11 +125,11 @@ void vi_get_native_window(::Ctx* c) {
 // picture for an HDR TV (Pokopia: extended 0..400, standard 0..300 nits, from its graphics-system defaults, every time it makes the layer). The
 // values go to the HDR extras ([hdr] mode = native uses them); nn::Result 0.
 void vi_layer_extended_luminance(::Ctx* c) {
-    if (extras::layer_luminance_sink) extras::layer_luminance_sink(true, static_cast<uint16_t>(c->x[1]), static_cast<uint16_t>(c->x[2]));
+    extras::hdr_note_layer_luminance(true, static_cast<uint16_t>(c->x[1]), static_cast<uint16_t>(c->x[2]));
     c->x[0] = 0;
 }
 void vi_layer_standard_luminance(::Ctx* c) {
-    if (extras::layer_luminance_sink) extras::layer_luminance_sink(false, static_cast<uint16_t>(c->x[1]), static_cast<uint16_t>(c->x[2]));
+    extras::hdr_note_layer_luminance(false, static_cast<uint16_t>(c->x[1]), static_cast<uint16_t>(c->x[2]));
     c->x[0] = 0;
 }
 
@@ -146,25 +157,35 @@ void vi_get_display_vsync_event(::Ctx* c) {
     c->x[0] = 0;
 }
 
-// Display queries of SDK 22 (Fortune's Weave): the guest versions compare the Display* with the SDK's own display object and return
-// vi OperationFailed for the host one, so they answer here. BufferMaxResolution is read as {u32 width, u32 height}: the PC output
-// allows 4K. HDR is reported off (SDR swapchain); paper white 203 nits (ITU-R BT.2408). nn::Result 0.
+void streamplay_native_window(::Ctx* c) { c->x[0] = reinterpret_cast<uint64_t>(g_native_window); }
+
+// nn::vi::QueryDisplayBufferMaxResolution(BufferMaxResolution*, const Display*): the largest buffer the display takes, 0 720p, 1 1080p, 2 1440p,
+// 3 2160p. The SDK's own asks vi2 about its DefaultDisplay and answers 0x272 for the host's stand-in display, which Fortune's Weave (main
+// 0x1818350) reads as 0, its lowest render config in every mode: DLSS from 640x360 to 1280x720. A Switch 2 dock gives 2160p (the game then
+// renders 1280x720 into 2560x1440 at graphics scale 0), the handheld panel 1080p (nxnative-penis6 9d1a455e17). [vi] buffer_max_resolution
+// (0-3) answers another value.
 void vi_query_buffer_max_resolution(::Ctx* c) {
-    if (c->x[0]) { auto* r = reinterpret_cast<uint32_t*>(c->x[0]); r[0] = 3840; r[1] = 2160; }
-    c->x[0] = 0;
-}
-void vi_query_hdr_status(::Ctx* c) {
-    if (c->x[0]) *reinterpret_cast<uint8_t*>(c->x[0]) = 0;
-    if (c->x[1]) *reinterpret_cast<uint32_t*>(c->x[1]) = 0;
-    if (c->x[2]) *reinterpret_cast<uint16_t*>(c->x[2]) = 0;
-    c->x[0] = 0;
-}
-void vi_query_hdr_paper_white(::Ctx* c) {
-    if (c->x[0]) *reinterpret_cast<uint16_t*>(c->x[0]) = 203;
+    static const int64_t forced = config_get_int("vi", "buffer_max_resolution", -1);
+    const uint32_t v = forced >= 0 && forced <= 3 ? static_cast<uint32_t>(forced) : (services::amctl::docked() ? 3u : 1u);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) NXLOG_I("switch2", "nn::vi::QueryDisplayBufferMaxResolution -> %u (%s)", v, v == 3 ? "2160p" : v == 2 ? "1440p" : v == 1 ? "1080p" : "720p");
+    if (c->x[0]) *reinterpret_cast<uint32_t*>(c->x[0]) = v;
     c->x[0] = 0;
 }
 
-void streamplay_native_window(::Ctx* c) { c->x[0] = reinterpret_cast<uint64_t>(g_native_window); }
+// nn::vi::QueryDisplayHdrStatus(bool* enabled, HdrOutputFormat*, uint16_t* peak, const Display*) for game::Info vi_hdr_status_sdr: HDR off,
+// format 0, peak 400. This is what an SDR display gives: the vi2 client (sdk 0x5EA700) maps the server's raw format 1 to HdrOutputFormat 0
+// and 2 to 1, and DefaultDisplay::QueryHdrStatus (sdk 0x5DD610) sets enabled = (format == 1); Eden-NS2's GetHdrStatus answers raw 1. Without
+// this the SDK path read the cache fields of a stand-in display (format 1, HDR off). Fortune's Weave (main 0x180D220 and its brightness
+// update at main 0x826C04) takes its nits from the paper white when the format is 1, but asks for the paper white only with HDR on, so
+// they came out 0 (main+0x21A75C0..CC): NaN in its push constants (+0x40), a NaN bloom threshold and a black picture. With format 0 it
+// keeps its 300-nit SDR base (225/300/400/300), as under Eden; the peak is stored but not read then.
+void vi_query_hdr_status_sdr(::Ctx* c) {
+    if (c->x[0]) *reinterpret_cast<uint8_t*>(c->x[0]) = 0;
+    if (c->x[1]) *reinterpret_cast<uint32_t*>(c->x[1]) = 0;
+    if (c->x[2]) *reinterpret_cast<uint16_t*>(c->x[2]) = 400;
+    c->x[0] = 0;
+}
 
 }  // namespace
 
@@ -193,25 +214,27 @@ void install_switch2_hle() {
         {"_ZN2nn2vi12DestroyLayerEPNS0_5LayerE", vi_ok},
         {"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", vi_get_native_window},
         {"_ZN2nn2vi23SetDisplayVrrCapabilityEPNS0_7DisplayEb", vi_ok},
+        {"_ZN2nn2vi31QueryDisplayBufferMaxResolutionEPNS0_19BufferMaxResolutionEPKNS0_7DisplayE", vi_query_buffer_max_resolution},
         {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", vi_get_display_vsync_event},
         {"_ZN2nn2vi52SetLayerNextHdrExtendedContentLuminanceRangeMetadataEPNS0_5LayerEtt", vi_layer_extended_luminance},
         {"_ZN2nn2vi52SetLayerNextHdrStandardContentLuminanceRangeMetadataEPNS0_5LayerEtt", vi_layer_standard_luminance},
+        // Fortune's Weave: the gamut half of the same HDR metadata; the SDK's own one reaches the skipped GPU driver through nvnBootstrapLoader
         {"_ZN2nn2vi35SetLayerNextHdrContentGamutMetadataEPNS0_5LayerENS0_15HdrContentGamutE", vi_ok},
-        {"_ZN2nn2vi31QueryDisplayBufferMaxResolutionEPNS0_19BufferMaxResolutionEPKNS0_7DisplayE", vi_query_buffer_max_resolution},
-        {"_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE", vi_query_hdr_status},
-        {"_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", vi_query_hdr_paper_white},
     };
     for (const auto& it : items) {
         hle_register(it.name, it.fn);
         module_override_symbol(it.name);
     }
-    // SDK 22 links its own nvnBootstrapLoader (the console driver shim: it loads the driver's proc table and jumps to entry 0, null
-    // here). Fortune's Weave imports it from sdk, so without the override the import binds to the guest copy and the game calls 0x0.
-    // Games whose sdk does not define it already reach the host loader; the override changes nothing for them.
-    module_override_symbol("nvnBootstrapLoader");
-    if (!media::video_codec_enabled()) {
-        hle_register("_ZN2nn5movie10InitializeEv", movie_initialize_unavailable);
-        module_override_symbol("_ZN2nn5movie10InitializeEv");
+    if (game::info().vi_hdr_status_sdr) {
+        const char* sym = "_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE";
+        hle_register(sym, vi_query_hdr_status_sdr);
+        module_override_symbol(sym);
+    }
+    if (!media::video_codec_enabled() && !media::movie_decoder_enabled()) {
+        const bool at_open = game::info().movie_fail_at_open;
+        const char* sym = at_open ? "_ZN2nn5movie14MediaExtractor11SetUriMediaEPKci" : "_ZN2nn5movie10InitializeEv";
+        hle_register(sym, at_open ? movie_open_unavailable : movie_initialize_unavailable);
+        module_override_symbol(sym);
     }
     NXLOG_I("switch2", "Switch 2 platform: graphics system boot answered on the host");
 }

@@ -8,12 +8,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
 
 #include "nvn_cmd.h"
 #include "nvn_gpu.h"
 #include "nvn_impl.h"
 #include "nxrt/log.h"
+#include "nxrt/kernel.h"
+#include "nxrt/config.h"
 
 namespace nxrt::nvn {
 using namespace be;
@@ -79,7 +82,51 @@ void nvnCommandBufferDrawArrays(NVNcommandBuffer* cmd, NVNdrawPrimitive mode, in
     cb->rec->draw_count++;
 }
 
+// [nvn] draw_bt = 1 (debug): a 6-vertex instanced draw whose instance count changed logs the guest's frame-pointer backtrace and
+// x19..x28 (at most 60 lines), and publishes the ui2d TextBox being drawn and its display-string buffer: in the font drawer's frame
+// (main 0x56a560, the second frame record) its caller's x21, the TextBox, is saved at fp + 0x28, and the buffer is [TextBox + 0x148]
+// (notes/fps120.md, typewriter hunt; read by games/fefw/fefw_twprobe.cpp).
+std::atomic<uint64_t> g_dbg_textbox{0}, g_dbg_buffer{0};
+std::atomic<int> g_dbg_instances{0};
+
+void draw_backtrace(int count, int instances) {
+    static const bool on = nxrt::config_get_bool("nvn", "draw_bt", false);
+    static std::atomic<int> logged{0};
+    static std::atomic<int> last{-1};
+    if (!on || count != 6 || instances < 2 || instances > 400 || last.exchange(instances) == instances) return;
+    ::Ctx* c = nxrt::kernel::current_ctx();
+    if (!c) return;
+    uint64_t fps[4] = {}, lrs[12] = {};
+    int nf = 0;
+    uint64_t fp = c->x[29];
+    for (int i = 0; i < 12 && fp && (fp & 7) == 0; ++i) {
+        uint64_t next = 0;
+        std::memcpy(&next, reinterpret_cast<const void*>(fp), 8);
+        std::memcpy(&lrs[i], reinterpret_cast<const void*>(fp + 8), 8);
+        if (nf < 4) fps[nf++] = fp;
+        if (next <= fp) break;
+        fp = next;
+    }
+    uint64_t tb = 0, buf = 0;
+    if (nf >= 2 && lrs[1] == 0x710059ccc4ull) {
+        std::memcpy(&tb, reinterpret_cast<const void*>(fps[1] + 0x28), 8);
+        if (tb) std::memcpy(&buf, reinterpret_cast<const void*>(tb + 0x148), 8);
+    }
+    if (tb && buf && instances > 12) {
+        g_dbg_textbox = tb;
+        g_dbg_buffer = buf;
+        g_dbg_instances = instances;
+    }
+    if (logged.load() >= 60) return;
+    logged.fetch_add(1);
+    NXLOG_I("nvn.drawbt", "instances %d: lr %llx %llx %llx %llx %llx %llx | textbox %llx buffer %llx", instances, static_cast<unsigned long long>(c->x[30]),
+            static_cast<unsigned long long>(lrs[0]), static_cast<unsigned long long>(lrs[1]), static_cast<unsigned long long>(lrs[2]),
+            static_cast<unsigned long long>(lrs[3]), static_cast<unsigned long long>(lrs[4]), static_cast<unsigned long long>(tb),
+            static_cast<unsigned long long>(buf));
+}
+
 void nvnCommandBufferDrawArraysInstanced(NVNcommandBuffer* cmd, NVNdrawPrimitive mode, int first, int count, int baseInstance, int instanceCount) {
+    draw_backtrace(count, instanceCount);
     std::unique_lock<std::mutex> lk;
     CommandBuffer* cb = begin_record(cmd, lk);
     if (!cb) return;
@@ -126,6 +173,7 @@ void nvnCommandBufferDrawElementsBaseVertex(NVNcommandBuffer* cmd, NVNdrawPrimit
 }
 
 void nvnCommandBufferDrawElementsInstanced(NVNcommandBuffer* cmd, NVNdrawPrimitive mode, NVNindexType type, int count, NVNbufferAddress indexBuffer, int baseVertex, int baseInstance, int instanceCount) {
+    draw_backtrace(count, instanceCount);
     std::unique_lock<std::mutex> lk;
     CommandBuffer* cb = begin_record(cmd, lk);
     if (!cb) return;
@@ -636,6 +684,33 @@ void nvnCommandBufferInsertCheckpointStatic(NVNcommandBuffer*, uint32_t, const c
 void nvnCommandBufferInsertCheckpointDynamic(NVNcommandBuffer*, uint32_t, const char*) {}
 void nvnCommandBufferOverrideSubtileSize(NVNcommandBuffer*, int, int) {}
 
+// NVN2 push constants: (cmdbuf, int slot, int offset, int size, const void* data). The 231.40 driver (sdk 0x673660 graphics, 0x673A60
+// compute; the Deferred forms 0x673810 / 0x673CC0 take a GPU address for the data) does nothing below 4 bytes, clamps the size to 256,
+// sends size / 4 words and keeps slot & 7 and offset & 0xff (bytes). Graphics stages read slot n as constant bank 24 + n; compute shaders
+// read it in c[0] from 0x10 + 0x100 * n (the push words before the resource table, control +0xa9). Fortune's Weave pushes 0x70 bytes to
+// slot 0 at offset 0 with both (main 0xB5EAA8 graphics, 0xB5EAD8 compute): a 3x3 colour matrix, luma weights and brightness terms.
+void push_constants(bool compute, NVNcommandBuffer* cmd, int slot, int offset, int size, const void* data, uint64_t address) {
+    if (size < 4 || (!data && !address)) return;
+    std::unique_lock<std::mutex> lk;
+    CommandBuffer* cb = begin_record(cmd, lk);
+    if (!cb) return;
+    P_PushConstants p = zeroed<P_PushConstants>();
+    p.compute = compute ? 1u : 0u;
+    p.slot = static_cast<uint32_t>(slot) & 7u;
+    p.offset = static_cast<uint32_t>(offset) & 0xffu;
+    p.size = static_cast<uint32_t>(std::min(size, 0x100)) & ~3u;
+    p.address = data ? 0 : address;
+    if (data) cb->rec->emit(Op::PushConstants, p, data, p.size);
+    else cb->rec->emit(Op::PushConstants, p);
+}
+void nvnCommandBufferPushGraphicsConstants(NVNcommandBuffer* c, int slot, int offset, int size, const void* data) { push_constants(false, c, slot, offset, size, data, 0); }
+void nvnCommandBufferPushComputeConstants(NVNcommandBuffer* c, int slot, int offset, int size, const void* data) { push_constants(true, c, slot, offset, size, data, 0); }
+void nvnCommandBufferPushGraphicsConstantsDeferred(NVNcommandBuffer* c, int slot, int offset, int size, NVNbufferAddress a) { push_constants(false, c, slot, offset, size, nullptr, a); }
+void nvnCommandBufferPushComputeConstantsDeferred(NVNcommandBuffer* c, int slot, int offset, int size, NVNbufferAddress a) { push_constants(true, c, slot, offset, size, nullptr, a); }
+// NVN2 performance hints (no visible effect): compute work overlapping graphics work, and Z-cull compression of D32F depth.
+void nvnCommandBufferSetComputeOverlapMode(NVNcommandBuffer*, int) {}
+void nvnCommandBufferSetZCullZF32CompressionEnable(NVNcommandBuffer*, NVNboolean) {}
+
 }  // namespace
 
 void register_api_cmd_work() {
@@ -701,6 +776,19 @@ void register_api_cmd_work() {
     NVN_REG(nvnCommandBufferInsertCheckpointStatic);
     NVN_REG(nvnCommandBufferInsertCheckpointDynamic);
     NVN_REG(nvnCommandBufferOverrideSubtileSize);
+    NVN2_REG(nvnCommandBufferPushGraphicsConstants);
+    NVN2_REG(nvnCommandBufferPushComputeConstants);
+    NVN2_REG(nvnCommandBufferPushGraphicsConstantsDeferred);
+    NVN2_REG(nvnCommandBufferPushComputeConstantsDeferred);
+    NVN2_REG(nvnCommandBufferSetComputeOverlapMode);
+    NVN2_REG(nvnCommandBufferSetZCullZF32CompressionEnable);
+}
+
+// Debug accessor for games/fefw/fefw_twprobe.cpp ([nvn] draw_bt).
+void debug_text_draw(uint64_t* textbox, uint64_t* buffer, int* instances) {
+    *textbox = g_dbg_textbox.load();
+    *buffer = g_dbg_buffer.load();
+    *instances = g_dbg_instances.load();
 }
 
 }  // namespace nxrt::nvn

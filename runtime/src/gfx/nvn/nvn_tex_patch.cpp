@@ -38,16 +38,18 @@ uint32_t rect_levels(const Texture* t, uint32_t x, uint32_t y, uint32_t w, uint3
     return n;
 }
 
-// Runs fn(level's blocks as a linear row-major array, blocks per row) on one level and, when `write`, writes the level back.
-template <class Fn> bool with_level(Texture* t, uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool write, Fn fn) {
+// Runs fn(level's blocks as a linear row-major array, blocks per row) on one level of one layer and, when `write`, writes the level back.
+template <class Fn> bool with_level(Texture* t, uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool write, Fn fn,
+                                    uint32_t layer = 0) {
     if ((x | y | w | h) & 3u || w == 0 || h == 0) return false;
     const nvn::be::TexLayout tl = nvn::be::compute_texture_layout(t->b);
-    if (!tl.valid || !tl.block_linear || level >= tl.layout.levels.size()) return false;
+    if (!tl.valid || !tl.block_linear || level >= tl.layout.levels.size() || layer >= std::max(tl.layers, 1u)) return false;
     const tegra::LevelLayout& lv = tl.layout.levels[level];
-    if (x + w > lv.width || y + h > lv.height || lv.tiled_offset + lv.tiled_size > t->storage_size) return false;
+    const uint64_t at = lv.tiled_offset + static_cast<uint64_t>(layer) * tl.layout.tiled_layer_stride;
+    if (x + w > lv.width || y + h > lv.height || at + lv.tiled_size > t->storage_size) return false;
     std::vector<uint8_t> lin(static_cast<size_t>(lv.linear_slice_size));
     std::lock_guard<std::mutex> lk(g_mu);
-    uint8_t* tiled = t->mem + lv.tiled_offset;
+    uint8_t* tiled = t->mem + at;
     tegra::untile_level(tl.desc, lv, tiled, lin.data());
     fn(lin.data(), static_cast<size_t>(lv.linear_row_stride));
     if (!write) return true;
@@ -174,6 +176,67 @@ bool texture_put_bc7_blocks(const void* guest, uint32_t x, uint32_t y, uint32_t 
         });
     }
     mark_written(t);
+    return ok;
+}
+
+// ---- any 4x4 block texture, known by its storage --------------------------------------------------------------------------------------
+using nvn::be::Ref;
+
+namespace {
+
+bool block4(const Texture& t) {
+    return !t.destroyed.load() && t.mem && t.block_linear && t.fmt && t.fmt->compressed && t.fmt->block_w == 4 && t.fmt->block_h == 4;
+}
+
+Ref<Texture> texture_by_id(uint32_t id) {
+    auto pred = [](const Texture& t, void* u) { return t.id == *static_cast<const uint32_t*>(u) && block4(t); };
+    std::vector<Ref<Texture>> v = nvn::be::texture_registry_collect(pred, &id);
+    return v.empty() ? Ref<Texture>() : std::move(v.front());
+}
+
+}  // namespace
+
+std::vector<uint32_t> texture_find_by_content(const TexContentMatch& m, const std::vector<uint32_t>* skip) {
+    struct Want { const TexContentMatch* m; const std::vector<uint32_t>* skip; } want{&m, skip};
+    auto pred = [](const Texture& t, void* u) {
+        const Want& wt = *static_cast<const Want*>(u);
+        if (!block4(t) || t.fmt->nvn != wt.m->nvn_format || static_cast<uint32_t>(t.b.width) != wt.m->width ||
+            static_cast<uint32_t>(t.b.height) != wt.m->height || std::max(t.layers, 1u) != std::max(wt.m->layers, 1u))
+            return false;
+        return !wt.skip || std::find(wt.skip->begin(), wt.skip->end(), t.id) == wt.skip->end();
+    };
+    std::vector<uint32_t> out;
+    if (!m.data || !m.size) return out;
+    for (const Ref<Texture>& r : nvn::be::texture_registry_collect(pred, &want)) {
+        const Texture* t = r.get();
+        if (t->storage_size >= m.size && std::memcmp(t->mem, m.data, m.size) == 0) out.push_back(t->id);
+    }
+    return out;
+}
+
+bool texture_read_blocks(uint32_t id, uint32_t layer, uint32_t x, uint32_t y, uint32_t w, uint32_t h, std::vector<uint8_t>* blocks) {
+    Ref<Texture> r = texture_by_id(id);
+    if (!r || !blocks) return false;
+    const size_t unit = r->fmt->bytes, row = static_cast<size_t>(w / 4) * unit;
+    blocks->clear();
+    return with_level(r.get(), 0, x, y, w, h, false, [&](uint8_t* lin, size_t stride) {
+        for (uint32_t by = 0; by < h / 4; ++by) {
+            const uint8_t* src = lin + (y / 4 + by) * stride + static_cast<size_t>(x / 4) * unit;
+            blocks->insert(blocks->end(), src, src + row);
+        }
+    }, layer);
+}
+
+bool texture_write_blocks(uint32_t id, uint32_t layer, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint8_t* blocks, size_t size) {
+    Ref<Texture> r = texture_by_id(id);
+    if (!r || !blocks) return false;
+    const size_t unit = r->fmt->bytes, row = static_cast<size_t>(w / 4) * unit;
+    if (size < row * (h / 4)) return false;
+    const bool ok = with_level(r.get(), 0, x, y, w, h, true, [&](uint8_t* lin, size_t stride) {
+        for (uint32_t by = 0; by < h / 4; ++by)
+            std::memcpy(lin + (y / 4 + by) * stride + static_cast<size_t>(x / 4) * unit, blocks + by * row, row);
+    }, layer);
+    if (ok) mark_written(r.get());
     return ok;
 }
 

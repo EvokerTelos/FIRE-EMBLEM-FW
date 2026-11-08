@@ -94,14 +94,28 @@ void nvnDeviceSetAutomaticCheckpointsByDebugGroup(NVNdevice*, NVNboolean) {}
 void nvnDeviceSetCheckpointCallStacksEnable(NVNdevice*, NVNboolean) {}
 void nvnDeviceSetCheckpointMaxCallStacksDepth(NVNdevice*, int) {}
 
+// NVN2-only queries 0x62..0xA9 (no names known): the constants of the 231.40 driver (NintendoSDK 22.2, Fortune's Weave's sdk, the
+// nvnDeviceGetInteger switch at sdk 0x655220). 0 where that driver reads a device field. 0x85 = 32: texture ids the DLSS network
+// reserves. The 231.30 driver's values were never read, so older drivers keep answering 0 here.
+constexpr int kNvn2InfoFrom0x62[] = {
+    0,       256,     16,     65535,  65535,      256,    1,  16,   16,  16,     1,    1,   1,       256, 0,    16,   // 0x62
+    8,       16,      32,     31,     0x20000000, 0x1000000, 0x1000000, 0x40000000, 32, 1, 64, 0, 1,   0x7FFFFFFF, 32, 32,   // 0x72
+    4194303, 512,     256,    32,     16383,      0,      8,  0,    0,   4,      256,  16,  0,       1,   31,   0,    // 0x82
+    64,      1,       58368,  0,      0,          256,    262144, 0, 0,  0,      201,  14,  201,     20,  163840, 8, // 0x92
+    4,       256,     256,    4,      65536,      201,    5,  1,                                                    // 0xA2
+};
+static_assert(sizeof kNvn2InfoFrom0x62 / sizeof(int) == 0xAA - 0x62);
+
 void nvnDeviceGetInteger(const NVNdevice* device, NVNdeviceInfo info, int* out) {
     if (!out) return;
     (void)device;   // the values do not depend on the device (the game asks before and after nvnDeviceInitialize)
     if (game::info().platform == game::Platform::Switch2) {
-        // NVN2 (Switch 2 SDK 20.5, docs/nvn2_abi.md section 1): the values that differ from NVN1; the rest keep NVN1's numbering.
+        // NVN2 (Switch 2 SDK 20.5, docs/nvn2_abi.md section 1): the values that differ from NVN1; the rest keep NVN1's numbering. The
+        // driver is the game's own (game::Info nvn_api_minor): 231.40 loads shader binaries up to 201.20, 231.30 up to 201.17.
+        const int minor = game::info().nvn_api_minor;
         switch (static_cast<int>(info)) {
             case 0x00: *out = 231; return;          // API_MAJOR_VERSION
-            case 0x01: *out = 30; return;           // API_MINOR_VERSION
+            case 0x01: *out = minor; return;        // API_MINOR_VERSION
             case 0x06: *out = 32; return;           // VERTEX_BUFFER_BINDINGS
             case 0x0E: *out = 32; return;           // VERTEX_ATTRIBUTES
             case 0x1A: *out = 0x4000; return;       // SHADER_SCRATCH_MEMORY_GRANULARITY
@@ -109,11 +123,16 @@ void nvnDeviceGetInteger(const NVNdevice* device, NVNdeviceInfo info, int* out) 
             case 0x20: *out = 0x7FFFFFFF; return;   // MAX_COMPUTE_DISPATCH_WORK_GROUPS_X
             case 0x2C: *out = 16; return;           // MAX_TEXTURE_LEVELS
             case 0x2E: case 0x2F: *out = 201; return;   // GLSLC max/min supported GPU code major
-            case 0x30: *out = 17; return;           // GLSLC max supported GPU code minor
+            case 0x30: *out = minor >= 40 ? 20 : 17; return;   // GLSLC max supported GPU code minor
             case 0x31: *out = 0; return;            // GLSLC min supported GPU code minor
             case 0x4E: *out = 2048; return;         // SHADER_CODE_MEMORY_POOL_PADDING_SIZE
             case 0x5A: *out = 0; return;            // SUPPORTS_DEBUG_LAYER
             default: break;
+        }
+        const int i = static_cast<int>(info);
+        if (i >= 0x62 && i <= 0xA9) {
+            *out = minor >= 40 ? kNvn2InfoFrom0x62[i - 0x62] : 0;
+            return;
         }
     }
     *out = device_info_value(static_cast<int>(info));
@@ -161,37 +180,21 @@ void nvnDeviceSetDepthMode(NVNdevice* device, NVNdepthMode mode) {
     }
 }
 
-// Fast-clear registration (sdk 0x5D6920..0x5D69E0; the table is FastClearTables in nvn_small.h). Vulkan has no fast-clear table, so this
-// keeps the registry only: it accepts and refuses the values the console does and hands out a stable index. A null value is refused.
-int register_color(NVNdevice* device, uint32_t kind, const void* color, NVNformat format) {
-    be::Device* dev = be::host_of<be::Device>(device);
-    if (!dev || !color) return -1;
-    uint32_t v[4];
-    std::memcpy(v, color, sizeof v);
-    return dev->fast_clear.add_color(kind, v, static_cast<uint32_t>(format));
-}
-int register_depth(NVNdevice* device, float value) {
-    be::Device* dev = be::host_of<be::Device>(device);
-    return dev ? dev->fast_clear.add_depth(value) : -1;
-}
-int register_stencil(NVNdevice* device, int value, int format) {
-    be::Device* dev = be::host_of<be::Device>(device);
-    return dev ? dev->fast_clear.add_stencil(static_cast<uint32_t>(value), static_cast<uint32_t>(format)) : -1;
+NVNboolean nvnDeviceRegisterFastClearColor(NVNdevice* device, const float*, NVNformat) {
+    return be::host_of<be::Device>(device) ? 1 : 0;
 }
 
-NVNboolean nvnDeviceRegisterFastClearColor(NVNdevice* device, const float* color, NVNformat format) { return register_color(device, 0, color, format) >= 0; }
-NVNboolean nvnDeviceRegisterFastClearColori(NVNdevice* device, const int* color, NVNformat format) { return register_color(device, 1, color, format) >= 0; }
-NVNboolean nvnDeviceRegisterFastClearColorui(NVNdevice* device, const uint32_t* color, NVNformat format) { return register_color(device, 2, color, format) >= 0; }
-NVNboolean nvnDeviceRegisterFastClearDepth(NVNdevice* device, float value) { return register_depth(device, value) >= 0; }
-// NVN2 only (not in the NVN1 table). The *Index calls return the registry index (-1: refused); signatures read from the sdk (0x5D6930 and the
-// other thunks into 0x6179F0 / 0x617D00 / 0x617D20 / 0x617E40): (device, value, format) and (device, value); stencil takes the value, and the
-// index form also the depth-stencil format.
-int nvnDeviceRegisterFastClearColorIndex(NVNdevice* device, const float* color, NVNformat format) { return register_color(device, 0, color, format); }
-int nvnDeviceRegisterFastClearColoriIndex(NVNdevice* device, const int* color, NVNformat format) { return register_color(device, 1, color, format); }
-int nvnDeviceRegisterFastClearColoruiIndex(NVNdevice* device, const uint32_t* color, NVNformat format) { return register_color(device, 2, color, format); }
-int nvnDeviceRegisterFastClearDepthIndex(NVNdevice* device, float value) { return register_depth(device, value); }
-NVNboolean nvnDeviceRegisterFastClearStencil(NVNdevice* device, int value) { return register_stencil(device, value, 0) >= 0; }
-int nvnDeviceRegisterFastClearStencilIndex(NVNdevice* device, int value, NVNformat format) { return register_stencil(device, value, static_cast<int>(format)); }
+NVNboolean nvnDeviceRegisterFastClearColori(NVNdevice* device, const int*, NVNformat) {
+    return be::host_of<be::Device>(device) ? 1 : 0;
+}
+
+NVNboolean nvnDeviceRegisterFastClearColorui(NVNdevice* device, const uint32_t*, NVNformat) {
+    return be::host_of<be::Device>(device) ? 1 : 0;
+}
+
+NVNboolean nvnDeviceRegisterFastClearDepth(NVNdevice* device, float) {
+    return be::host_of<be::Device>(device) ? 1 : 0;
+}
 
 NVNwindowOriginMode nvnDeviceGetWindowOriginMode(const NVNdevice* device) {
     const be::Device* dev = be::host_of<be::Device>(device);
@@ -265,7 +268,7 @@ void nvnQueueSubmitCommands(NVNqueue* queue, int count, const NVNcommandHandle* 
             else note_unknown_handle(handles[i], count);
         }
     }
-    be::gpu::submit(lists);
+    be::host_of<be::Queue>(queue)->last_serial.store(be::gpu::submit(lists));
 }
 
 void nvnQueueFlush(NVNqueue* queue) {
@@ -276,6 +279,14 @@ void nvnQueueFlush(NVNqueue* queue) {
 void nvnQueueFinish(NVNqueue* queue) {
     if (!be::host_of<be::Queue>(queue)) return;
     be::gpu::finish();
+}
+
+// NVN2 sync scope, as the console's driver (nxnative-penis6 df973df30f, fb9f2a2029): an acquire sync waits for the work before the texture's
+// own last present, not for everything submitted, and a queue's fence covers that queue's submissions. Waiting for all of it made Mario Kart
+// World's main thread wait out each frame's GPU work before starting the next. NVN1 keeps the older answer.
+bool nvn2_sync_scope() {
+    static const bool on = game::info().platform == game::Platform::Switch2;
+    return on;
 }
 
 // Shared by nvnWindowAcquireTexture and nvnQueueAcquireTexture (the queue variant passes no sync object).
@@ -289,7 +300,7 @@ NVNwindowAcquireTextureResult acquire_texture(be::Window* w, NVNsync* sync, int*
     w->next_acquire = slot + 1;
     if (index) *index = slot;
     if (be::Sync* s = be::host_of<be::Sync>(sync)) {
-        s->serial.store(be::gpu::last_serial());
+        s->serial.store(nvn2_sync_scope() ? (slot < 4 ? w->present_serial[slot].load() : 0) : be::gpu::last_serial());
         s->armed.store(true);
     }
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
@@ -303,7 +314,7 @@ void nvnQueuePresentTexture(NVNqueue* queue, NVNwindow* window, int index) {
         NXLOG_W(kTag, "nvnQueuePresentTexture: index %d is not one of the %zu window textures; not presented", index, w->textures.size());
         return;
     }
-    if (const game::Info* g = game::current(); g && g->on_present) g->on_present();
+    if (index < 4) w->present_serial[index].store(be::gpu::last_serial());
     be::gpu::present(w, index);
 }
 
@@ -325,7 +336,8 @@ void nvnQueueFenceSync(NVNqueue* queue, NVNsync* sync, NVNsyncCondition, int) {
     if (!be::host_of<be::Queue>(queue)) return;
     be::Sync* s = be::host_of<be::Sync>(sync);
     if (!s) return;
-    s->serial.store(be::gpu::last_serial());   // a serial of 0 reads as already signaled (see nvnSyncWait)
+    // a serial of 0 reads as already signaled (see nvnSyncWait)
+    s->serial.store(nvn2_sync_scope() ? be::host_of<be::Queue>(queue)->last_serial.load() : be::gpu::last_serial());
     s->armed.store(true);
 }
 
@@ -466,8 +478,6 @@ void nvnWindowSetPresentInterval(NVNwindow* window, int interval) {
     be::Window* w = be::host_of<be::Window>(window);
     if (!w) return;
     std::lock_guard<std::mutex> lk(w->lock);
-    if (w->present_interval != interval)
-        NXLOG_I(kTag, "nvnWindowSetPresentInterval: %d -> %d (the host paces by [display] fps_limit, not by this)", w->present_interval, interval);
     w->present_interval = interval;
 }
 
@@ -581,12 +591,6 @@ void register_api_device() {
     NVN_REG(nvnDeviceRegisterFastClearColori);
     NVN_REG(nvnDeviceRegisterFastClearColorui);
     NVN_REG(nvnDeviceRegisterFastClearDepth);
-    NVN2_REG(nvnDeviceRegisterFastClearColorIndex);
-    NVN2_REG(nvnDeviceRegisterFastClearColoriIndex);
-    NVN2_REG(nvnDeviceRegisterFastClearColoruiIndex);
-    NVN2_REG(nvnDeviceRegisterFastClearDepthIndex);
-    NVN2_REG(nvnDeviceRegisterFastClearStencil);
-    NVN2_REG(nvnDeviceRegisterFastClearStencilIndex);
     NVN_REG(nvnDeviceGetWindowOriginMode);
     NVN_REG(nvnDeviceGetDepthMode);
     NVN_REG(nvnDeviceGetTimestampInNanoseconds);

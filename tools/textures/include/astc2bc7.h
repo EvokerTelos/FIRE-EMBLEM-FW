@@ -58,8 +58,18 @@ typedef struct a2b_stats {
 
 #define A2B_DEFAULT_QUALITY 5
 
+typedef enum a2b_encoder {
+    A2B_ENCODER_NONE = 0, /* no transcoder (the runtime's stand-in): ASTC decodes and encodes fail */
+    A2B_ENCODER_ISPC,     /* bc7e compiled with ISPC */
+    A2B_ENCODER_CPP,      /* bc7e translated to C++ (src/bc7e_cpp.cpp): the same presets and output quality, about 3 to 4 times slower */
+} a2b_encoder;
+
+/* The BC7 encoder of this build. *name, when name is not NULL, gets a short description for logs. */
+a2b_encoder a2b_bc7_encoder(const char** name);
+
 /* Optional. Locates astcdec-{avx2,sse4.1,sse2}-shared.dll in dll_dir (NULL: the executable's directory) and picks the
- * best one the CPU supports. Called implicitly by the first transcode with the default directory. */
+ * best one the CPU supports. Called implicitly by the first transcode with the default directory. A build with the
+ * decoder linked in (A2B_ASTC_STATIC) needs no DLL and always succeeds. */
 a2b_status a2b_init(const char* dll_dir);
 
 const char* a2b_status_string(a2b_status s);

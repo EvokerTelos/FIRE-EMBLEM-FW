@@ -562,3 +562,25 @@ inline V128 clmul64(uint64_t a, uint64_t b) {
 #include "cxx_ldst.h"
 #include "cxx_neon1.h"
 #include "cxx_neon2.h"
+
+// Indirect calls (BLR, BR out of a function, unresolved jump tables): the runtime's flat table of the main module's functions
+// (runtime core/dispatch.cpp nx_fn_flat; one entry per 4-byte slot from 0x7100000000, nxrt::mem::kMainBase, as an offset from
+// nx_fn_flat_host) is read at the call site, so every site has its own indirect branch for the host to predict. The rotate puts a
+// misaligned address out of range. Other modules, HLE thunks and empty entries go through call_indirect; the target is the same
+// either way. A game turns it on with NX_INLINE_INDIRECT when its runtime has the table (nxrt does; fefw: games/fefw).
+#ifdef NX_INLINE_INDIRECT
+extern "C" uint32_t *nx_fn_flat;
+extern "C" uint64_t nx_fn_flat_n;
+extern "C" uintptr_t nx_fn_flat_host;
+NX_INLINE void nx_call_indirect(Ctx *c, uint64_t a) {
+    const uint64_t i = __builtin_rotateright64(a - 0x7100000000ull, 2);
+    if (i < __atomic_load_n(&nx_fn_flat_n, __ATOMIC_ACQUIRE)) {
+        if (const uint32_t off = nx_fn_flat[i]) {
+            reinterpret_cast<void (*)(Ctx *)>(nx_fn_flat_host + off)(c);
+            return;
+        }
+    }
+    (call_indirect)(c, a);
+}
+#define call_indirect(c, a) nx_call_indirect(c, a)
+#endif

@@ -46,6 +46,14 @@ Counters* counters_if();   // null before the GPU is up
 void note_unsupported(const char* what);
 std::string unsupported_report();
 
+// Hands the submissions recorded so far to the GPU ([nvn] submit_batch keeps them back). Call before a queue operation that must come after
+// them: the present, sparse binds.
+void submit_recorded();
+// The present: with [nvn] submit_batch = frame, the batch goes in the present's own vkQueueSubmit2 (one kernel submission a frame).
+// true: p is filled (cmds holds its command buffers); call present_batch_done(p) after Renderer::end_frame(p). false: the batch is
+// submitted already (submit_recorded), call end_frame without a prefix.
+bool take_batch_for_present(std::vector<VkCommandBuffer>* cmds, gfx::Renderer::SubmitPrefix* p);
+void present_batch_done(const gfx::Renderer::SubmitPrefix& p);
 // Runs fn on the render thread and waits for it. From the render thread itself it just calls fn.
 void run_on_render_thread(const std::function<void()>& fn);
 // Test and one-shot hook: runs fn(Frame&) on the render thread with a fresh command buffer, submits it and waits for the GPU.
@@ -81,10 +89,6 @@ struct Frame {
     // A descriptor set of this submission's pool (freed when the slot is reused). Null on failure.
     VkDescriptorSet alloc_set(VkDescriptorSetLayout layout);
 };
-
-// Splits the submission being recorded (nvn_gpu.cpp): runs what is recorded so far, waits for the GPU, and goes on in a fresh command buffer
-// (f.cb changes, the serial does not). Render thread only; false when it cannot. The caller ends its pass / queries first and re-binds after.
-bool frame_split(Frame& f);
 
 // Destruction: fn runs once every submission made so far (and the one being recorded) has completed.
 void defer_destroy(std::function<void()> fn);
@@ -165,6 +169,11 @@ bool out_add(uint64_t addr, VkDeviceSize size, VkBuffer mbuf, VkDeviceSize moff,
 bool out_exact(uint64_t addr, VkDeviceSize size, VkBuffer* buf, VkDeviceSize* off);
 // Some page of [addr, +size) holds a result that is newer in the copy than in the pool.
 bool out_overlaps(uint64_t addr, uint64_t size);
+// Moves whenever the held results change: out_overlaps' answer for a range is the same while it stays (rt agent, notes/rt.md).
+uint64_t out_gen();
+// No result held now in [addr, +size) was added since out_gen() was `gen`, given none was there then (false when the log of additions does
+// not reach back to `gen`). Render thread.
+bool out_clear_since(uint64_t addr, uint64_t size, uint64_t gen);
 // resolve_read would bind the copy for [addr, +size) (every page current there).
 bool out_servable(uint64_t addr, uint64_t size);
 // Why results went back (the stats line): the end of a submission, or the GPU reader of the pool that needed them.
@@ -227,6 +236,11 @@ void tex_ensure_current(Texture* t, Frame& f);
 void tex_poll_cpu_writes();   // start of a submission: textures of coherent pools whose pages the CPU wrote become dirty (nvn_gpu_texture.cpp)
 // Moves the whole image to `layout` (no-op if already there). Call with no render pass open.
 void tex_transition(Texture* t, Frame& f, VkImageLayout layout);
+// nvn_pipeline.cpp: tex_transition moves t to `layout`. A texture leaving its sampled layout is looked at again by the next draw that
+// samples through a pool array (pool_textures_to_prepare).
+void pool_note_layout(Texture* t, VkImageLayout layout);
+// nvn_pipeline.cpp: t's image and views were remade (tex_rescale) or released: the pool arrays write the ids it sits at again.
+void pool_texture_remade(Texture* t);
 VkImageLayout tex_layout(Texture* t);
 // The texture has been (or is about to be) written by the GPU: no more uploads from memory until the CPU writes it.
 void tex_mark_gpu_written(Texture* t);
@@ -297,6 +311,7 @@ TexStats tex_stats();
 void replay_begin_submit(Frame& f);
 void replay_lists(Frame& f, const std::vector<Ref<CmdList>>& lists);
 void replay_end_submit(Frame& f);
+void replay_abort_submit();     // after a recording threw (its command buffer is discarded)
 void replay_request_trace();      // trace the next whole presented frame (any thread)
 void replay_shutdown();           // destroys pipelines and layouts (render thread, device idle)
 
@@ -313,6 +328,7 @@ bool keep_aspect();
 void trace_dump_targets();
 
 // ---- present -----------------------------------------------------------------------------------------------------------
-void present_on_render_thread(Window* w, int index);
+void present_on_render_thread(Window* w, int index, bool again = false);   // again: present_again (not counted as a game present)
+void present_again();
 
 }  // namespace nxrt::nvn::be::gpu

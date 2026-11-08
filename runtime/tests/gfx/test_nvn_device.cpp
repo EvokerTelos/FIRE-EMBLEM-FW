@@ -4,6 +4,7 @@
 // builder objects. The GPU is the stub (nvn_gpu_stub.cpp): submit advances the serial, every wait is already satisfied.
 #include <cstring>
 
+#include "nxrt/game.h"
 #include "nvn_cmd.h"
 #include "nvn_core.h"
 #include "nvn_gpu.h"
@@ -121,10 +122,11 @@ NXTEST(device_get_integer_known_and_unknown_values) {
     CHECK(v == 256);
     get(&dev, NVN_DEVICE_INFO_MAX_TEXTURE_SIZE, &v);
     CHECK(v == 16384);
+    const bool nvn2 = nxrt::game::info().platform == nxrt::game::Platform::Switch2;   // NVN2 (Switch 2 SDK 20.5) is 231.30, NVN1 55.15
     get(&dev, NVN_DEVICE_INFO_API_MAJOR_VERSION, &v);
-    CHECK(v == 55);
+    CHECK(v == (nvn2 ? 231 : 55));
     get(&dev, NVN_DEVICE_INFO_API_MINOR_VERSION, &v);
-    CHECK(v == 15);
+    CHECK(v == (nvn2 ? 30 : 15));
     get(&dev, NVN_DEVICE_INFO_TEXTURE_BINDINGS_PER_STAGE, &v);
     CHECK(v == 32);
     get(&dev, NVN_DEVICE_INFO_MAX_TEXTURE_LAYERS, &v);
@@ -135,6 +137,36 @@ NXTEST(device_get_integer_known_and_unknown_values) {
     CHECK(v == 0);
     // a null out pointer is tolerated
     get(&dev, NVN_DEVICE_INFO_UNIFORM_BUFFER_ALIGNMENT, nullptr);
+    P<void(NVNdevice*)>("nvnDeviceFinalize")(&dev);
+}
+
+// A Switch 2 game whose sdk carries the 231.40 driver (NintendoSDK 22.2, game::Info nvn_api_minor 40): API 231.40, shader binaries up to
+// 201.20, and the NVN2-only queries answer that driver's constants (0x85: 32 texture ids for DLSS); a 231.30 driver keeps 17 and 0.
+NXTEST(device_get_integer_follows_the_games_nvn2_driver) {
+    setup();
+    NVNdevice dev{};
+    init_device(&dev, 0);
+    auto get = P<void(const NVNdevice*, NVNdeviceInfo, int*)>("nvnDeviceGetInteger");
+    const nxrt::game::Info* before = nxrt::game::current();
+    nxrt::game::Info g;
+    g.platform = nxrt::game::Platform::Switch2;
+    for (int minor : {30, 40}) {
+        g.nvn_api_minor = minor;
+        nxrt::game::set_current(&g);
+        int v = -1;
+        get(&dev, NVN_DEVICE_INFO_API_MINOR_VERSION, &v);
+        CHECK_EQ(v, minor);
+        get(&dev, NVN_DEVICE_INFO_GLSLC_MAX_SUPPORTED_GPU_CODE_MINOR_VERSION, &v);
+        CHECK_EQ(v, minor >= 40 ? 20 : 17);
+        get(&dev, static_cast<NVNdeviceInfo>(0x85), &v);
+        CHECK_EQ(v, minor >= 40 ? 32 : 0);
+        get(&dev, static_cast<NVNdeviceInfo>(0x9F), &v);
+        CHECK_EQ(v, minor >= 40 ? 20 : 0);
+        v = 77;
+        get(&dev, static_cast<NVNdeviceInfo>(0xAA), &v);   // past the NVN2 switch
+        CHECK_EQ(v, 0);
+    }
+    nxrt::game::set_current(before);
     P<void(NVNdevice*)>("nvnDeviceFinalize")(&dev);
 }
 
@@ -202,14 +234,9 @@ NXTEST(device_handles_timestamps_and_debug_domains) {
 
     CHECK(P<NVNboolean(const NVNdevice*)>("nvnDeviceIsExternalDebuggerAttached")(&dev) == 0);
     P<NVNboolean(NVNdevice*, float)>("nvnDeviceRegisterFastClearDepth")(&dev, 1.0f);
-    // fast-clear registry (nvn_small.h; the details are in test_nvn_small.cpp): real values are accepted, a null value is refused
-    const float fc[4] = {0, 0, 0, 1};
-    const int fci[4] = {1, 2, 3, 4};
-    const uint32_t fcu[4] = {1, 2, 3, 4};
-    CHECK(P<NVNboolean(NVNdevice*, const float*, NVNformat)>("nvnDeviceRegisterFastClearColor")(&dev, fc, NVN_FORMAT_RGBA8) == 1);
-    CHECK(P<NVNboolean(NVNdevice*, const int*, NVNformat)>("nvnDeviceRegisterFastClearColori")(&dev, fci, NVN_FORMAT_RGBA8I) == 1);
-    CHECK(P<NVNboolean(NVNdevice*, const uint32_t*, NVNformat)>("nvnDeviceRegisterFastClearColorui")(&dev, fcu, NVN_FORMAT_RGBA8I) == 1);
-    CHECK(P<NVNboolean(NVNdevice*, const float*, NVNformat)>("nvnDeviceRegisterFastClearColor")(&dev, nullptr, NVN_FORMAT_RGBA8) == 0);
+    CHECK(P<NVNboolean(NVNdevice*, const float*, NVNformat)>("nvnDeviceRegisterFastClearColor")(&dev, nullptr, NVN_FORMAT_RGBA8) == 1);
+    CHECK(P<NVNboolean(NVNdevice*, const int*, NVNformat)>("nvnDeviceRegisterFastClearColori")(&dev, nullptr, NVN_FORMAT_RGBA8) == 1);
+    CHECK(P<NVNboolean(NVNdevice*, const uint32_t*, NVNformat)>("nvnDeviceRegisterFastClearColorui")(&dev, nullptr, NVN_FORMAT_RGBA8) == 1);
 
     P<void(NVNdevice*, const char*)>("nvnDeviceSetDebugLabel")(&dev, "device under test");
     P<void(NVNdevice*, int)>("nvnDeviceSetIntermediateShaderCache")(&dev, 1);

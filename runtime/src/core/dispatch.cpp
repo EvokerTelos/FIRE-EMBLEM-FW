@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -18,6 +19,16 @@
 #include "nxrt/config.h"
 #include "nxrt/log.h"
 #include "nxrt/memory.h"
+
+// The flat table of the main module's functions, under C names: one entry per 4-byte guest slot of [kMainBase, kMainBase +
+// kFlatSpan), the function as an offset from nx_fn_flat_host (0: not a registered function). Generated code built with a cxx.h that
+// has nx_call_indirect reads it at the call site (a range test and a load), so every site has its own indirect branch; anything else
+// goes through call_indirect. nx_fn_flat_n stays 0 until the table exists.
+extern "C" {
+uint32_t* nx_fn_flat = nullptr;
+uint64_t nx_fn_flat_n = 0;
+uintptr_t nx_fn_flat_host = 0;
+}
 
 namespace nxrt {
 namespace {
@@ -51,6 +62,27 @@ struct FnCacheEntry {
 constexpr size_t kFnCache = 1024;
 thread_local FnCacheEntry t_fn_cache[kFnCache];
 thread_local uint32_t t_fn_epoch = 0;
+
+// Flat table (above): 64 MiB of guest addresses, 64 MiB reserved and committed once; a page stays untouched until an entry is written.
+constexpr uint64_t kFlatSpan = 0x4000000;
+
+inline uint64_t flat_index(uint64_t a) { return std::rotr(a - mem::kMainBase, 2); }   // a misaligned address is out of range
+
+void flat_put(uint64_t guest_addr, GuestFn fn) {   // under g_write
+    if (!nx_fn_flat) {
+        void* p = VirtualAlloc(nullptr, kFlatSpan, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!p) return;
+        nx_fn_flat_host = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        nx_fn_flat = static_cast<uint32_t*>(p);
+        __atomic_store_n(&nx_fn_flat_n, kFlatSpan / 4, __ATOMIC_RELEASE);
+    }
+    const uint64_t i = flat_index(guest_addr);
+    if (i >= nx_fn_flat_n) return;
+    // a function outside the image (none today) stays out of the table: its callers take call_indirect
+    const uintptr_t h = reinterpret_cast<uintptr_t>(fn);
+    const uint32_t off = h > nx_fn_flat_host && h - nx_fn_flat_host <= UINT32_MAX ? uint32_t(h - nx_fn_flat_host) : 0;
+    __atomic_store_n(&nx_fn_flat[i], off, __ATOMIC_RELEASE);
+}
 std::vector<std::unique_ptr<Table>> g_all_tables;   // owns current + retired tables
 std::atomic<size_t> g_fn_count{0};
 
@@ -92,7 +124,6 @@ struct Thunk {
     HleFn fn = nullptr;       // null: logging stub
     std::atomic<uint64_t> calls{0};
     std::atomic<int> ft_zone{-1};   // frame trace zone ("hle:<name>"), registered on the first slow call
-    std::atomic<bool> leaf{false};  // hle_mark_leaf: an import call runs fn directly (no count, trace or import bookkeeping)
 };
 std::mutex g_hle_lock;
 std::vector<std::unique_ptr<Thunk>> g_thunks;        // index = (addr - kHleBase) / 16
@@ -133,6 +164,7 @@ void fn_register(uint64_t guest_addr, GuestFn fn) {
         uint64_t a = t->slots[h].addr.load(std::memory_order_relaxed);
         if (a == guest_addr) {
             t->slots[h].fn.store(fn, std::memory_order_release);
+            flat_put(guest_addr, fn);
             g_fn_epoch.fetch_add(1, std::memory_order_release);      // a replaced function: the per-thread caches may hold the old one
             return;
         }
@@ -141,6 +173,7 @@ void fn_register(uint64_t guest_addr, GuestFn fn) {
     }
     t->slots[h].fn.store(fn, std::memory_order_relaxed);
     t->slots[h].addr.store(guest_addr, std::memory_order_release);
+    flat_put(guest_addr, fn);
     t->used++;
     g_fn_count.fetch_add(1, std::memory_order_relaxed);
 }
@@ -162,6 +195,7 @@ size_t fn_count() { return g_fn_count.load(std::memory_order_relaxed); }
 void fn_clear() {
     std::lock_guard<std::mutex> lk(g_write);
     g_table.store(nullptr);
+    if (nx_fn_flat) std::memset(nx_fn_flat, 0, kFlatSpan);
     g_fn_epoch.fetch_add(1, std::memory_order_release);
     g_all_tables.clear();
     g_fn_count = 0;
@@ -231,18 +265,6 @@ HleFn hle_lookup(const char* name) {
     return it == g_thunk_by_name.end() ? nullptr : g_thunks[it->second]->fn;
 }
 
-void hle_mark_leaf(const char* name) {
-    std::lock_guard<std::mutex> lk(g_hle_lock);
-    auto it = g_thunk_by_name.find(name);
-    if (it != g_thunk_by_name.end() && g_thunks[it->second]->fn) g_thunks[it->second]->leaf.store(true, std::memory_order_release);
-}
-
-HleFn hle_leaf_fn(uint64_t addr) {
-    if (!hle_is_thunk(addr)) return nullptr;
-    const Thunk& t = *g_thunks[thunk_index(addr)];
-    return t.leaf.load(std::memory_order_acquire) ? t.fn : nullptr;
-}
-
 bool hle_is_thunk(uint64_t addr) {
     return addr - mem::kHleBase < mem::kHleSize && thunk_index(addr) < g_thunk_count.load(std::memory_order_acquire);
 }
@@ -300,6 +322,13 @@ void dispatch_call(::Ctx* c, uint64_t addr) {
     // HLE thunks live in their own address range, away from every lifted function: no hash lookup for them
     const bool in_hle_range = addr - mem::kHleBase < mem::kHleSize;
     if (!in_hle_range) {
+        const uint64_t i = flat_index(addr);
+        if (i < __atomic_load_n(&nx_fn_flat_n, __ATOMIC_ACQUIRE)) {
+            if (const uint32_t off = __atomic_load_n(&nx_fn_flat[i], __ATOMIC_ACQUIRE)) {
+                reinterpret_cast<GuestFn>(nx_fn_flat_host + off)(c);
+                return;
+            }
+        }
         const uint32_t ep = g_fn_epoch.load(std::memory_order_acquire);
         if (t_fn_epoch != ep) {
             std::memset(t_fn_cache, 0, sizeof t_fn_cache);

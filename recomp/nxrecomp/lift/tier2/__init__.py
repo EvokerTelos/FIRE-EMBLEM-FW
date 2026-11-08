@@ -8,6 +8,7 @@ what Wonder's own test accepted (NaN payloads "both NaN", estimates "more precis
 Tier2.lift(fn, w, pc) -> one statement for the instruction word w at address pc, or raises Unimpl. Branches are never seen
 here: tier 1 handles every branch.
 """
+import re
 import struct
 
 import capstone
@@ -32,6 +33,9 @@ from .x_pac import XPac
 
 class Tier2(XFp, XLdst, XLse, XPac, XNeon1, XNeon2, LseOps, ExtOps, VecLdSt, IntOps, FpOps, NeonOps, NeonWideOps, MiscOps):
     _shared = None
+    # The ported FP lane emitters name the V128 view after the element size; V128 (ctx.h) has no half-precision view, so a
+    # FEAT_FP16 vector form they do not special-case would not compile. Such a form is reported as not translated (debug note 010).
+    NO_VIEW = re.compile(r"\.f16\[")
 
     @classmethod
     def shared(cls):
@@ -53,7 +57,10 @@ class Tier2(XFp, XLdst, XLse, XPac, XNeon1, XNeon2, LseOps, ExtOps, VecLdSt, Int
         h = getattr(self, 'i_' + mn.replace('.', '_'), None)
         try:
             if h:
-                return h(f, i, ops)
+                out = h(f, i, ops)
+                if self.NO_VIEW.search(out):
+                    raise Unhandled("half-precision lanes")
+                return out
             if self.LSE.match(mn):
                 return self.lse(i, ops)
         except Unhandled as e:

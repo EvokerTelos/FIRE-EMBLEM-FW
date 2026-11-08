@@ -3,10 +3,23 @@
 C++20 library plus CLI (`astc2bc7`) that turns ASTC LDR / sRGB textures (all 14 footprints, 4x4 to 12x12) into BC7, once,
 at setup time, so the renderer never keeps 4 to 9 times larger RGBA8 copies. BCn input is copied through untouched.
 
-Pipeline: ASTC to RGBA8 with ARM astcenc 5.7.0, then BC7 with `bc7e` (ISPC, from bc7enc_rdo). Both stages are
+Pipeline: ASTC to RGBA8 with ARM astcenc 5.7.0, then BC7 with `bc7e` (from bc7enc_rdo). Both stages are
 multithreaded (decode in bands of block rows, one astcenc context per thread; encode in 64-block chunks).
-astcenc is built decode-only as three DLLs (`astcdec-avx2/sse4.1/sse2-shared.dll`) and the one the CPU supports is loaded at run time;
-bc7e's ISPC object carries sse4, avx2 and avx512 paths with its own dispatch.
+
+Two builds of the same library (CMake `A2B_BC7E`, `scripts/build.ps1 [-Ispc]`):
+
+- `cpp` (default): bc7e translated to C++ by `scripts/port_bc7e.py` (`src/bc7e_cpp.cpp`, generated: the ISPC qualifiers dropped, the
+  block loop and `cif`/`cfor` made plain C++, ISPC's 64-bit `uint16_t` and float constants kept). It is compiled twice, for baseline
+  x86-64 and for AVX2 + FMA, and `src/bc7e_cpp_dispatch.cpp` picks one by CPUID (the AVX2 one is about 1.35 times as fast, the same
+  quality; `A2B_BC7E_SCALAR=1` forces the other). astcenc's
+  decoder is compiled into the library (SSE2, `A2B_ASTC_STATIC`): no DLLs. No ISPC compiler is involved. The runtime builds exactly
+  this from source when no ispc build exists (`cmake/a2b_cpp.cmake`, included by `runtime/cmake/gfx.cmake`).
+- `ispc`: bc7e.ispc through the ISPC compiler (sse4, avx2 and avx512 paths with its own dispatch); astcenc decode-only as three DLLs
+  (`astcdec-avx2/sse4.1/sse2-shared.dll`), the one the CPU supports loaded at run time. The same presets and quality, an estimated
+  3 to 4 times faster encode.
+
+`a2b_bc7_encoder()` says which one a program has; the runtime starts the C++ build at a cheaper preset (`[nvn] bc7_quality` 1, no
+background re-encode; `runtime/docs/CONFIG.md`).
 
 ## Behaviour that matters
 
@@ -21,10 +34,32 @@ bc7e's ISPC object carries sse4, avx2 and avx512 paths with its own dispatch.
 
 ```powershell
 powershell -File tools\textures\scripts\fetch_third_party.ps1     # astc-encoder 5.7.0, bc7enc_rdo, ISPC 1.32.0 into third_party\
-pwsh -File tools\textures\scripts\build.ps1                       # CMake + Ninja + clang-cl -> build\release\astc2bc7.exe + 3 DLLs
+pwsh -File tools\textures\scripts\build.ps1                       # C++ build: CMake + Ninja + clang-cl (runtime\scripts\env.cmd) -> build\release\astc2bc7.exe
+pwsh -File tools\textures\scripts\build.ps1 -Ispc                 # ISPC build -> build\release\astc2bc7.exe + 3 DLLs (+ bc7e_ispc.lib)
 build\release\astc2bc7.exe in.astc out.dds --srgb [--quality 5] [--threads N] [--dump-rgba f.rgba] [--bench N]
 build\release\astc2bc7.exe blocks.bin out.dds --raw 1024x1024:6x6 [--raw-out]     # bare ASTC blocks
+python -I tools\textures\scripts\port_bc7e.py                     # regenerate src\bc7e_cpp.{h,cpp} after bc7e.ispc changes
 ```
+
+### The C++ build, measured (Ryzen 5 7600X, 2026-11-03, other builds running alongside)
+
+On 22 ASTC 8x8 textures of Fire Emblem: Fortune's Weave (level 0, 64 to 2048 texels, albedo, normal, mask, AO) and on the Khronos
+images of astc-encoder's test set encoded at 4x4, 6x6, 8x8 and 12x12 (40 cases): the library's banded, threaded decode equals one
+astcenc decode of the whole image byte for byte in every case, and no opaque texel loses alpha 255. PSNR RGB of the BC7 against the
+ASTC decode, mean (min):
+
+| preset | game 8x8 (22) | Khronos (40) | 8 largest game textures: MPix/s, 10 threads | MPix per CPU second |
+|---|---|---|---|---|
+| 0 ultrafast | 58.1 (46.2) | 45.9 (37.6) | 113 | 13.0 |
+| 1 veryfast | 61.2 (46.5) | 50.9 (42.8) | 23.7 | 2.39 |
+| 2 fast | 61.3 (46.5) | | 17.5 | 1.83 |
+| 3 basic | 62.3 (47.0) | 52.4 (45.4) | 8.0 | 0.84 |
+| 4 slow | 62.3 (46.7) | | 9.4 | 1.01 |
+| 5 veryslow | 63.1 (47.4) | | 2.5 | 0.26 |
+| 6 slowest | | | 1.7 | 0.18 |
+
+bc7enc_rdo's scalar `bc7enc` (modes 1/6 opaque, 5/6/7 alpha) at uber 0 is faster (39 MPix/s) at preset-1 quality on the game set
+(60.8 dB) but leaves alpha 254 on opaque textures and loses 2 dB on the worst Khronos case, so it is not used.
 
 Library API: `include/astc2bc7.h` (`a2b_transcode`, `a2b_decode_astc_rgba8`, `a2b_encode_bc7`, `a2b_output_size`, C linkage).
 
@@ -69,6 +104,7 @@ SSIM is computed on luma of the RGB channels, also for normal maps, where it is 
 |---|---|---|
 | astcenc 5.7.0 (decoder DLLs, header) | github.com/ARM-software/astc-encoder, tag 5.7.0 | Apache-2.0 (`licenses/LICENSE.astc-encoder.Apache-2.0`) |
 | `bc7e.ispc` | github.com/richgel999/bc7enc_rdo `b9438627`, Binomial LLC | Apache-2.0 (`licenses/LICENSE.bc7enc_rdo`) |
+| `src/bc7e_cpp.h`, `src/bc7e_cpp.cpp` | `bc7e.ispc` above, translated to C++ by `scripts/port_bc7e.py` (a modified version; the files say so) | Apache-2.0 (`licenses/LICENSE.bc7enc_rdo`) |
 | `bc7decomp_ref.cpp` (oracle's `bc7dec` only) | same repo | MIT or public domain, same LICENSE |
 | ISPC 1.32.0 (build tool, not shipped) | github.com/ispc/ispc | BSD-3-Clause |
 | everything else here | written for this project | GPL-3.0-or-later |

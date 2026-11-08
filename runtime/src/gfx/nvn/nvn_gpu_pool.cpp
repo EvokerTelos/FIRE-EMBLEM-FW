@@ -210,8 +210,12 @@ PoolGpu* import_pool(MemoryPool* p) {
     const uint64_t start = reinterpret_cast<uint64_t>(p->base) & ~(align - 1);
     const uint64_t end = (reinterpret_cast<uint64_t>(p->base) + p->size + align - 1) & ~(align - 1);
     VkDeviceSize size = end - start;
+    static const bool use_view = config_get_bool("nvn", "pool_view", true);      // [nvn] pool_view = 0: import the pool's own address (slow)
+    const bool viewed = use_view && mem::heap_has_section() && start >= mem::kHeapBase && start + size <= mem::kHeapBase + mem::heap_reserved();
     const uint64_t stride = import_stride();
-    const bool chunked = stride && size > stride + import_overlap();
+    // Chunks overlap, and without private views two of them would import the same host pages: the driver refuses the second
+    // (VK_ERROR_INVALID_EXTERNAL_HANDLE, seen on the RX 9060 XT with [memory] heap_section = 0). Unviewed pools are imported whole.
+    const bool chunked = viewed && stride && size > stride + import_overlap();
     if (!chunked && size > dev.limits_ext().max_buffer_size && dev.limits_ext().max_buffer_size) {
         NXLOG_W(kTag, "pool of 0x%llx bytes is larger than maxBufferSize 0x%llx: the tail is not reachable by the GPU",
                 static_cast<unsigned long long>(size), static_cast<unsigned long long>(dev.limits_ext().max_buffer_size));
@@ -219,8 +223,7 @@ PoolGpu* import_pool(MemoryPool* p) {
     }
     g->base = reinterpret_cast<uint8_t*>(start);
     g->size = size;
-    static const bool use_view = config_get_bool("nvn", "pool_view", true);      // [nvn] pool_view = 0: import the pool's own address (slow)
-    g->viewed = use_view && mem::heap_exists() && start >= mem::kHeapBase && start + size <= mem::kHeapBase + mem::heap_reserved();
+    g->viewed = viewed;
     if (chunked) {
         g->stride = stride;
         g->clen = stride + import_overlap();
@@ -902,10 +905,15 @@ bool note_gpu_write(uint64_t gpu_address, uint64_t size, int use) {
     const uint64_t first = off / kPageBytes, last = std::min<uint64_t>((off + size - 1) / kPageBytes, m.npages - 1);
     g_wr_calls[use % 6]++;
     g_wr_pages[use % 6] += static_cast<int64_t>(last - first + 1);
-    bool stale = false;
-    for (uint64_t p = first; p <= last && !stale; ++p) stale = page_valid(m, p);
+    // word by word (page by page this was ~3.5 % of the render thread: draws note their storage buffers, MiBs each; notes/rt.md)
+    const bool stale = mem::ww::any_valid(m.ww, first, last - first + 1);
     mem::ww::invalidate(m.ww, first, last - first + 1);
-    for (uint64_t p = first; p <= last; ++p) bit_put(m.want, p, false);
+    for (uint64_t p = first; p <= last;) {
+        const uint64_t lo = p & 63, hi = std::min<uint64_t>(64, lo + (last + 1 - p));
+        const uint64_t mask = (hi - lo == 64) ? ~uint64_t{0} : (((uint64_t{1} << (hi - lo)) - 1) << lo);
+        m.want[static_cast<size_t>(p >> 6)] &= ~mask;
+        p += hi - lo;
+    }
     return stale;
 }
 
@@ -1038,22 +1046,49 @@ std::vector<OutEntry> g_out;
 std::vector<Mirror*> g_out_mirrors;
 std::atomic<size_t> g_out_n{0};
 std::atomic<uint64_t> g_out_lo{UINT64_MAX}, g_out_hi{0};   // address bounds of the entries (render thread; a quick filter)
+// Bumped (under g_out_mu, before it is released) by every function that adds, removes or re-flags entries: out_overlaps rebuilds its
+// index when it moved (read without the lock).
+std::atomic<uint64_t> g_out_gen{0};
+struct OutChanged { ~OutChanged() { ++g_out_gen; } };
+// out_add's growth of the live entries, by the generation it made (out_clear_since). Every other change of g_out keeps or drops live
+// entries (copy-backs, retirement, fetches, the end of a submission), so a range clear at some generation stays clear until a range
+// logged here after it overlaps it. Render thread (out_add's callers), under g_out_mu.
+struct OutGrow { uint64_t gen, lo, hi; };
+constexpr size_t kOutGrowLog = 256;
+OutGrow g_out_grow[kOutGrowLog];
+uint64_t g_out_grow_n = 0;
+void out_grew(uint64_t addr, uint64_t size) {
+    g_out_grow[g_out_grow_n++ % kOutGrowLog] = {g_out_gen.load(std::memory_order_relaxed), addr & ~(kPageBytes - 1),
+                                                (addr + size + kPageBytes - 1) & ~(kPageBytes - 1)};
+}
 
 // statistics (bytes and counts; the 10 s line)
 std::atomic<uint64_t> g_ob_end{0}, g_ob_gpu{0}, g_ob_fault{0}, g_ob_inval{0};
 std::atomic<uint64_t> g_why_bytes[kOutWhyCount], g_why_n[kOutWhyCount];   // GPU-reader copy-backs by reason
 std::atomic<uint64_t> g_on_fault{0}, g_on_inval{0}, g_on_deferred{0}, g_on_eager_read{0}, g_on_eager_noguard{0}, g_on_gpu_flush{0};
 
+// A word (64 pages) at a time: page by page, one locked RMW each, it was ~6 % of the render thread in Dagsion crowds (out_add on every
+// draw binding a storage buffer of hundreds of pages). A word already in the wanted state is left alone (no RMW, no cache-line write).
 void bits_set(std::atomic<uint64_t>* bm, uint64_t first, uint64_t last, bool on) {
-    for (uint64_t p = first; p <= last; ++p) {
-        const uint64_t b = uint64_t{1} << (p & 63);
-        if (on) bm[p >> 6].fetch_or(b, std::memory_order_acq_rel);
-        else bm[p >> 6].fetch_and(~b, std::memory_order_acq_rel);
+    if (first > last) return;
+    for (uint64_t w = first >> 6, wl = last >> 6; w <= wl; ++w) {
+        const uint64_t lo = w == (first >> 6) ? (first & 63) : 0, hi = w == wl ? (last & 63) : 63;
+        const uint64_t mask = (hi == 63 ? ~uint64_t{0} : ((uint64_t{1} << (hi + 1)) - 1)) & ~((uint64_t{1} << lo) - 1);
+        const uint64_t cur = bm[w].load(std::memory_order_acquire);
+        if (on) {
+            if ((cur & mask) != mask) bm[w].fetch_or(mask, std::memory_order_acq_rel);
+        } else {
+            if (cur & mask) bm[w].fetch_and(~mask, std::memory_order_acq_rel);
+        }
     }
 }
 bool bits_any(const std::atomic<uint64_t>* bm, uint64_t first, uint64_t last) {
-    for (uint64_t p = first; p <= last; ++p)
-        if ((bm[p >> 6].load(std::memory_order_acquire) >> (p & 63)) & 1) return true;
+    if (first > last) return false;
+    for (uint64_t w = first >> 6, wl = last >> 6; w <= wl; ++w) {
+        const uint64_t lo = w == (first >> 6) ? (first & 63) : 0, hi = w == wl ? (last & 63) : 63;
+        const uint64_t mask = (hi == 63 ? ~uint64_t{0} : ((uint64_t{1} << (hi + 1)) - 1)) & ~((uint64_t{1} << lo) - 1);
+        if (bm[w].load(std::memory_order_acquire) & mask) return true;
+    }
     return false;
 }
 
@@ -1064,8 +1099,10 @@ void out_register(Mirror* m) {
     std::call_once(once, [] { mem::ww::set_guard_handler([](uint64_t addr) { out_fetch(addr, kPageBytes, true); }); });
 }
 
-bool new_servable(const Mirror& m, uint64_t first, uint64_t last) {   // per page: valid, or newer in the copy and armed (the CPU has not
-    return mem::ww::all_valid_or_armed(m.ww, m.gpu_new.get(), first, last - first + 1);   // written it since); 64 pages a step
+// every page current in the copy, or newer there (a GPU result) and armed: the CPU has not written it since. 64 pages at a time: page by page
+// it was a third of the render thread in Dagsion (notes/pacing.md)
+bool new_servable(const Mirror& m, uint64_t first, uint64_t last) {
+    return mem::ww::all_valid_or_armed(m.ww, first, last - first + 1, m.gpu_new.get());
 }
 
 bool overlaps(const OutEntry& e, uint64_t lo, uint64_t hi) {      // page granular: [lo, hi) of addresses
@@ -1169,13 +1206,27 @@ bool out_add(uint64_t addr, VkDeviceSize size, VkBuffer mbuf, VkDeviceSize moff,
     const PoolHit hit = pool_lookup(addr);
     Mirror* m = hit.pool && hit.pool->gpu ? hit.pool->gpu->mirror : nullptr;
     std::lock_guard<std::mutex> lk(g_out_mu);
-    for (OutEntry& e : g_out)
+    // Entries are unique by (addr, size, m) (only this function adds them), so a remembered index that still matches is the entry the walk
+    // would find. Draws add the same ranges again and again; the walk over ~160 entries was ~3 % of the render thread (notes/rt.md).
+    static size_t recent[64];                                            // direct mapped by the range
+    static bool recent_init = false;
+    if (!recent_init) { std::fill(std::begin(recent), std::end(recent), SIZE_MAX); recent_init = true; }
+    size_t& memo = recent[((addr >> 8) ^ (size * 0x9e3779b97f4a7c15ull >> 40)) % 64];
+    auto again = [&](OutEntry& e) {
+        if (e.flushed && !e.pending) { ++g_out_gen; out_grew(e.addr, e.size); }   // live again (out_overlaps); a result written again changes nothing there
+        e.pending = true;
+        e.mbuf = mbuf; e.moff = moff; e.hbuf = host.buffer; e.hoff = host.offset;
+        if (m) bits_set(m->gpu_new.get(), e.first, e.last, true);        // a copy-back recorded earlier in this submission cleared them
+        return true;
+    };
+    if (memo < g_out.size() && g_out[memo].addr == addr && g_out[memo].size == size && g_out[memo].m == m) return again(g_out[memo]);
+    for (size_t i = 0; i < g_out.size(); ++i) {
+        OutEntry& e = g_out[i];
         if (e.addr == addr && e.size == size && e.m == m) {
-            e.pending = true;
-            e.mbuf = mbuf; e.moff = moff; e.hbuf = host.buffer; e.hoff = host.offset;
-            if (m) bits_set(m->gpu_new.get(), e.first, e.last, true);    // a copy-back recorded earlier in this submission cleared them
-            return true;
+            memo = i;
+            return again(e);
         }
+    }
     OutEntry e;
     e.addr = addr; e.size = size; e.m = m;
     e.mbuf = mbuf; e.moff = moff; e.hbuf = host.buffer; e.hoff = host.offset;
@@ -1187,6 +1238,9 @@ bool out_add(uint64_t addr, VkDeviceSize size, VkBuffer mbuf, VkDeviceSize moff,
         bits_set(m->gpu_new.get(), e.first, e.last, true);
     }
     g_out.push_back(e);
+    memo = g_out.size() - 1;
+    ++g_out_gen;
+    out_grew(addr, size);
     g_out_lo.store(std::min(g_out_lo.load(std::memory_order_relaxed), addr), std::memory_order_relaxed);
     g_out_hi.store(std::max(g_out_hi.load(std::memory_order_relaxed), addr + size), std::memory_order_relaxed);
     g_out_n.store(g_out.size(), std::memory_order_release);
@@ -1210,11 +1264,71 @@ bool out_overlaps(uint64_t addr, uint64_t size) {
     if (!out_any() || !size) return false;
     const uint64_t lo = addr & ~(kPageBytes - 1), hi = size >= UINT64_MAX - addr ? UINT64_MAX : (addr + size + kPageBytes - 1) & ~(kPageBytes - 1);
     if (hi <= (g_out_lo.load(std::memory_order_relaxed) & ~(kPageBytes - 1)) || lo >= g_out_hi.load(std::memory_order_relaxed) + kPageBytes) return false;
+    // The live entries (not copied back, or written again) as page ranges sorted by start, with the running maximum of their ends: a binary
+    // search instead of a walk over every held result for every buffer a draw binds (the walk was 15 % of the render thread in Dagsion
+    // with about 160 results held, notes/pacing.md). Rebuilt when g_out_gen moved. The index is per thread and searched without the lock
+    // (the lock on every query was ~3 % of the render thread, notes/perf.md); a change right after the check is the same as one right after
+    // the lock was released.
+    thread_local uint64_t gen = ~0ull;
+    thread_local std::vector<uint64_t> a0, a1max;
+    thread_local std::vector<std::pair<uint64_t, uint64_t>> iv;
+    // The live pages hashed into 2^15 bits: a query of a few pages whose bits are all clear holds no result (the common answer; rt agent,
+    // notes/rt.md). Empty when the live entries span too many pages to say anything.
+    constexpr size_t kBloomWords = 512;
+    constexpr uint64_t kBloomMaxPages = 8192;
+    thread_local std::vector<uint64_t> bloom;
+    auto bloom_bit = [](uint64_t page_addr) { return static_cast<size_t>(((page_addr >> 12) * 0x9e3779b97f4a7c15ull) >> 49); };
+    if (gen != g_out_gen.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(g_out_mu);
+        iv.clear();
+        for (const OutEntry& e : g_out)
+            if (!e.flushed || e.pending) iv.emplace_back(e.addr & ~(kPageBytes - 1), (e.addr + e.size + kPageBytes - 1) & ~(kPageBytes - 1));
+        std::sort(iv.begin(), iv.end());
+        a0.resize(iv.size());
+        a1max.resize(iv.size());
+        uint64_t m = 0;
+        for (size_t i = 0; i < iv.size(); ++i) {
+            a0[i] = iv[i].first;
+            m = std::max(m, iv[i].second);
+            a1max[i] = m;
+        }
+        bloom.assign(kBloomWords, 0);
+        uint64_t pages = 0;
+        for (const auto& r : iv) {
+            pages += (r.second - r.first) / kPageBytes;
+            if (pages > kBloomMaxPages) { bloom.clear(); break; }
+            for (uint64_t pa = r.first; pa < r.second; pa += kPageBytes) {
+                const size_t h = bloom_bit(pa);
+                bloom[h >> 6] |= uint64_t{1} << (h & 63);
+            }
+        }
+        gen = g_out_gen.load(std::memory_order_relaxed);
+    }
+    if (!bloom.empty() && hi - lo <= 16 * kPageBytes) {
+        bool any = false;
+        for (uint64_t pa = lo; pa < hi && !any; pa += kPageBytes) {
+            const size_t h = bloom_bit(pa);
+            any = (bloom[h >> 6] >> (h & 63)) & 1;
+        }
+        if (!any) return false;
+    }
+    const size_t k = static_cast<size_t>(std::lower_bound(a0.begin(), a0.end(), hi) - a0.begin());   // the entries that start below hi
+    return k > 0 && a1max[k - 1] > lo;
+}
+
+uint64_t out_gen() { return g_out_gen.load(std::memory_order_acquire); }
+
+bool out_clear_since(uint64_t addr, uint64_t size, uint64_t gen) {
+    const uint64_t lo = addr & ~(kPageBytes - 1), hi = (addr + size + kPageBytes - 1) & ~(kPageBytes - 1);
     std::lock_guard<std::mutex> lk(g_out_mu);
-    for (const OutEntry& e : g_out)
-        if (!e.flushed || e.pending)
-            if (overlaps(e, lo, hi)) return true;
-    return false;
+    const uint64_t n = g_out_grow_n;
+    for (uint64_t k = 0; k < n; ++k) {
+        if (k >= kOutGrowLog) return false;                  // the log does not reach back that far
+        const OutGrow& g = g_out_grow[(n - 1 - k) % kOutGrowLog];
+        if (g.gen <= gen) return true;                       // every growth after `gen` was looked at
+        if (g.lo < hi && lo < g.hi) return false;
+    }
+    return true;
 }
 
 bool out_servable(uint64_t addr, uint64_t size) {
@@ -1241,6 +1355,7 @@ uint64_t out_flush(VkCommandBuffer cb, uint64_t addr, uint64_t size, int why) {
     uint64_t bytes = 0;
     {
         std::lock_guard<std::mutex> lk(g_out_mu);
+        const OutChanged changed;
         std::vector<size_t> idx, gone;
         for (size_t i = 0; i < g_out.size(); ++i) {
             const OutEntry& e = g_out[i];
@@ -1275,6 +1390,7 @@ void out_end_submit(VkCommandBuffer cb, uint64_t serial) {
     std::vector<std::pair<uint64_t, uint64_t>> rearm;
     {
         std::lock_guard<std::mutex> lk(g_out_mu);
+        const OutChanged changed;
         std::vector<size_t> eager, gone;
         for (size_t i = 0; i < g_out.size(); ++i) {
             OutEntry& e = g_out[i];
@@ -1311,6 +1427,7 @@ void out_retire() {
     std::vector<std::pair<uint64_t, uint64_t>> rearm;
     {
         std::lock_guard<std::mutex> lk(g_out_mu);
+        const OutChanged changed;
         std::vector<size_t> gone;
         for (size_t i = 0; i < g_out.size(); ++i) {
             OutEntry& e = g_out[i];
@@ -1328,6 +1445,7 @@ void out_fetch(uint64_t addr, uint64_t size, bool by_fault) {
     if (!size || (!by_fault && !out_lazy())) return;
     const uint64_t lo = addr & ~(kPageBytes - 1), hi = (addr + size + kPageBytes - 1) & ~(kPageBytes - 1);
     std::unique_lock<std::mutex> lk(g_out_mu);
+    const OutChanged changed;
     // later results in these pages go back at the end of their submission
     for (Mirror* m : g_out_mirrors) {
         const uint64_t base = reinterpret_cast<uint64_t>(m->pg->base), end = base + m->npages * kPageBytes;
@@ -1384,6 +1502,7 @@ void out_fetch(uint64_t addr, uint64_t size, bool by_fault) {
 
 void out_unregister(Mirror* m) {
     std::lock_guard<std::mutex> lk(g_out_mu);
+    const OutChanged changed;
     g_out_mirrors.erase(std::remove(g_out_mirrors.begin(), g_out_mirrors.end(), m), g_out_mirrors.end());
     // the pool is going away: its held results with it (the region's destruction makes every page writable again)
     g_out.erase(std::remove_if(g_out.begin(), g_out.end(), [m](const OutEntry& e) { return e.m == m; }), g_out.end());
@@ -1392,6 +1511,7 @@ void out_unregister(Mirror* m) {
 
 void out_reset() {
     std::lock_guard<std::mutex> lk(g_out_mu);
+    const OutChanged changed;
     std::vector<size_t> all(g_out.size());
     for (size_t i = 0; i < all.size(); ++i) { all[i] = i; g_out[i].guarded = false; }
     remove_entries(all);

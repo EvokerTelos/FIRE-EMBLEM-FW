@@ -18,7 +18,13 @@
 #include "play_display.h"
 #include "play_types.h"
 
+namespace nxrt::gfx {
+class Overlay;
+}
+
 namespace nxrt::play {
+
+class UiHost;   // play_ui.h
 
 // What play mode offers the game module. Main thread (the thread the game's frame update and input hooks run on) unless noted.
 class GameHost {
@@ -95,6 +101,9 @@ struct GamePlay {
     bool (*tweaks_tab)(Settings& edit) = nullptr;
     // F1 page, Graphics tab (kDisplayOptQuality): writes a quality preset's values ("switch2", "high", "ultra") into d. False: unknown name.
     bool (*quality_preset)(const char* name, DisplaySettings& d) = nullptr;
+    // The game's own F1 menu, in place of the base settings page (draw_settings_page) and the Diagnostics window: called every visible frame
+    // on the presenting thread inside the overlay's ImGui frame (Overlay::set_menu); it opens its own window. nullptr = the base page.
+    void (*settings_menu)(UiHost& host, gfx::Overlay& overlay) = nullptr;
 };
 
 const GamePlay* game_play();         // the registered game's table, or nullptr

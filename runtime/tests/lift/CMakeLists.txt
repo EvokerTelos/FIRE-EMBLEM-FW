@@ -45,7 +45,7 @@ function(nxrt_lift_case name)
   endif()
   nxrecomp_add_module(lift_${name} INPUT "${elf}" NAME main SHARDS 2 JOBS 2 KIND static_elf ${lift_extra})
   add_executable(liftrun_${name} "${CMAKE_CURRENT_SOURCE_DIR}/driver.cpp")
-  target_link_libraries(liftrun_${name} PRIVATE lift_${name} nxrt)
+  target_link_libraries(liftrun_${name} PRIVATE lift_${name} nxrt $<TARGET_NAME_IF_EXISTS:nxrt_gfx>)   # nxrt calls into the graphics shell
   target_link_options(liftrun_${name} PRIVATE /MAP /STACK:67108864 /HIGHENTROPYVA:NO /DEBUG)
   set_target_properties(liftrun_${name} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
   add_custom_target(lift_data_${name} DEPENDS "${elf}" "${expected}")

@@ -163,7 +163,8 @@ NXTEST(set_heap_size_misaligned_gives_0xCA01) {
 
 NXTEST(set_heap_size_too_large_gives_0xD001) {
     setup();
-    CHECK_EQ(svc(0x01, 0, 0x100000000ull + 0x200000ull).rc, kRcD001);
+    // past the heap region: refused on every platform (Switch 1 also refuses anything over 4 GiB; Switch 2 heaps are several GiB)
+    CHECK_EQ(svc(0x01, 0, mem::kHeapMax + 0x200000ull).rc, kRcD001);
     CHECK_EQ(nxrt::svc_current_heap_size(), 0ull);
     teardown();
 }
@@ -415,10 +416,8 @@ NXTEST(map_physical_memory_commit_write_unmap) {
     CHECK_EQ(mi.type, kTypeAlias);
     CHECK_EQ(mi.size, 0x2000ull);
 
-    // MapPhysicalMemory is page granular like the console kernel's: a range that is mapped already succeeds and keeps its contents.
-    CHECK_EQ(svc(0x2C, addr, 0x2000).rc, 0u);
-    CHECK_EQ(*word_at(addr), 0x5A5Au);
-    CHECK_EQ(*word_at(addr + kPg), 0xA5A5u);
+    CHECK_EQ(svc(0x2C, addr, 0x2000).rc, 0u);       // a fully mapped range maps again as a no-op (mesosphere; nn::os VAMM relies on it)
+    CHECK_EQ(*word_at(addr), 0x5A5Au);             // and keeps its contents
     CHECK_EQ(svc(0x2D, addr, 0x2000).rc, 0u);
     CHECK_EQ(touch(addr, false), 0);
 
@@ -434,7 +433,7 @@ NXTEST(map_physical_memory_errors) {
     CHECK_EQ(svc(0x2C, addr, 0).rc, kRcCa01);
     CHECK_EQ(svc(0x2C, addr, 0x800).rc, kRcCa01);
     CHECK_EQ(svc(0x2C, mem::kHeapBase, kPg).rc, kRcD401);  // outside the alias region
-    CHECK_EQ(svc(0x2D, addr, kPg).rc, 0u);                 // never mapped: unmap releases only the mapped pages, a free page is fine
+    CHECK_EQ(svc(0x2D, addr, kPg).rc, 0u);                 // never mapped: unmap releases only mapped pages, here none
     teardown();
 }
 

@@ -281,7 +281,7 @@ class Env:
 
 
 # ---------------------------------------------------------------------------------------------------- one function
-TAILS = ('return;', 'goto', '{ jt', '{ f_', '{ h_', '{ call_indirect', 'switch (', '{ nx_', '{ if (c->x[30] == nx_lr0)')
+TAILS = ('return;', 'goto', '{ jt', '{ f_', '{ h_', '{ call_indirect', 'switch (', '{ nx_')
 
 
 def lift_function(env, entry):
@@ -331,8 +331,7 @@ def lift_function(env, entry):
         out.append('  if (nx_hook_entry(c, 0x%xULL)) return;' % entry)
     if fn.has_br_fallback:
         out.append('  uint64_t jt = 0;')
-    if fn.has_br_x30:
-        out.append('  const uint64_t nx_lr0 = c->x[30];')   # entry return address, for `br x30` (a64.py)
+        out.append('  const uint64_t lr0 = c->x[30];')   # where the caller resumes: an indirect branch there is a return
     if pads:
         out.append('  if (rp) switch (rp) {')
         out.extend('  case 0x%xULL: goto L_%x;' % (lp, lp) for lp in pads)
@@ -355,7 +354,9 @@ def lift_function(env, entry):
     if fn.has_br_fallback:
         out.append('L_dispatch: switch (jt) {')
         out.extend('  case 0x%xULL: goto L_%x;' % (pc, pc) for pc, _ in lines)
-        out.append('  default: call_indirect(c, jt); return; }')
+        # A hand-written routine may return with `br x30` (or through another register) after restoring x30 itself, e.g. Fortune's Weave's
+        # script call trampoline (main 0x7100263bf0): the caller's return address is not a function entry, so it is taken as the return.
+        out.append('  default: if (jt == lr0) return; call_indirect(c, jt); return; }')
     out.append('}')
     if two:
         out.append('void f_%x(Ctx *__restrict c) { %s }' % (entry, 'nx_catch_call(c, u_%x);' % entry if entry in env.catchers else 'u_%x(c, 0);' % entry))

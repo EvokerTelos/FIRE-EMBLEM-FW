@@ -28,7 +28,7 @@ namespace SpirvHarness
         readonly byte[] _code;        // the whole code block (0x30-byte NVN header, SPH, instructions, constant data)
         readonly int _constOff, _constSize;
         readonly int _stageSlot;      // 0 vertex/compute, 1 fragment (Ryujinx's GetStageIndex remap)
-        readonly int _localX, _localY, _localZ, _sharedSize;
+        int _localX, _localY, _localZ, _sharedSize;
         int _staticTextures, _staticImages, _arrayTextures, _arrayImages;
         // Tessellation evaluation input layout (domain, spacing, winding) from the NVN2 control section; see TessFromNvn2Control.
         readonly TessPatchType _tessPatchType = TessPatchType.Triangles;
@@ -59,14 +59,13 @@ namespace SpirvHarness
             _localX = _localY = _localZ = 1;
             if (Program.IsNvn2(ctrl))
             {
-                // NVN2 (Switch 2) control section, docs/AMPERE.md section 3: work group +0x58..+0x60, shared memory +0x64 (+0x50 is the local
-                // memory size, non-zero exactly when the SASS has LDL/STL; docs/nvn2_layout_xcheck.md).
+                // NVN2 (Switch 2) control section, docs/AMPERE.md section 3: work group +0x58..+0x60, shared memory +0x50.
                 if (stage == ShaderStage.Compute)
                 {
                     _localX = Math.Max(1, BitConverter.ToInt32(ctrl, 0x58));
                     _localY = Math.Max(1, BitConverter.ToInt32(ctrl, 0x5c));
                     _localZ = Math.Max(1, BitConverter.ToInt32(ctrl, 0x60));
-                    _sharedSize = BitConverter.ToInt32(ctrl, 0x64);
+                    _sharedSize = BitConverter.ToInt32(ctrl, 0x50);
                 }
                 if (stage == ShaderStage.TessellationEvaluation)
                     (_tessPatchType, _tessSpacing, _tessCw) = TessFromNvn2Control(ctrl, Messages);
@@ -80,6 +79,12 @@ namespace SpirvHarness
             // Shared memory bytes: control +0x754 (0 exactly for the compute shaders without shared memory). Without
             // it the translator declares its default, 0xc000, past the 32 KB Metal allows (docs/nvn/DEBUG.md #23).
             if (!Program.IsNvn2(ctrl) && ctrl != null && ctrl.Length >= 0x758) _sharedSize = BitConverter.ToInt32(ctrl, 0x754);
+        }
+
+        /// CUDA kernels: the work group and static shared memory come from the kernel descriptor, not a control section.
+        public void SetCompute(int x, int y, int z, int sharedBytes)
+        {
+            (_localX, _localY, _localZ, _sharedSize) = (Math.Max(1, x), Math.Max(1, y), Math.Max(1, z), sharedBytes);
         }
 
         // NVN2 tessellation evaluation blocks keep their GLSL input layout in the control section as GL enums: +0x58 domain
@@ -127,13 +132,21 @@ namespace SpirvHarness
             return offset >= 0 && offset + 4 <= _constSize ? BitConverter.ToUInt32(_code, _constOff + offset) : 0;
         }
 
+        // NVN2 constant banks 18..31 (c[0x18]: push constants) and storage slots 16..31 get a range after every stage's Maxwell-sized
+        // range, so the bindings of Ryujinx's layout keep their numbers (ampere-resource-slots.patch).
+        const int ExtraUniformBuffersPerStage = 14, ExtraStorageBuffersPerStage = 16;
+
         public SetBindingPair CreateConstantBufferBinding(int index)
         {
+            if (index >= MaxUniformBuffersPerStage)
+                return new(UniformSet, ShaderStages * MaxUniformBuffersPerStage + ReservedUniformBuffers + _stageSlot * ExtraUniformBuffersPerStage + index - MaxUniformBuffersPerStage);
             return new(UniformSet, _stageSlot * MaxUniformBuffersPerStage + index + ReservedUniformBuffers);
         }
 
         public SetBindingPair CreateStorageBufferBinding(int index)
         {
+            if (index >= MaxStorageBuffersPerStage)
+                return new(StorageSet, ShaderStages * MaxStorageBuffersPerStage + _stageSlot * ExtraStorageBuffersPerStage + index - MaxStorageBuffersPerStage);
             return new(StorageSet, _stageSlot * MaxStorageBuffersPerStage + index);
         }
 
@@ -185,10 +198,14 @@ namespace SpirvHarness
             return false;
         }
 
+        // NVN2: the runtime never writes the driver's c[0] draw parameters (0x640 base vertex, 0x644 base instance, 0x648 draw
+        // index) but passes them to Vulkan, so Ryujinx's DrawParametersReplace reads them from the built-ins instead.
+        public bool DrawParametersFromBuiltIns;
+
         public bool QueryHasConstantBufferDrawParameters()
         {
             DrawTimeQueries.Add("drawParameters");
-            return false;
+            return DrawParametersFromBuiltIns;
         }
 
         public int QueryComputeLocalSizeX() => _localX;
@@ -196,17 +213,13 @@ namespace SpirvHarness
         public int QueryComputeLocalSizeZ() => _localZ;
         public int QueryComputeSharedMemorySize() => _sharedSize;  // 0: the translator uses 4 KB (never happens here)
 
-        // Sizes of bindless arrays: pool sizes are draw-time state; a fixed bound makes the SPIR-V valid.
-        public int QuerySamplerArrayLengthFromPool() { DrawTimeQueries.Add("poolSize"); return 4096; }
-        public int QueryTextureArrayLengthFromPool() { DrawTimeQueries.Add("poolSize"); return 4096; }
-        // Arrays of handles in a uniform block (BindlessToArray): Ryujinx indexes them from the start of the buffer, 8 bytes per
-        // handle, so the length must reach the table's offset too (FEFW's light-probe cubemaps: c[6] + 0x340 + 8i, index 0x68 + i).
-        // 256 covers handles in the first 2 KiB; the runtime writes every element (dummy texture where the word is no handle).
-        public int QueryTextureArrayLengthFromBuffer(int slot) { DrawTimeQueries.Add("cbufSize"); return 256; }
-
-        // Bindless handles that come from memory (LDG/storage) would need the whole texture and sampler pools as descriptor arrays
-        // (Ryujinx GenerateBindlessAccess); the runtime has no pool arrays, so BindlessElimination drops those samples (result 0, logged).
-        public bool QueryHostSupportsSeparateSampler() => false;
+        // Sizes of bindless arrays: pool sizes are draw-time state; a fixed bound makes the SPIR-V valid. Handles index the pools
+        // with 20 texture bits and 12 sampler bits, so 4096 covers every sampler id; textures default to 65536 (Eden-NS2 saw ids
+        // past 6000 in Fortune's Weave). --texture-pool / --sampler-pool override them; the runtime's pool arrays must match.
+        public static int TexturePoolLength = 65536, SamplerPoolLength = 4096;
+        public int QuerySamplerArrayLengthFromPool() { DrawTimeQueries.Add("poolSize"); return SamplerPoolLength; }
+        public int QueryTextureArrayLengthFromPool() { DrawTimeQueries.Add("poolSize"); return TexturePoolLength; }
+        public int QueryTextureArrayLengthFromBuffer(int slot) { DrawTimeQueries.Add("cbufSize"); return 32; }
 
         // Default graphics state: triangles, no alpha test (emulated in the shader on Vulkan), every vertex attribute
         // and render target float, origin upper left (what Ryujinx passes on Vulkan). All of it is draw-time state.

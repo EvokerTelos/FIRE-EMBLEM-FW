@@ -12,6 +12,7 @@
 #include "nvn_core.h"
 #include "nvn_impl.h"
 #include "nvn_shaders.h"
+#include "nxrt/nvn.h"
 #include "test_framework.h"
 #include "project_root.h"
 NXTEST_GROUP(gfx_nvn_program)
@@ -289,4 +290,40 @@ NXTEST(copies_of_the_guest_object_share_the_host_object) {
     std::memcpy(&b, &a, sizeof a);   // the game copies objects around; the header still names the same host object
     CHECK(be::host_of<be::Program>(&b) == be::host_of<be::Program>(&a));
     CHECK(be::host_of<be::Program>(&a) != nullptr);
+}
+
+// NVN2's program builder (api_program.cpp): it keeps the device and the shader array with its count; nvnProgramInitializeFromBuilder is
+// nvnProgramInitialize + SetSampleShading + SetShaders and answers what SetShaders answers (no stage: initialised, 1).
+NXTEST(program_builder_initializes_the_program) {
+    setup();
+    struct Builder {
+        uint8_t bytes[0x80];   // the room nn::gfx gives it (Fortune's Weave main 0x604CB8)
+    };
+    abi::Caller<void(Builder*)> set_defaults(proc_address("nvnProgramBuilderSetDefaults"));
+    abi::Caller<void(Builder*, NVNdevice*)> set_device(proc_address("nvnProgramBuilderSetDevice"));
+    abi::Caller<NVNdevice*(const Builder*)> get_device(proc_address("nvnProgramBuilderGetDevice"));
+    abi::Caller<void(Builder*, int, const NVNshaderData*)> set_shaders(proc_address("nvnProgramBuilderSetShaders"));
+    abi::Caller<int(const Builder*)> shader_count(proc_address("nvnProgramBuilderGetShaderCount"));
+    abi::Caller<const NVNshaderData*(const Builder*)> get_shaders(proc_address("nvnProgramBuilderGetShaders"));
+    abi::Caller<NVNboolean(NVNprogram*, const Builder*)> init(proc_address("nvnProgramInitializeFromBuilder"));
+    auto fin = abi::proc<PFNNVNPROGRAMFINALIZEPROC>("nvnProgramFinalize");
+    Builder b;
+    std::memset(&b, 0xCD, sizeof b);
+    set_defaults(&b);
+    CHECK(get_device(&b) == nullptr);
+    CHECK_EQ(shader_count(&b), 0);
+    NVNdevice dev;
+    set_device(&b, &dev);
+    CHECK(get_device(&b) == &dev);
+    NVNshaderData d[2]{};
+    set_shaders(&b, 2, d);
+    CHECK_EQ(shader_count(&b), 2);
+    CHECK(get_shaders(&b) == d);
+    set_shaders(&b, 0, nullptr);
+    NVNprogram prog;
+    std::memset(&prog, 0, sizeof prog);
+    CHECK_EQ(init(&prog, &b), 1);
+    CHECK(be::host_of<be::Program>(&prog) != nullptr);
+    fin(&prog);
+    CHECK_EQ(init(nullptr, &b), 0);
 }

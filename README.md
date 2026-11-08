@@ -1,40 +1,97 @@
-# Pokopia Recomp
+# fefw-recomp
 
-Pokémon Pokopia (Switch 2) recompiled to run natively on Windows.
+A native Windows PC port of **Fire Emblem: Fortune's Weave** (Nintendo Switch 2), made by static recompilation. The game's code is
+translated to C++ and compiled into a regular Windows program, which runs on a small runtime that stands in for the console's system
+software and draws with Vulkan. It is not an emulator.
 
-[Download the latest build](https://github.com/drakolordx7/pokopia-recomp/releases/latest)
+> [!IMPORTANT]
+> **No game files are included or downloadable here.** This project contains only its own tools and runtime. To play, you need your
+> own legally dumped copy of the game; everything that reads the game happens on your PC. See [LEGAL.md](LEGAL.md).
+>
+> Not affiliated with or endorsed by Nintendo or Intelligent Systems.
 
-You need your own copy of the game, version 2.0.1a: an extracted folder, or NSP/XCI files plus your keys. Not affiliated with Nintendo, The Pokémon Company or Koei Tecmo.
+## Features
+
+- Runs natively on Windows, with no emulator in between
+- 60 or 120 FPS modes, any output resolution, render scale and a temporal upscaler
+- Windowed, borderless or fullscreen
+- Keyboard and mouse or any controller, with matching button prompts
+- An in-game settings overlay (**F1**)
+- A launcher that sets everything up from your dump, with nothing else to install
 
 ## Requirements
 
 - Windows 10 or 11, 64-bit
-- GPU with Vulkan 1.3
-- 16 GB of RAM
+- A GPU with Vulkan 1.3 and an up-to-date driver
+- 16 GB of RAM and about 30 GB of free disk space
+- Your own decrypted dump of the game at update **131072**, in one of these forms:
+  - a folder with `exefs\` and `romfs\`
+  - a dump folder with `base\` and `updates\<version>\`
+  - a [`.nup`](https://github.com/a55uka/nup) package
 
-## Usage
+## Getting started
 
-1. Unzip the build and run `PokopiaLauncher.exe`.
-2. Pick your dump folder (or your NSP/XCI files and key files) and press Set up. It compiles the game on your PC (about 7 minutes), then builds the shader cache (1 to 2 hours). You can pause it and continue later.
-3. Press Play.
+1. Download `fefw-recomp-<version>-win64.zip` from the [Releases](../../releases) page and extract it to its own folder.
+2. Run `fefw-launcher.exe`.
+3. On **Setup**, choose your dump folder (or **.nup** file) and press **Set up**. The launcher checks your files, builds the game on
+   your PC and prepares the shaders. The first setup takes a while; you can **Pause** it and continue later.
+4. Press **Play**.
 
-F1 opens the settings in game. Middle mouse toggles Joy-Con 2 mouse mode for placing items.
+Your saves are in the `save\` folder next to the launcher.
+
+### Settings
+
+The launcher's **Settings** page covers resolution, frame rate, upscaling, window mode, sound and controls. Press **F1** in game for
+the overlay. Every option is described in [runtime/docs/CONFIG.md](runtime/docs/CONFIG.md).
+
+### Updating to a new release
+
+Extract the new zip to a new folder, copy your `save\` folder into it, and run **Set up** again.
+
+## Troubleshooting
+
+- **"These game files are a different version"**: only update 131072 is supported. Check that you dumped the update, not only the
+  base game.
+- **Setup stopped or failed**: press **Set up** again to continue where it stopped. **Open full log** on the Setup page shows what
+  went wrong.
+- **The game closes or freezes**: look at `fefw.log` in the launcher's folder, and update your GPU driver.
 
 ## Reporting problems
 
-[Open an issue](../../issues/new/choose) with `pkp.log` from the session where it happened, your GPU and your Windows version.
+Open an [issue](../../issues) with `fefw.log`, your GPU, driver and Windows version, and the release you used. Please do not attach
+game files or anything made from them.
 
-## Contributing
+## Building from source
 
-- Open pull requests against `main` and say what you tested on which GPU.
-- Code for this game goes in `recomp/games/pkp/` and `runtime/games/pkp/`; the rest is shared with other games.
-- Building from source needs Visual Studio 2022 Build Tools or newer, LLVM, CMake, Ninja, Python 3.13, .NET 8 SDK, vcpkg with `libvpx:x64-windows-static`, Rust and Node.js. Copy the game's `exefs` files to `game\dump\exefs\`, run `recomp\scripts\build_game.cmd pkp` in a Developer Command Prompt, then `pwsh -File game-build\scripts\build.ps1`. Shaders: [tools/shaders/README.md](tools/shaders/README.md). Launcher: `npm install`, `npm run tauri build` in `launcher\`.
-- Runtime tests: `pwsh -File runtime\scripts\build.ps1 -Test`.
+See [docs/BUILDING.md](docs/BUILDING.md). Contributions are welcome.
 
 ## Credits
 
-Built on [nxrecomp](https://github.com/drakolordx7/nxrecomp). Uses code from [Ryujinx](https://github.com/Ryubing/Ryujinx), [Mesa](https://gitlab.freedesktop.org/mesa/mesa), smo-recomp, ScarletNX, ssbu-recomp, SuperMarioWonderRecomp, yuzu, Eden, libnx, [astc-encoder](https://github.com/ARM-software/astc-encoder), [bc7enc_rdo](https://github.com/richgel999/bc7enc_rdo), [libvpx](https://chromium.googlesource.com/webm/libvpx), AMD FidelityFX, NVIDIA Image Scaling, [SDL3](https://github.com/libsdl-org/SDL), [Tauri](https://tauri.app), [Zig](https://ziglang.org) and Python, plus [Kenney input prompts](https://kenney.nl/assets/input-prompts) and DejaVu fonts. Licences are in `runtime/THIRD_PARTY_NOTICES.md`, `recomp/THIRD_PARTY.md` and `tools/shaders/licenses/`.
+This project stands on the work of others. Thank you.
+
+- [nxrecomp](https://github.com/drakolordx7/nxrecomp) by drakolordx7: the recompiler this is built on.
+- [pokopia-recomp](https://github.com/drakolordx7/pokopia-recomp) (drakolordx7) and [featureJosh/pokopia-recomp](https://github.com/featureJosh/pokopia-recomp)
+  (featureJosh): the runtime, tools and launcher this project started from (GPL-3.0).
+- [drakolordx7/switch2-recomp](https://github.com/drakolordx7/switch2-recomp): the launcher design this launcher follows.
+- [nxnative-penis6](https://git.eden-emu.dev/penis6/nxnative-penis6) by seedds (MIT): the movie decoder front end, its dav1d copy and
+  several hardware facts (notices in `runtime/THIRD_PARTY_NOTICES.md`).
+- [Ryujinx / Ryubing](https://git.ryujinx.app/ryubing/ryujinx) (MIT): the shader translator and tiling code; [Mesa](https://gitlab.freedesktop.org/mesa/mesa) NAK (MIT).
+- SuperMarioWonderRecomp (MIT); smo-recomp, ScarletNX and ssbu-recomp (GPL-3.0); [yuzu and Eden](https://git.eden-emu.dev/eden-emu/eden)
+  (GPL); libnx (ISC); LLVM libc++abi (Apache-2.0 with LLVM exceptions).
+- [zbic](https://github.com/kinnay/zbic) by Yannik Marchand (GPLv2; installed by pip at setup, not included here): ZBIC decompression.
+- [dav1d](https://code.videolan.org/videolan/dav1d) (BSD-2-Clause), [libvpx](https://chromium.googlesource.com/webm/libvpx) (BSD-3-Clause),
+  [Zstandard](https://github.com/facebook/zstd) (BSD), [SDL3](https://github.com/libsdl-org/SDL) (zlib), volk, VulkanMemoryAllocator, Dear ImGui (MIT),
+  Vulkan-Headers (Apache-2.0 or MIT).
+- [astc-encoder](https://github.com/ARM-software/astc-encoder) (Apache-2.0), [bc7enc_rdo](https://github.com/richgel999/bc7enc_rdo)
+  (MIT or public domain), ISPC (BSD-3-Clause).
+- AMD FidelityFX SDK headers and FSR (MIT), NVIDIA Image Scaling (MIT), NVIDIA Streamline headers (MIT). No NVIDIA or AMD binaries are
+  included; DLSS is not used or distributed.
+- [Sascha Willems' Vulkan samples](https://github.com/SaschaWillems/Vulkan) (MIT): the stand-in shader test corpus.
+- [Kenney input prompts](https://kenney.nl/assets/input-prompts) (CC0), DejaVu fonts, [Tauri](https://tauri.app), [Lucide](https://lucide.dev) icons (ISC).
+
+Licence texts: `runtime/THIRD_PARTY_NOTICES.md`, `recomp/THIRD_PARTY.md`, `tools/*/licenses/`, `tools/textures/THIRD_PARTY.md` and the
+licence files inside `runtime/third_party/`. All of these licences are compatible with the GPL-3.0 this project is released under.
 
 ## License
 
-GPL-3.0. Third-party code keeps its own licence.
+GPL-3.0 ([LICENSE](LICENSE)). Third-party code keeps its own licence.

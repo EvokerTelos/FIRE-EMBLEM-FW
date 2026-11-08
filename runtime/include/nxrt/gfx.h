@@ -117,14 +117,16 @@ struct DeviceFeatures {
     bool extended_dynamic_state3 = false, vertex_input_dynamic_state = false;
     bool graphics_pipeline_library = false;   // VK_EXT_graphics_pipeline_library (pipelines linked from separately compiled parts, S24)
     bool external_memory_host = false, push_descriptor = false;
+    bool full_screen_exclusive = false;       // VK_EXT_full_screen_exclusive (Windows): swapchains say exclusive mode is not allowed
     bool dynamic_rendering_unused_attachments = false;
     bool transform_feedback = false, transform_feedback_queries = false;   // VK_EXT_transform_feedback (the feedback queries: transformFeedbackQueries)
-    bool fragment_shading_rate = false;   // VK_KHR_fragment_shading_rate with pipelineFragmentShadingRate (NVN2 shading rate image, nvn_small.h)
-    bool conservative_raster_dynamic = false;   // VK_EXT_conservative_rasterization + the extended-dynamic-state-3 mode / overestimation size (NVN2 conservative raster)
     bool index_type_uint8 = false;        // VK_EXT/KHR_index_type_uint8 (8-bit index buffers, indexTypeUint8)
     bool debug_labels = false;            // VK_EXT_debug_utils is enabled on the instance (command buffer labels)
     bool occlusion_query = false, occlusion_query_precise = false, pipeline_statistics_query = false;
     bool sparse_binding = false, sparse_residency_image2d = false, sparse_residency_image3d = false, sparse_residency_aliased = false;
+    // VK_EXT_pipeline_robustness for uniform buffers only: 0 none, 1 robustBufferAccess, 2 robustBufferAccess2 (reads past the bound
+    // range give zero, as the console's constant buffers do)
+    int ubo_robustness = 0;
     // Display extras (S14): HDR swapchains and low-latency markers. Enabled whenever the GPU / driver offers them; used only when the settings ask.
     bool swapchain_colorspace = false;    // VK_EXT_swapchain_colorspace (instance): HDR10 and scRGB colour spaces in the surface format list
     bool hdr_metadata = false;            // VK_EXT_hdr_metadata
@@ -138,8 +140,6 @@ struct DeviceLimitsExt {
     uint64_t max_buffer_size = 0;
     uint32_t subgroup_size = 0, subgroup_ops = 0;
     uint32_t max_memory_allocation_count = 0;
-    float cons_max_extra = 0, cons_granularity = 0;   // VK_EXT_conservative_rasterization: maxExtraPrimitiveOverestimationSize, extraPrimitiveOverestimationSizeGranularity
-    uint32_t fsr_sizes = 0;   // VK_KHR_fragment_shading_rate: bit (log2(w) * 3 + log2(h)) = a fragment size of 1 sample the device supports (w, h in 1, 2, 4)
 };
 
 class Device {
@@ -271,9 +271,18 @@ public:
     // the command buffer (GPU timestamp 0) and puts the image in COLOR_ATTACHMENT_OPTIMAL. Returns false when there is nothing
     // to draw (window minimised / zero extent, swapchain being recreated): the caller waits for events and tries again.
     bool begin_frame(FrameInfo* out);
+    // Command buffers that go to the GPU in end_frame's own vkQueueSubmit2, before the frame's command buffer, and a timeline value
+    // that submission signals: one kernel submission for a frame's work and its present. They wait for the swapchain image with the rest.
+    struct SubmitPrefix {
+        const VkCommandBuffer* cmds = nullptr;
+        uint32_t count = 0;
+        VkSemaphore timeline = VK_NULL_HANDLE;
+        uint64_t value = 0;
+        bool submitted = false;           // out: vkQueueSubmit2 succeeded
+    };
     // Runs the overlay hook, finishes and submits the command buffer (GPU timestamp 1), saves a requested screenshot and
     // presents.
-    void end_frame();
+    void end_frame(SubmitPrefix* prefix = nullptr);
 
     // Called from end_frame, after the caller's drawing, with the image still in COLOR_ATTACHMENT_OPTIMAL: record draws that
     // go on top (the ImGui overlay) with a dynamic-rendering pass that loads the image.

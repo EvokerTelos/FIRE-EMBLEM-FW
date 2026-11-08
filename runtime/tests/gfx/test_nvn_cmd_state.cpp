@@ -555,7 +555,7 @@ NXTEST(no_op_functions_record_nothing) {
     abi::proc<PFNNVNCOMMANDBUFFERSETPROGRAMSUBROUTINESPROC>("nvnCommandBufferSetProgramSubroutines")(&r.cb, &prog, NVN_SHADER_STAGE_VERTEX, 0, 1, subroutines);
     abi::proc<PFNNVNCOMMANDBUFFERSETTILEDCACHEACTIONPROC>("nvnCommandBufferSetTiledCacheAction")(&r.cb, static_cast<NVNtiledCacheAction>(0));
     abi::proc<PFNNVNCOMMANDBUFFERSETTILEDCACHETILESIZEPROC>("nvnCommandBufferSetTiledCacheTileSize")(&r.cb, 32, 32);
-    // (SetConservativeRasterDilate is recorded now: tests/gfx/test_nvn_small.cpp)
+    abi::proc<PFNNVNCOMMANDBUFFERSETCONSERVATIVERASTERDILATEPROC>("nvnCommandBufferSetConservativeRasterDilate")(&r.cb, 0.5f);
     abi::proc<PFNNVNCOMMANDBUFFERSETSUBPIXELPRECISIONBIASPROC>("nvnCommandBufferSetSubpixelPrecisionBias")(&r.cb, 8, 8);
     const NVNseparateTextureHandle tex{0x12};
     const NVNseparateSamplerHandle smp{0x34};

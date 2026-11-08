@@ -51,6 +51,22 @@ NXTEST(audren_get_work_buffer_size) {
     CHECK_EQ(r.result, services::res(153, 2));
 }
 
+// Switch 2 libraries spell their revision 'R' 'E' 'v' (lower case) and go up to 16 (Eden-NS2 feature_support.h): 'REv@' is accepted and sized
+// like REV15. The upper-case spelling still stops at 15 and the lower-case one at 16.
+NXTEST(audren_native_revision_16) {
+    nxsvc::Env env;
+    Session s = nxsvc::connect("audren:u");
+    REQUIRE(s.valid());
+    constexpr int32_t kRev15 = 0x3F564552, kNativeRev16 = 0x40764552, kRev16 = 0x40564552, kNativeRev17 = 0x41764552;
+    Reply r15 = s.call(1, cfg_args(config(kRev15, 4, 1, 2, 1)));
+    REQUIRE(r15.ok());
+    Reply r = s.call(1, cfg_args(config(kNativeRev16, 4, 1, 2, 1)));
+    REQUIRE(r.ok());
+    CHECK_EQ(r.get<int64_t>(0), r15.get<int64_t>(0));   // 16 adds no feature over 15
+    CHECK_EQ(s.call(1, cfg_args(config(kRev16, 4, 1, 2, 1))).result, services::res(153, 2));
+    CHECK_EQ(s.call(1, cfg_args(config(kNativeRev17, 4, 1, 2, 1))).result, services::res(153, 2));
+}
+
 NXTEST(audren_open_renderer_and_getters) {
     nxsvc::Env env;
     Session s = nxsvc::connect("audren:u");
@@ -144,4 +160,30 @@ NXTEST(audren_audio_device_service) {
     CHECK(r2.ok());
     Session dev2 = s.sub(r2);
     CHECK(dev2.valid());
+}
+
+// 17.0.0+ device notifications, ids as the SDK's proxy (methods 0-8, 10-21 in order): 15/16 input, 17/18 output. The u64 id is the SDK's
+// SystemEvent address; each id gets an event that is not signalled (no host device change). 19/20: the auto-tune flag round trip.
+NXTEST(audren_audio_device_notifications_and_auto_tune) {
+    nxsvc::Env env;
+    Session s = nxsvc::connect("audren:u");
+    Reply r = s.call(2, Args().u64(0x51));
+    REQUIRE(r.ok());
+    Session dev = s.sub(r);
+    REQUIRE(dev.valid());
+    for (uint32_t cmd : {15u, 17u}) {
+        Reply e = dev.call(cmd, Args().u64(0x7E000FFB00ull));
+        REQUIRE(e.ok());
+        REQUIRE(e.copy.size() == 1);
+        int32_t idx;
+        uint32_t h = e.copy[0];
+        CHECK_EQ(kernel::wait_synchronization(&h, 1, 0, &idx), kernel::kTimedOut);
+        kernel::handle_close(h);
+        CHECK(dev.call(cmd + 1, Args().u64(0x7E000FFB00ull)).ok());   // Release
+    }
+    CHECK(dev.call(19, Args().u8(1)).ok());
+    CHECK_EQ(dev.call(20).get<uint8_t>(0), 1u);
+    CHECK(dev.call(19, Args().u8(0)).ok());
+    CHECK_EQ(dev.call(20).get<uint8_t>(0), 0u);
+    CHECK_EQ(dev.call(21).get<uint8_t>(0), 0u);
 }

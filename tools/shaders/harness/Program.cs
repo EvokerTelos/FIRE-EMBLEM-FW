@@ -31,7 +31,7 @@ namespace SpirvHarness
 
     sealed class Result
     {
-        public string Hash, Group, Stage = "?", Status = "?", Error = "", ValError = "";
+        public string Hash, Group, Stage = "?", Status = "?", Error = "", ValError = "", Stack = "";
         public int Stages, SpvBytes;
         public double Ms;
         public List<string> Messages = new();
@@ -41,7 +41,7 @@ namespace SpirvHarness
         public List<string> Unsupported = new();
     }
 
-    static partial class Program
+    static class Program
     {
         const uint ComputeMagic = 0x12345679;
         static readonly TimeSpan Timeout = TimeSpan.FromSeconds(60);
@@ -57,12 +57,12 @@ namespace SpirvHarness
         {
             NoRetry = args.Contains("--no-retry");
             StaticGpuAccessor.DesktopHost = Opt(args, "--host", "desktop") != "moltenvk";
+            StaticGpuAccessor.TexturePoolLength = int.Parse(Opt(args, "--texture-pool", "65536"));
+            StaticGpuAccessor.SamplerPoolLength = int.Parse(Opt(args, "--sampler-pool", "4096"));
             Debug = args.Contains("--debug-mode");
             try
             {
-                if (args.Length >= 1 && args[0] == "--serve") return Serve(args);
                 if (args.Length >= 2 && args[0] == "--batch") return Batch(args);
-                if (args.Length >= 2 && args[0] == "--hwcheck") return Hwcheck(args);
                 if (args.Length >= 2 && !args[0].StartsWith("-")) return Single(args);
             }
             catch (ArgumentException e)
@@ -70,58 +70,8 @@ namespace SpirvHarness
                 Console.Error.WriteLine(e.Message);
             }
             Console.Error.WriteLine("usage: spirv_harness <code.bin> <ctrl.bin> [-o out.spv] [--glsl] [--glslc <GLSLC output, NVN2>]\n" +
-                                    "       spirv_harness --serve --cache <spirv dir> [--corpus <dir>] [--jobs N] [--priority below|idle|normal]   (protocol: Serve.cs)\n" +
                                     "       spirv_harness --batch <extracted dir> --out <dir> [--jobs N] [--limit N] [--no-val] [--no-retry] [--debug-mode] [--target-env E] [--host desktop|moltenvk] [--spirv-val PATH] [--reflect <Ampere corpus>]");
             return 2;
-        }
-
-        // --hwcheck <cases.tsv> --out <dir> [--local-x 32]: hardware-check modules (tools/shaders/hwcheck). Each line of cases.tsv is
-        // "<id>	<lo hi lo hi ...>[	<memory test>]" (16-hex-digit instruction words; memory test: AmpereHwcheck.cs); writes <dir>/<id>.spv (a compute module that runs the decoded
-        // instructions on the register file in storage buffer set 1 binding 0, see ampere/frontend/AmpereHwcheck.cs) and
-        // <dir>/hwcheck.tsv (id, status, sass text, error). Status: ok, unsupported (the front end refuses a form), exception.
-        static int Hwcheck(string[] args)
-        {
-            string outDir = Opt(args, "--out", null) ?? throw new ArgumentException("--out required");
-            int localX = int.Parse(Opt(args, "--local-x", "32"));
-            Directory.CreateDirectory(outDir);
-            byte[] ctrl = new byte[0xd8];
-            BitConverter.GetBytes(0x98761234u).CopyTo(ctrl, 0);
-            BitConverter.GetBytes(201u).CopyTo(ctrl, 4);
-            BitConverter.GetBytes((ushort)5).CopyTo(ctrl, 0x56);
-            BitConverter.GetBytes(localX).CopyTo(ctrl, 0x58);
-            BitConverter.GetBytes(1).CopyTo(ctrl, 0x5c);
-            BitConverter.GetBytes(1).CopyTo(ctrl, 0x60);
-            BitConverter.GetBytes(AmpereTranslator.HwcheckSharedBytes).CopyTo(ctrl, 0x64);   // shared memory size (+0x64; +0x50 is local memory), declared only when a test uses it
-            var lines = File.ReadAllLines(args[1]).Where(l => l.Length > 0 && l[0] != '#').ToList();
-            var rows = new string[lines.Count];
-            Parallel.For(0, lines.Count, new ParallelOptions { MaxDegreeOfParallelism = 4 }, k =>
-            {
-                string[] f = lines[k].Split('\t');
-                string id = f[0];
-                ulong[] w = f[1].Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(x => Convert.ToUInt64(x, 16)).ToArray();
-                var insts = new List<SassInst>();
-                for (int n = 0; n + 1 < w.Length; n += 2) insts.Add(SassDecoder.Decode(w[n], w[n + 1], n * 8));
-                string text = string.Join(" | ", insts.Select(x => x.ToSassText()));
-                string status = "ok", err = "";
-                try
-                {
-                    StaticGpuAccessor gpu = new(Array.Empty<byte>(), 0, 0, ShaderStage.Compute, ctrl);
-                    TranslationOptions options = new(TargetLanguage.Spirv, TargetApi.Vulkan, TranslationFlags.Compute);
-                    TranslatorContext tctx = AmpereTranslator.CreateHwcheckContext(gpu, options, insts, out AmpereProgram prog, f.Length > 2 ? f[2] : null);
-                    ShaderProgram sp = tctx.Translate();
-                    if (prog.Unsupported.Count > 0) { status = "unsupported"; err = string.Join("; ", prog.Unsupported); }
-                    else File.WriteAllBytes(Path.Combine(outDir, id + ".spv"), sp.BinaryCode);
-                }
-                catch (Exception e)
-                {
-                    status = "exception";
-                    err = $"{e.GetType().Name}: {e.Message}";
-                }
-                rows[k] = $"{id}\t{status}\t{text}\t{err.Replace('\t', ' ').Replace('\n', ' ')}";
-            });
-            File.WriteAllLines(Path.Combine(outDir, "hwcheck.tsv"), rows);
-            Console.WriteLine($"hwcheck: {rows.Count(r => r.Split('\t')[1] == "ok")} of {rows.Length} translated -> {outDir}");
-            return 0;
         }
 
         // spirv-val: $VULKAN_SDK\Bin, else the PATH.
@@ -152,6 +102,7 @@ namespace SpirvHarness
             foreach (string m in r.Unsupported) Console.WriteLine($"unsupported: {m}");
             if (r.Reflection != "") Console.WriteLine($"glslc reflection: {r.Reflection}");
             if (r.Error != "") Console.WriteLine($"error: {r.Error}");
+            if (r.Stack != "" && args.Contains("--trace")) Console.WriteLine(r.Stack);
             return spv != null ? 0 : 1;
         }
 
@@ -159,6 +110,7 @@ namespace SpirvHarness
         static Result Translate(byte[] code, byte[] ctrl, out byte[] spv, bool glsl = false, string glslcPath = null)
         {
             if (IsNvn2(ctrl)) return TranslateNvn2(code, ctrl, out spv, glsl, glslcPath);
+            if (CudaKernel.Is(ctrl)) return TranslateCuda(code, ctrl, out spv, glsl);
             Result r = new();
             spv = null;
             int start = BitConverter.ToInt32(ctrl, 0x708);
@@ -204,9 +156,9 @@ namespace SpirvHarness
                 {
                     r.Status = "exception";
                     r.Error = $"{e.GetType().Name}: {e.Message}";
+                    r.Stack = e.StackTrace ?? "";
                     string frame = e.StackTrace?.Split('\n').FirstOrDefault(l => l.Contains("Ryujinx.Graphics.Shader"))?.Trim();
                     if (frame != null) r.Error += $" @ {Regex.Replace(frame, @" in (/|[A-Za-z]:\\).*", "")}";
-                    if (Environment.GetEnvironmentVariable("NX_HARNESS_STACK") == "1") Console.Error.WriteLine(e);   // whole stack on stderr
                 }
                 lock (gpu.Messages) r.Messages = gpu.Messages.Distinct().ToList();
                 r.Queries = string.Join(',', gpu.DrawTimeQueries);
@@ -253,7 +205,7 @@ namespace SpirvHarness
             {
                 // Address 0 of the accessor's code is the SPH (graphics) or the first instruction (compute); the constant
                 // data offset (+0x40) is from the start of the code area in both cases.
-                StaticGpuAccessor gpu = new(code, constOff, constSize, stage, ctrl);
+                StaticGpuAccessor gpu = new(code, constOff, constSize, stage, ctrl) { DrawParametersFromBuiltIns = true };
                 if (refl != null) foreach (var h in refl.BufferTextureHandles(nvnStage, ctrl)) gpu.BufferTextures.Add(h);
                 else foreach (var h in BufferFetchHandles(insts, compute)) gpu.BufferTextures.Add(h);
                 TranslationFlags flags = (compute ? TranslationFlags.Compute : TranslationFlags.None) |
@@ -279,9 +231,9 @@ namespace SpirvHarness
                 {
                     r.Status = "exception";
                     r.Error = $"{e.GetType().Name}: {e.Message}";
+                    r.Stack = e.StackTrace ?? "";
                     string frame = e.StackTrace?.Split('\n').FirstOrDefault(l => l.Contains("Ryujinx.Graphics.Shader"))?.Trim();
                     if (frame != null) r.Error += $" @ {Regex.Replace(frame, @" in (/|[A-Za-z]:\\).*", "")}";
-                    if (Environment.GetEnvironmentVariable("NX_HARNESS_STACK") == "1") Console.Error.WriteLine(e);   // whole stack on stderr
                 }
                 if (prog != null && prog.Unsupported.Count > 0)
                 {
@@ -297,6 +249,113 @@ namespace SpirvHarness
             }
             r.Ms = sw.Elapsed.TotalMilliseconds;
             return r;
+        }
+
+        // One CUDA kernel (DLSS, subsdk0 cubins): the .text is SASS with no SPH, bank 0 is CUDA's (block and grid size at
+        // c[0][0x0..0x14], parameters from the descriptor's offset, normally 0x160), indirect branch targets come from .nv.info.
+        // Same Ampere front end as NVN2, compute only; the work group is a default the runtime overrides with specialization
+        // constants 0..2 (AddWorkgroupSizeSpecConstants).
+        static Result TranslateCuda(byte[] code, byte[] ctrl, out byte[] spv, bool glsl)
+        {
+            Result r = new() { Stage = "compute" };
+            spv = null;
+            CudaKernel k = CudaKernel.Read(ctrl);
+            int end = Math.Min(k.TextSize, code.Length) & ~0xf;
+            Stopwatch sw = Stopwatch.StartNew();
+            IReadOnlyList<SassInst> insts = SassDecoder.DecodeBlock(code, 0, end);
+            for (int attempt = 1; attempt <= (glsl || NoRetry ? 1 : 2); attempt++)
+            {
+                StaticGpuAccessor gpu = new(code, 0, 0, ShaderStage.Compute, null);
+                (int x, int y, int z) = k.LocalSize;
+                gpu.SetCompute(x, y, z, k.Shared);
+                TranslationFlags flags = TranslationFlags.Compute | (attempt == 2 || Debug ? TranslationFlags.DebugMode : TranslationFlags.None);
+                TranslationOptions options = new(glsl ? TargetLanguage.Glsl : TargetLanguage.Spirv, TargetApi.Vulkan, flags);
+                AmpereProgram prog = null;
+                try
+                {
+                    TranslatorContext tctx = AmpereTranslator.CreateContext(gpu, options, insts, out prog, k.IndirectTargets, cuda: true);
+                    ShaderProgram sp = tctx.Translate();
+                    if (prog.Unsupported.Count == 0)
+                    {
+                        spv = glsl ? Encoding.UTF8.GetBytes(sp.Code) : sp.BinaryCode;
+                        if (!glsl && spv != null && sp.Info.Images.Count > 0) spv = AddImageWithoutFormatCapabilities(spv);
+                        if (!glsl && spv != null) spv = AddWorkgroupSizeSpecConstants(spv);
+                        r.SpvBytes = spv?.Length ?? 0;
+                        r.Status = spv == null ? "no-output" : attempt == 1 ? "ok" : "ok-retry";
+                        r.Resources = DescribeResources(sp.Info);
+                    }
+                }
+                catch (Exception e)
+                {
+                    r.Status = "exception";
+                    r.Error = $"{e.GetType().Name}: {e.Message}";
+                    r.Stack = e.StackTrace ?? "";
+                    string frame = e.StackTrace?.Split('\n').FirstOrDefault(l => l.Contains("Ryujinx.Graphics.Shader"))?.Trim();
+                    if (frame != null) r.Error += $" @ {Regex.Replace(frame, @" in (/|[A-Za-z]:\\).*", "")}";
+                }
+                if (prog != null && prog.Unsupported.Count > 0)
+                {
+                    r.Status = "unsupported";
+                    r.Unsupported = prog.Unsupported.ToList();
+                    r.Error = "unsupported: " + string.Join("; ", r.Unsupported.Take(8)) + (r.Unsupported.Count > 8 ? $"; ... {r.Unsupported.Count - 8} more" : "");
+                    r.SpvBytes = 0;
+                    spv = null;
+                }
+                lock (gpu.Messages) r.Messages = gpu.Messages.Distinct().ToList();
+                r.Queries = string.Join(',', gpu.DrawTimeQueries);
+                if (r.Status != "exception") break;
+            }
+            r.Ms = sw.Elapsed.TotalMilliseconds;
+            return r;
+        }
+
+        // CUDA kernels run with the block size of each launch, which the cubin does not always fix. Turn the module's
+        // LocalSize into the GLSL local_size_x_id = 0..2 form: three OpSpecConstant (default = the LocalSize values) with
+        // SpecId 0, 1, 2 and an OpSpecConstantComposite decorated BuiltIn WorkgroupSize, which overrides LocalSize.
+        static byte[] AddWorkgroupSizeSpecConstants(byte[] spv)
+        {
+            const uint OpTypeInt = 21, OpTypeVector = 23, OpExecutionMode = 16, OpDecorate = 71, OpSpecConstant = 50,
+                       OpSpecConstantComposite = 51, OpFunction = 54, OpVariable = 59, OpTypePointer = 32;
+            const uint ModeLocalSize = 17, DecorationSpecId = 1, DecorationBuiltIn = 11, BuiltInWorkgroupSize = 25;
+            uint[] all = new uint[spv.Length / 4];
+            Buffer.BlockCopy(spv, 0, all, 0, spv.Length);
+            List<uint> w = all.ToList();
+            uint bound = w[3];
+            uint[] local = null;
+            uint uintType = 0, uvec3Type = 0;
+            int firstDecorate = -1, firstTypeOrConst = -1, firstFunction = -1;
+            for (int i = 5; i < w.Count;)
+            {
+                uint op = w[i] & 0xffff, len = w[i] >> 16;
+                if (len == 0) return spv;
+                if (op == OpExecutionMode && w[i + 2] == ModeLocalSize) local = [w[i + 3], w[i + 4], w[i + 5]];
+                if (op == OpDecorate && firstDecorate < 0) firstDecorate = i;
+                if (op == OpDecorate && w[i + 2] == DecorationBuiltIn && w[i + 3] == BuiltInWorkgroupSize) return spv;
+                if (op == OpTypeInt && w[i + 2] == 32 && w[i + 3] == 0) uintType = w[i + 1];
+                if (op == OpTypeVector && uintType != 0 && w[i + 2] == uintType && w[i + 3] == 3) uvec3Type = w[i + 1];
+                if ((op is >= OpTypeInt and <= 39 || op == OpTypePointer || op == OpVariable) && firstTypeOrConst < 0) firstTypeOrConst = i;
+                if (op == OpFunction) { firstFunction = i; break; }
+                i += (int)len;
+            }
+            if (local == null || firstFunction < 0) return spv;
+            // New types (if missing) and constants go right before the first function: every type they use precedes them.
+            List<uint> decl = new();
+            if (uintType == 0) { uintType = bound++; decl.AddRange([(4u << 16) | OpTypeInt, uintType, 32, 0]); }
+            if (uvec3Type == 0) { uvec3Type = bound++; decl.AddRange([(4u << 16) | OpTypeVector, uvec3Type, uintType, 3]); }
+            uint[] ids = [bound++, bound++, bound++];
+            uint composite = bound++;
+            for (int c = 0; c < 3; c++) decl.AddRange([(4u << 16) | OpSpecConstant, uintType, ids[c], local[c]]);
+            decl.AddRange([(6u << 16) | OpSpecConstantComposite, uvec3Type, composite, ids[0], ids[1], ids[2]]);
+            List<uint> deco = new();
+            for (int c = 0; c < 3; c++) deco.AddRange([(4u << 16) | OpDecorate, ids[c], DecorationSpecId, (uint)c]);
+            deco.AddRange([(4u << 16) | OpDecorate, composite, DecorationBuiltIn, BuiltInWorkgroupSize]);
+            w.InsertRange(firstFunction, decl);
+            int decoAt = firstDecorate >= 0 ? firstDecorate : (firstTypeOrConst >= 0 ? firstTypeOrConst : firstFunction);
+            w.InsertRange(decoAt, deco);
+            w[3] = bound;
+            byte[] result = new byte[w.Count * 4];
+            Buffer.BlockCopy(w.ToArray(), 0, result, 0, result.Length);
+            return result;
         }
 
         // Blocks without a GLSLC reflection (the ones only the runtime dumped): a plain 1D TLD (no array, LOD, offset or
@@ -439,10 +498,6 @@ namespace SpirvHarness
             if (limit > 0) jobs = jobs.Take(limit).ToList();
             Console.WriteLine($"{jobs.Count} distinct code blocks, {jobsN} jobs, validation {(validate ? targetEnv : "off")}");
 
-            // Each Parallel.ForEach body waits on a pool task (the timeout guard): without spare pool threads those tasks queue behind the
-            // waiting bodies and the pool adds threads slowly, so fewer than --jobs blocks run at once.
-            ThreadPool.GetMinThreads(out int minW, out int minIo);
-            ThreadPool.SetMinThreads(Math.Max(minW, jobsN * 2 + 4), minIo);
             ConcurrentBag<Result> results = new();
             int done = 0;
             Stopwatch total = Stopwatch.StartNew();
@@ -503,19 +558,13 @@ namespace SpirvHarness
         static void WriteResults(string path, List<Result> all)
         {
             using StreamWriter w = new(path) { NewLine = "\n" };  // LF on Windows too: same bytes as on macOS
-            w.WriteLine(ResultsHeader);
-            foreach (Result r in all) w.WriteLine(FormatRow(r));
-        }
-
-        const string ResultsHeader = "hash\tgroup\tstage\tstages_using\tstatus\tms\tspv_bytes\tresources\ttranslator_messages\terror\tdraw_time_queries\tglslc_reflection";
-
-        // One results.tsv line, without CR/LF in it (--serve also sends it as one stdout line).
-        static string FormatRow(Result r)
-        {
-            string err = (r.Error + " " + r.ValError).Trim().Replace('\t', ' ');
-            string row = $"{r.Hash}\t{r.Group}\t{r.Stage}\t{r.Stages}\t{r.Status}\t{r.Ms:F1}\t{r.SpvBytes}\t{r.Resources}\t" +
-                         $"{string.Join(" | ", r.Messages).Replace('\t', ' ')}\t{err}\t{r.Queries}\t{r.Reflection}";
-            return row.Replace('\r', ' ').Replace('\n', ' ');
+            w.WriteLine("hash\tgroup\tstage\tstages_using\tstatus\tms\tspv_bytes\tresources\ttranslator_messages\terror\tdraw_time_queries\tglslc_reflection");
+            foreach (Result r in all)
+            {
+                string err = (r.Error + " " + r.ValError).Trim().Replace('\t', ' ').Replace('\n', ' ');
+                w.WriteLine($"{r.Hash}\t{r.Group}\t{r.Stage}\t{r.Stages}\t{r.Status}\t{r.Ms:F1}\t{r.SpvBytes}\t{r.Resources}\t" +
+                            $"{string.Join(" | ", r.Messages).Replace('\t', ' ')}\t{err}\t{r.Queries}\t{r.Reflection}");
+            }
         }
 
         // Group messages that differ only in numbers ("Attribute offset 0x3A0 ..." etc.) so the summary stays short.

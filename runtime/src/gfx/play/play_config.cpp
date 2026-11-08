@@ -15,6 +15,7 @@
 #include <system_error>
 #include <vector>
 
+#include "nxrt/config.h"
 #include "nxrt/game.h"
 
 namespace nxrt::play {
@@ -331,6 +332,7 @@ bool apply_fixed(Sec sec, const std::string& k, const std::string& v, Settings* 
             if (k == "label_abxy") return set_bool(&s->pad.label_abxy);
             if (k == "deadzone") return set_real(0.0, 0.5, &s->pad.stick_deadzone);
             if (k == "right_deadzone") return set_real(0.0, 0.5, &s->pad.right_deadzone);
+            if (k == "stick_max") return set_real(0.5, 1.0, &s->pad.stick_max);
             if (k == "invert_y") return set_bool(&s->pad.invert_y);
             if (k == "look_sens") return set_real(0.25, 3.0, &s->pad.look_sens);
             if (k == "trigger_threshold") return set_real(0.05, 1.0, &s->pad.trigger_threshold);
@@ -875,6 +877,7 @@ std::string format_settings(const Settings& s) {
     kv("invert_y", flag(s.pad.invert_y));
     kv("look_sens", num(s.pad.look_sens));
     kv("trigger_threshold", num(s.pad.trigger_threshold));
+    kv("stick_max", num(s.pad.stick_max));
     kv("gyro", flag(s.pad.gyro));
     kv("gyro_scale", num(s.pad.gyro_scale));
     kv("rumble", flag(s.pad.rumble));
@@ -1028,6 +1031,21 @@ bool save_settings(const std::string& path, const Settings& s, std::string* err)
             return false;
         }
     }
+    // An existing file keeps what the player wrote: comments, blank lines, key order and keys this writer does not know (nxrt::ini_merge);
+    // the bindings sections are written whole (an input may appear in several lines).
+    std::string text = format_settings(s);
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (in) {
+            std::string old((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            if (old.compare(0, 3, "\xEF\xBB\xBF") == 0) old.erase(0, 3);
+            std::vector<std::string> whole;
+            for (int c = 0; c < kCtxCount; ++c) whole.push_back(std::string("bindings.") + ctx_name(static_cast<Ctx>(c)));
+            for (std::string& w : whole)
+                for (char& ch : w) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            text = ini_merge(old, text, whole);
+        }
+    }
     // Write the whole file to a temp name first, then rename it over the target, so a crash never leaves half a file.
     const std::string tmp = path + ".tmp";
     {
@@ -1036,7 +1054,7 @@ bool save_settings(const std::string& path, const Settings& s, std::string* err)
             if (err) *err = "cannot write " + tmp;
             return false;
         }
-        out << format_settings(s);
+        out << text;
         out.flush();
         if (!out) {
             if (err) *err = "cannot write " + tmp;

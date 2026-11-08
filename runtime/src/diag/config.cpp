@@ -7,6 +7,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
@@ -29,10 +32,9 @@ struct Seen {
 std::mutex g_mu;
 // canonical id ("section" 0x1F "key", lower-case) -> value. config_set values live here too (source "ini").
 std::unordered_map<std::string, std::string> g_ini;
-// config_set_default values: the game's own defaults, under env and ini, kept across ini reloads.
-std::unordered_map<std::string, std::string> g_game_defaults;
 // every key read so far, keyed by canonical id, ordered for a stable dump.
 std::map<std::string, Seen> g_seen;
+std::string g_file;   // the path config_load_file() was last given (config_file_path)
 
 std::string S(const char* p) { return p ? std::string(p) : std::string(); }
 
@@ -71,8 +73,6 @@ Found lookup(const std::string& section, const std::string& key) {
     std::lock_guard<std::mutex> g(g_mu);
     auto it = g_ini.find(canon_id(section, key));
     if (it != g_ini.end()) return {true, it->second, "ini"};
-    auto gd = g_game_defaults.find(canon_id(section, key));
-    if (gd != g_game_defaults.end()) return {true, gd->second, "game default"};
     return {false, std::string(), "default"};
 }
 
@@ -212,6 +212,10 @@ std::string fmt_double(double v) {
 }  // namespace
 
 bool config_load_file(const char* path) {
+    {
+        std::lock_guard<std::mutex> g(g_mu);
+        g_file = S(path);
+    }
     std::FILE* f = path ? std::fopen(path, "rb") : nullptr;
     if (!f) {
         config_clear();
@@ -226,12 +230,60 @@ bool config_load_file(const char* path) {
     return true;
 }
 
-void config_set_default(const char* section, const char* key, const char* value) {
+void config_load_string(const char* text) { replace_ini(S(text)); }
+
+std::string config_file_path() {
     std::lock_guard<std::mutex> g(g_mu);
-    g_game_defaults[canon_id(S(section), S(key))] = S(value);
+    return g_file;
 }
 
-void config_load_string(const char* text) { replace_ini(S(text)); }
+bool config_write(const char* section, const char* key, const std::string& value, std::string* err) {
+    namespace fs = std::filesystem;
+    const std::string path = config_file_path();
+    if (path.empty()) {
+        if (err) *err = "no ini file in use";
+        return false;
+    }
+    // A value parse_line would cut (a comment character after a space, edge spaces, a leading quote) is written quoted.
+    std::string v = value;
+    bool quote = !v.empty() && (is_space(v.front()) || is_space(v.back()) || v.front() == '"');
+    for (size_t i = 1; i < v.size() && !quote; ++i) quote = (v[i] == ';' || v[i] == '#') && is_space(v[i - 1]);
+    if (quote) v = "\"" + v + "\"";
+    std::string base;
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (in) base.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::string sec = S(section);
+    const std::string upd = (sec.empty() ? std::string() : "[" + sec + "]\n") + S(key) + " = " + v + "\n";
+    const std::string text = ini_merge(base, upd);
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            if (err) *err = "cannot write " + tmp;
+            return false;
+        }
+        out << text;
+        out.flush();
+        if (!out) {
+            if (err) *err = "cannot write " + tmp;
+            std::error_code ec;
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        std::error_code rm;
+        fs::remove(tmp, rm);
+        if (err) *err = "cannot replace " + path + ": " + ec.message();
+        return false;
+    }
+    config_set(section, key, value.c_str());
+    return true;
+}
 
 void config_clear() {
     std::lock_guard<std::mutex> g(g_mu);

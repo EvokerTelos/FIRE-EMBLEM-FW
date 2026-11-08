@@ -43,6 +43,8 @@ namespace Ryujinx.Graphics.Shader.Translation
         internal readonly Dictionary<int, (int Start, int End)> Subroutines = new(); // CALL address -> [start, RET address]
         internal readonly IGpuAccessor Gpu;
         internal ShaderStage Stage;
+        /// CUDA kernel (DLSS): bank 0 is CUDA's (launch sizes, parameters), BRX targets come from .nv.info.
+        internal bool Cuda;
 
         /// Reasons this block cannot be translated (instruction forms the front end does not handle). Non-empty = failed.
         public List<string> Unsupported { get; } = new();
@@ -64,15 +66,18 @@ namespace Ryujinx.Graphics.Shader.Translation
         internal SassInst At(int address) => IndexOf.TryGetValue(address, out int i) ? Insts[i] : null;
     }
 
-    public static partial class AmpereTranslator
+    public static class AmpereTranslator
     {
         private const int ThreadsPerWarp = 32;
 
         /// Builds the translation context. `insts` are the program's instructions (addresses from 0 = first
         /// instruction after the SPH); the SPH itself is read through gpuAccessor at address 0 (graphics only).
-        public static TranslatorContext CreateContext(IGpuAccessor gpuAccessor, TranslationOptions options, IReadOnlyList<SassInst> insts, out AmpereProgram program)
+        public static TranslatorContext CreateContext(IGpuAccessor gpuAccessor, TranslationOptions options, IReadOnlyList<SassInst> insts, out AmpereProgram program,
+                                                     IReadOnlyDictionary<int, int[]> indirectTargets = null, bool cuda = false)
         {
-            program = new AmpereProgram(insts.ToList(), gpuAccessor);
+            program = new AmpereProgram(insts.ToList(), gpuAccessor) { Cuda = cuda };
+            if (indirectTargets != null)
+                foreach (var (brx, targets) in indirectTargets) program.IndirectTargets[brx] = targets;
             bool compute = options.Flags.HasFlag(TranslationFlags.Compute);
 
             ShaderDefinitions definitions;
@@ -298,9 +303,8 @@ namespace Ryujinx.Graphics.Shader.Translation
             {
                 case "LDL": case "STL": features |= FeatureFlags.LocalMemory; break;
                 case "LDS": case "STS": case "ATOMS": features |= FeatureFlags.SharedMemory; break;
-                case "LDSM": features |= FeatureFlags.SharedMemory | FeatureFlags.Shuffle; break;
                 case "STG": case "ATOMG": case "ATOM": case "RED": case "SUST": case "SUATOM": case "SURED": features |= FeatureFlags.Store; break;
-                case "SHFL": case "REDUX": case "MATCH": case "FSWZADD": case "HMMA": case "MOVM": features |= FeatureFlags.Shuffle; break;
+                case "SHFL": case "REDUX": case "MATCH": case "FSWZADD": features |= FeatureFlags.Shuffle; break;
                 case "ALD": case "AST": case "IPA":
                     AttributeUses(definitions, usage, ref features, ref clip, i);
                     break;

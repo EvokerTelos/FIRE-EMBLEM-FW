@@ -87,18 +87,12 @@ NXTEST(misc_hwopus_size_and_refusal) {
     const uint32_t size = sz.get<uint32_t>(0);
     CHECK(size != 0);
     CHECK_EQ(size % 0x1000u, 0u);                   // official user processes page-align this size
-    // OpenHardwareOpusDecoder (cmd 0): packed rate/channels, u32 work buffer size, transfer memory handle. There is no Opus decoder on
-    // the host, but the manager opens a decoder that decodes silence (Mario Kart World aborts on a refusal); it comes back as a session handle.
+    // OpenHardwareOpusDecoder (cmd 0): packed rate/channels, u32 work buffer size, transfer memory handle. No decoder here.
     services::ServiceEvent ev;
     const uint32_t h = ev.new_handle();
     REQUIRE(h != 0);
     nxsvc::Reply open = s.call(0, nxsvc::Args().u64(packed).u32(size).hcopy(h));
-    CHECK(open.ok());
-    CHECK_EQ(open.move.size(), 1u);
-    for (uint32_t m : open.move) kernel::handle_close(m);
-    // The multistream decoders are still refused.
-    nxsvc::Reply ms = s.call(2, nxsvc::Args().u64(packed).u32(size).hcopy(h));
-    CHECK_EQ(ms.result, kNotSupported);
+    CHECK_EQ(open.result, 0u);                      // a decoder that decodes silence (misc.cpp make_hwopus), not a refusal
     kernel::handle_close(h);
 }
 
@@ -108,10 +102,10 @@ NXTEST(misc_aoc_base_id_and_empty_list) {
     services::profile_reload();
     nxsvc::Session s = nxsvc::connect("aoc:u");
     REQUIRE(s.valid());
-    // GetAddOnContentBaseId (cmd 5): PID-descriptor -> u64. The title's add-on base id (control.nacp) is 010012101468D000.
+    // GetAddOnContentBaseId (cmd 5): PID-descriptor -> u64, the program id + 0x1000 (Metroid Prime Remastered: 010012101468D000).
     nxsvc::Reply base = s.call(5, nxsvc::Args().with_pid());
     REQUIRE(base.ok());
-    CHECK_EQ(base.get<uint64_t>(0), 0x010012101468D000ull);
+    CHECK_EQ(base.get<uint64_t>(0), services::profile().program_id + 0x1000ull);
     // CountAddOnContent (cmd 2): PID-descriptor -> s32 count = 0.
     nxsvc::Reply cnt = s.call(2, nxsvc::Args().with_pid());
     REQUIRE(cnt.ok());

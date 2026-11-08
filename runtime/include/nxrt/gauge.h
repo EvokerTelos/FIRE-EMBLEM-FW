@@ -106,5 +106,9 @@ bool hitch_on_game_present_thread();
 // The last `window_s` seconds of frame times as a compact block of text (frames, fps, 1% low, worst, per-second fps and worst ms, the worst
 // frames and the age of the last one). Allocates; never takes a lock another thread could hold: for the crash, freeze and memory reports.
 std::string frame_times_summary(double window_s = 30.0);
+// For a live view (the F1 menu's debug page). The times between the last presented frames in ms, oldest first, at most `n`; returns how many.
+size_t frame_times_recent(float* ms, size_t n);
+// A phase timer's running total (HitchPhase), in ms since start: the difference of two reads is the time spent in it between them.
+double hitch_phase_total_ms(int phase);
 
 }  // namespace nxrt

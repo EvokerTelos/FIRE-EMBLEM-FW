@@ -4,15 +4,23 @@
 // Design follows smo-recomp (record on game threads, replay on one render thread) and SuperMarioWonderRecomp docs/nvn (a submit
 // is replayed under one lock and never overlaps the next); the code is new.
 #include "nxrt/nvn_backend.h"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <string>
 #include <thread>
 
 #include "nxrt/config.h"
@@ -47,8 +55,6 @@ nxrt::GaugeCounter g_gauge_barriers_img("nvn.cnt.barriers_img");   // image layo
 struct Slot {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
-    std::vector<VkCommandBuffer> split_cbs;   // command buffers frame_split continues in (from the slot's pool; reused after each pool reset)
-    size_t split_used = 0;
     std::vector<VkDescriptorPool> dpools;
     size_t dpool_cur = 0;
     gfx::Buffer upload;
@@ -75,7 +81,16 @@ struct Gpu {
     bool installed_entry_points = false;
     VkSemaphore timeline = VK_NULL_HANDLE;
     std::atomic<uint64_t> completed{0};
-    uint64_t submitted = 0;               // render thread: last serial handed to vkQueueSubmit2
+    uint64_t submitted = 0;               // render thread: last serial recorded (handed to vkQueueSubmit2, or waiting in `batch`)
+    uint64_t flushed = 0;                 // render thread: last serial handed to vkQueueSubmit2
+    // [nvn] submit_batch: recorded submissions wait here and go to the GPU in one vkQueueSubmit2 (flush_batch). Render thread.
+    std::vector<Slot*> batch;
+    uint32_t batch_max = 1;
+    // submit_batch = frame: the batch is not flushed when the render thread runs out of work; it goes with the present, in the present's
+    // own vkQueueSubmit2 (take_batch_for_present), or earlier when a thread waits for one of its serials (flush_wanted).
+    bool frame_batch = false;
+    std::atomic<uint64_t> flushed_pub{0};          // `flushed`, readable from any thread
+    std::atomic<bool> flush_wanted{false};         // a thread waits for (or polls) a serial still in the batch
     uint64_t recording = 0;               // render thread: serial of the submission being recorded (0 outside)
     std::atomic<uint64_t> last_submitted{0};
     // Serials are handed out when a submission is queued (the game thread gets its serial at once and goes on while the render thread
@@ -85,6 +100,10 @@ struct Gpu {
     std::mutex pmu;
     std::condition_variable pcv;
     int presents_pending = 0;
+    // The game's last present (under pmu): present_again shows it once more while the game presents nothing (it waits for a library applet).
+    Ref<Window> last_window;
+    int last_index = -1;
+    std::chrono::steady_clock::time_point last_present{};
     Slot slots[kSlots];
     VkQueryPool qpool = VK_NULL_HANDLE;   // frame trace: two timestamps per slot
     VkQueryPool gpool = VK_NULL_HANDLE;   // GPU pass profiler ([prof] gpu_passes): kGpMax timestamps per slot
@@ -113,6 +132,7 @@ struct Gpu {
 };
 
 Gpu* g = nullptr;
+void flush_batch();   // [nvn] submit_batch, below
 std::mutex g_install_mu;
 
 uint64_t read_completed() {
@@ -143,7 +163,35 @@ void retire() {
     }
 }
 
+thread_local bool t_render_thread = false;
+// [nvn] test_throw_every = N (tests only): every Nth recorded submission and every Nth present throws std::bad_alloc, to check that
+// a failed render job costs a frame and nothing else.
+void test_throw(std::atomic<uint64_t>& n) {
+    static const int64_t every = nxrt::config_get_int("nvn", "test_throw_every", 0);
+    if (every > 0 && (n.fetch_add(1) + 1) % static_cast<uint64_t>(every) == 0) throw std::bad_alloc();
+}
+std::atomic<uint64_t> g_test_records{0}, g_test_presents{0};
+template <class Fn> struct OnExit { Fn fn; ~OnExit() { fn(); } };
+template <class Fn> OnExit<Fn> on_exit(Fn fn) { return OnExit<Fn>{std::move(fn)}; }
+std::atomic<int> g_render_throw_reports{0};
+
+// A C++ exception thrown on the render thread is caught by render_loop, which aborts that job; the first few are logged with
+// the throwing stack (the catch alone cannot say where it came from).
+LONG WINAPI render_throw_report(EXCEPTION_POINTERS* ep) {
+    if (t_render_thread && ep && ep->ExceptionRecord && ep->ExceptionRecord->ExceptionCode == 0xE06D7363u &&
+        g_render_throw_reports.fetch_add(1) < 3) {
+        MEMORYSTATUSEX ms = {sizeof(ms)};
+        GlobalMemoryStatusEx(&ms);
+        NXLOG_E(kTag, "render thread C++ exception (system commit free %.1f GB of %.1f GB): %s", ms.ullAvailPageFile / 1073741824.0,
+                ms.ullTotalPageFile / 1073741824.0, nxrt::crash_build_report(ep).c_str());
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void render_loop() {
+    t_render_thread = true;
+    static void* veh = AddVectoredExceptionHandler(0, render_throw_report);
+    (void)veh;
     g->tid = std::this_thread::get_id();
     log_set_thread_name("nvn-render");
     diag_register_thread("nvn-render", nullptr);   // so the freeze watchdog and the stall sampler can see its stack
@@ -152,11 +200,21 @@ void render_loop() {
         std::function<void()> job;
         {
             std::unique_lock<std::mutex> lk(g->qmu);
+            if (!g->batch.empty() && (g->flush_wanted.load() || (!g->frame_batch && !g->stop && g->queue.empty()))) {
+                lk.unlock();
+                flush_batch();      // nothing more to record for now (or a thread waits for it): the GPU gets what there is
+                lk.lock();
+            }
             if (!g->stop && g->queue.empty()) {
                 nxrt::HitchTimer ht(nxrt::kHpRenderIdle);      // the hitch line: the render thread waited for the game
-                g->qcv.wait(lk, [] { return g->stop || !g->queue.empty(); });
+                g->qcv.wait(lk, [] { return g->stop || !g->queue.empty() || (g->flush_wanted.load() && !g->batch.empty()); });
+                if (g->queue.empty() && !g->stop) continue;    // woken to flush
             }
-            if (g->queue.empty()) return;   // stop requested and drained
+            if (g->queue.empty()) {   // stop requested and drained
+                lk.unlock();
+                flush_batch();
+                return;
+            }
             job = std::move(g->queue.front());
             g->queue.pop_front();
             g_gauge_render_queue.sub(1);
@@ -207,8 +265,58 @@ VkDescriptorPool new_dpool() {
     return p;
 }
 
+// Hands the recorded submissions of the batch to the GPU in one vkQueueSubmit2, in recording order, signalling the timeline with the last
+// serial (the earlier ones of the batch complete with it). Every kernel submission costs a pass over all memory the device holds: on Linux
+// (Proton, RADV) the multi-gigabyte host-memory pool imports are user pages the kernel looks up again on each one, about 2 ms a
+// submission on a Legion Go S, so 11 submissions a frame took 20 of its 25 ms. Render thread.
+void flush_batch() {
+    if (g->batch.empty()) return;
+    std::vector<VkCommandBufferSubmitInfo> cbi(g->batch.size(), VkCommandBufferSubmitInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO});
+    for (size_t i = 0; i < g->batch.size(); i++) cbi[i].commandBuffer = g->batch[i]->cb;
+    const uint64_t serial = g->batch.back()->serial;
+    VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    sig.semaphore = g->timeline;
+    sig.value = serial;
+    sig.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    si.commandBufferInfoCount = static_cast<uint32_t>(cbi.size());
+    si.pCommandBufferInfos = cbi.data();
+    si.signalSemaphoreInfoCount = 1;
+    si.pSignalSemaphoreInfos = &sig;
+    VkResult r;
+    {
+        nxrt::HitchTimer ht(nxrt::kHpRenderSubmit);
+        const uint64_t tl = nxrt::hitch_ticks();
+        std::lock_guard<std::mutex> lk(g->dev->queue_mutex());
+        nxrt::hitch_phase_add(nxrt::kHpRenderLockWait, nxrt::hitch_ticks() - tl);
+        r = vkQueueSubmit2(g->dev->queue(), 1, &si, VK_NULL_HANDLE);
+    }
+    if (r != VK_SUCCESS) {
+        NXLOG_E(kTag, "vkQueueSubmit2 failed (%d): the device is lost or out of memory", static_cast<int>(r));
+        // keep the timeline moving so waiters do not hang: signal from the host
+        VkSemaphoreSignalInfo ssi = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        ssi.semaphore = g->timeline;
+        ssi.value = serial;
+        vkSignalSemaphore(g->dev->device(), &ssi);
+    }
+    g->flushed = serial;
+    g->flushed_pub.store(serial);
+    g->flush_wanted.store(false);
+    g->batch.clear();
+    g->ctr.submits.fetch_add(1);
+}
+
+// submit_batch = frame: a thread outside the render thread waits for a serial that may still sit in the batch; the render thread flushes
+// it at once instead of with the next present (which that thread may be the one to queue).
+void want_flush(uint64_t serial) {
+    if (!g->frame_batch || serial <= g->flushed_pub.load() || g->flush_wanted.exchange(true)) return;
+    std::lock_guard<std::mutex> lk(g->qmu);
+    g->qcv.notify_one();
+}
+
 void wait_serial_blocking(uint64_t serial) {
     if (!serial || read_completed() >= serial) return;
+    if (serial > g->flushed && on_render_thread()) flush_batch();     // a serial still in the batch would never signal
     NXFT("gpu.wait");
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
@@ -258,7 +366,6 @@ Slot& acquire_slot() {
     s.gp_labels.clear();
     retire();
     vkResetCommandPool(g->dev->device(), s.pool, 0);
-    s.split_used = 0;
     for (VkDescriptorPool p : s.dpools) vkResetDescriptorPool(g->dev->device(), p, 0);
     vk_gauge_descriptor_sets().sub(static_cast<int64_t>(s.sets_live));   // the reset freed them
     s.sets_live = 0;
@@ -387,10 +494,12 @@ void run_on_render_thread(const std::function<void()>& fn) {
     {
         std::lock_guard<std::mutex> lk(g->qmu);
         g->queue.push_back([&] {
+            auto signal = on_exit([&] {
+                std::lock_guard<std::mutex> l2(m);
+                done = true;
+                cv.notify_all();
+            });
             fn();
-            std::lock_guard<std::mutex> l2(m);
-            done = true;
-            cv.notify_all();
         });
         g_gauge_render_queue.add(1);
     }
@@ -537,21 +646,41 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
         s.timed = true;
         s.cpu_t0 = ft::now_ns();
     }
-    record(f);
-    if (g->gpool) gpass_stamp(f, "tail", 0);
-    if (g->qpool) vkCmdWriteTimestamp(s.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->qpool, qi + 1);
+    bool aborted = false;
+    try {
+        test_throw(g_test_records);
+        record(f);
+    } catch (const std::exception& e) {
+        // An empty command buffer still signals the serial, so every wait for it (fences, the game's syncs, slot reuse) returns.
+        NXLOG_E(kTag, "submission %llu: recording threw (%s): its commands are dropped, an empty submission signals it",
+                static_cast<unsigned long long>(serial), e.what());
+        replay_abort_submit();
+        vkResetCommandPool(g->dev->device(), s.pool, 0);
+        vkBeginCommandBuffer(s.cb, &bi);
+        s.timed = false;
+        s.gp_n = 0;
+        s.gp_labels.clear();
+        aborted = true;
+    }
+    if (g->gpool && !aborted) gpass_stamp(f, "tail", 0);
+    if (g->qpool && !aborted) vkCmdWriteTimestamp(s.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g->qpool, qi + 1);
     vkEndCommandBuffer(s.cb);
+    if (!unsignalled) {
+        s.serial = serial;
+        g->submitted = serial;
+        g->last_submitted.store(serial);
+        g->recording = 0;
+        g->batch.push_back(&s);
+        if (g->batch.size() >= g->batch_max) flush_batch();
+        g->ctr.submit_replay_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
+        return serial;
+    }
+    flush_batch();      // debug path: submitted on its own, after everything recorded before it, signalling nothing
     VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
     cbi.commandBuffer = s.cb;
-    VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
-    sig.semaphore = g->timeline;
-    sig.value = serial;
-    sig.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     si.commandBufferInfoCount = 1;
     si.pCommandBufferInfos = &cbi;
-    si.signalSemaphoreInfoCount = unsignalled ? 0 : 1;
-    si.pSignalSemaphoreInfos = &sig;
     VkResult r;
     {
         nxrt::HitchTimer ht(nxrt::kHpRenderSubmit);
@@ -559,76 +688,45 @@ uint64_t submit_on_render_thread(const std::function<void(Frame&)>& record, uint
         std::lock_guard<std::mutex> lk(g->dev->queue_mutex());
         nxrt::hitch_phase_add(nxrt::kHpRenderLockWait, nxrt::hitch_ticks() - tl);
         r = vkQueueSubmit2(g->dev->queue(), 1, &si, VK_NULL_HANDLE);
-        if (unsignalled && r == VK_SUCCESS) vkQueueWaitIdle(g->dev->queue());   // debug path only: nothing else tells when it is done
+        if (r == VK_SUCCESS) vkQueueWaitIdle(g->dev->queue());   // nothing else tells when it is done
     }
-    if (unsignalled) {
-        g->recording = 0;
-        s.serial = 0;
-        return serial;
-    }
-    if (r != VK_SUCCESS) {
-        NXLOG_E(kTag, "vkQueueSubmit2 failed (%d): the device is lost or out of memory", static_cast<int>(r));
-        // keep the timeline moving so waiters do not hang: signal from the host
-        VkSemaphoreSignalInfo ssi = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
-        ssi.semaphore = g->timeline;
-        ssi.value = serial;
-        vkSignalSemaphore(g->dev->device(), &ssi);
-    }
-    s.serial = serial;
-    g->submitted = serial;
-    g->last_submitted.store(serial);
     g->recording = 0;
-    g->ctr.submits.fetch_add(1);
-    g->ctr.submit_replay_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()));
+    s.serial = 0;
     return serial;
 }
 
 }  // namespace
 
-// Ends the command buffer of the submission being recorded, runs what is recorded so far and waits for the GPU to finish it (and every earlier
-// submission), then goes on recording the same submission (same serial) in a fresh command buffer of the slot. Render thread only. The caller has
-// ended its render pass and queries, and must treat everything bound in the old command buffer as unbound.
-bool frame_split(Frame& f) {
-    if (!g || !on_render_thread() || !f.slot || f.cb == VK_NULL_HANDLE) return false;
-    Slot& s = *static_cast<Slot*>(f.slot);
-    VkDevice dev = g->dev->device();
-    if (s.split_used == s.split_cbs.size()) {
-        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        ai.commandPool = s.pool;
-        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        ai.commandBufferCount = 1;
-        VkCommandBuffer nb = VK_NULL_HANDLE;
-        if (vkAllocateCommandBuffers(dev, &ai, &nb) != VK_SUCCESS) return false;
-        s.split_cbs.push_back(nb);
+void submit_recorded() {
+    if (g) flush_batch();
+}
+
+bool take_batch_for_present(std::vector<VkCommandBuffer>* cmds, gfx::Renderer::SubmitPrefix* p) {
+    if (!g || !g->frame_batch || g->batch.empty()) {
+        submit_recorded();
+        return false;
     }
-    VkCommandBuffer next = s.split_cbs[s.split_used++];
-    VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    VkFence fence = VK_NULL_HANDLE;
-    if (vkCreateFence(dev, &fi, nullptr, &fence) != VK_SUCCESS) return false;
-    vkEndCommandBuffer(f.cb);
-    VkCommandBufferSubmitInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
-    cbi.commandBuffer = f.cb;
-    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.commandBufferInfoCount = 1;
-    si.pCommandBufferInfos = &cbi;   // no timeline signal: the serial belongs to the end of the submission
-    VkResult r;
-    {
-        std::lock_guard<std::mutex> lk(g->dev->queue_mutex());
-        r = vkQueueSubmit2(g->dev->queue(), 1, &si, fence);
+    cmds->clear();
+    for (Slot* s : g->batch) cmds->push_back(s->cb);
+    p->cmds = cmds->data();
+    p->count = static_cast<uint32_t>(cmds->size());
+    p->timeline = g->timeline;
+    p->value = g->batch.back()->serial;
+    return true;
+}
+
+void present_batch_done(const gfx::Renderer::SubmitPrefix& p) {
+    if (!p.submitted) {   // as flush_batch: keep the timeline moving so waiters do not hang
+        VkSemaphoreSignalInfo ssi = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        ssi.semaphore = g->timeline;
+        ssi.value = p.value;
+        vkSignalSemaphore(g->dev->device(), &ssi);
     }
-    if (r == VK_SUCCESS) {
-        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 10ull * 1000 * 1000 * 1000) != VK_SUCCESS) NXLOG_W(kTag, "frame split: the GPU did not finish within 10 s");
-        wait_serial_blocking(g->submitted);   // earlier submissions too: the data the caller reads may come from any of them
-    } else {
-        NXLOG_E(kTag, "frame split: vkQueueSubmit2 failed (%d)", static_cast<int>(r));
-    }
-    vkDestroyFence(dev, fence, nullptr);
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(next, &bi);
-    f.cb = next;
+    g->flushed = p.value;
+    g->flushed_pub.store(p.value);
+    g->flush_wanted.store(false);
+    g->batch.clear();
     g->ctr.submits.fetch_add(1);
-    return r == VK_SUCCESS;
 }
 
 // Queues a submission with the next serial (in queue order). wait: until the render thread has run it (and, with gpu_done, the GPU too).
@@ -645,13 +743,14 @@ uint64_t queue_submit(std::function<void(Frame&)> record, bool wait, bool gpu_do
         std::lock_guard<std::mutex> lk(g->qmu);
         serial = g->reserved.fetch_add(1) + 1;
         g->queue.push_back([record = std::move(record), serial, done, gpu_done] {
-            submit_on_render_thread(record, serial);
-            if (gpu_done) { wait_serial_blocking(serial); retire(); }
-            if (done) {
+            auto signal = on_exit([&] {
+                if (!done) return;
                 std::lock_guard<std::mutex> l2(done->m);
                 done->done = true;
                 done->cv.notify_all();
-            }
+            });
+            submit_on_render_thread(record, serial);
+            if (gpu_done) { wait_serial_blocking(serial); retire(); }
         });
         g_gauge_render_queue.add(1);
     }
@@ -710,7 +809,9 @@ void finish() {
 bool serial_done(uint64_t serial) {
     if (!g || !serial) return true;
     if (g->completed.load() >= serial) return true;
-    return read_completed() >= serial;
+    if (read_completed() >= serial) return true;
+    want_flush(serial);     // polled: it must reach the GPU to ever complete
+    return false;
 }
 
 namespace {
@@ -735,21 +836,52 @@ std::string gpu_report() {
 }
 }  // namespace
 
+int presents_since(uint64_t serial);   // below, beside the frame history
+
 bool wait_serial(uint64_t serial, uint64_t timeout_ns) {
     if (!g || !serial) return true;
     if (serial_done(serial)) return true;
     if (timeout_ns == 0) return false;
+    want_flush(serial);
     NXFT("sync.wait");
     nxrt::HitchTimer ht(nxrt::kHpGameSyncWait);
     g_wait_serial.store(serial);
     g_wait_timeout.store(timeout_ns);
     struct Counted { Counted() { g_waiters++; g_waits_begun++; } ~Counted() { g_waiters--; g_waits_done++; } } counted;
+    // Where a game sync wait spends its time (log line every 10 s): entered while the render thread had not recorded the fenced work yet
+    // ("replay": the wait covers replay + GPU), or after ("gpu": the GPU alone). Submissions behind = how far the fence is past what is recorded.
+    static std::atomic<uint64_t> w_n[2], w_us[2], w_behind{0}, w_last_ms{0}, w_age_n[4], w_age_us[4];
+    const uint64_t rec = g->last_submitted.load(std::memory_order_relaxed);
+    const int kind = serial > rec ? 0 : 1;
+    const int age = presents_since(serial);
+    if (kind == 0) w_behind.fetch_add(serial - rec, std::memory_order_relaxed);
+    const auto tw0 = std::chrono::steady_clock::now();
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
     wi.pSemaphores = &g->timeline;
     wi.pValues = &serial;
     const VkResult r = vkWaitSemaphores(g->dev->device(), &wi, timeout_ns);
     read_completed();
+    const auto tw1 = std::chrono::steady_clock::now();
+    w_n[kind].fetch_add(1, std::memory_order_relaxed);
+    const uint64_t us_w = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(tw1 - tw0).count());
+    w_us[kind].fetch_add(us_w, std::memory_order_relaxed);
+    w_age_n[age].fetch_add(1, std::memory_order_relaxed);
+    w_age_us[age].fetch_add(us_w, std::memory_order_relaxed);
+    const uint64_t now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(tw1.time_since_epoch()).count());
+    uint64_t last = w_last_ms.load(std::memory_order_relaxed);
+    if (!last) w_last_ms.compare_exchange_strong(last, now_ms);
+    else if (now_ms - last >= 10000 && w_last_ms.compare_exchange_strong(last, now_ms)) {
+        const uint64_t n0 = w_n[0].exchange(0), n1 = w_n[1].exchange(0), u0 = w_us[0].exchange(0), u1 = w_us[1].exchange(0), b = w_behind.exchange(0);
+        NXLOG_I(kTag, "sync waits, last %.1f s: behind the render thread %llu (%.1f ms total, %.2f submissions behind on average), on the GPU only %llu (%.1f ms total)",
+                (now_ms - last) / 1000.0, static_cast<unsigned long long>(n0), u0 / 1000.0, n0 ? static_cast<double>(b) / n0 : 0.0,
+                static_cast<unsigned long long>(n1), u1 / 1000.0);
+        uint64_t an[4], au[4];
+        for (int i = 0; i < 4; ++i) { an[i] = w_age_n[i].exchange(0); au[i] = w_age_us[i].exchange(0); }
+        NXLOG_I(kTag, "sync waits by fence age (presents since it was queued): 0: %llu (%.1f ms), 1: %llu (%.1f ms), 2: %llu (%.1f ms), 3+: %llu (%.1f ms)",
+                static_cast<unsigned long long>(an[0]), au[0] / 1000.0, static_cast<unsigned long long>(an[1]), au[1] / 1000.0,
+                static_cast<unsigned long long>(an[2]), au[2] / 1000.0, static_cast<unsigned long long>(an[3]), au[3] / 1000.0);
+    }
     return r == VK_SUCCESS;
 }
 
@@ -768,6 +900,14 @@ bool gpu_wait_frames(int frames_back, uint64_t timeout_ns) {
 }
 }  // namespace
 
+// Presents the game made after `serial` was queued (0: the fence is in the frame being built; 3: three or more frames back).
+int presents_since(uint64_t serial) {
+    const uint64_t n = g_frame_count.load(std::memory_order_acquire);
+    int k = 0;
+    while (k < 3 && static_cast<uint64_t>(k) < n && g_frame_work[(n - 1 - static_cast<uint64_t>(k)) & 3].load(std::memory_order_relaxed) >= serial) ++k;
+    return k;
+}
+
 // [nvn] present_ahead (default 1; 0 = wait for each present): the game thread queues the present and goes on while fewer than this many
 // presents are still pending on the render thread (the frame limiter and the swapchain's frame slots pace the render thread). 1 keeps the
 // render thread one present behind the game at most (2 let a second finished frame wait in the queue: one more frame between input and screen).
@@ -775,6 +915,12 @@ void present(Window* window, int index) {
     if (!g || !window) return;
     NXFT("present.call");
     nxrt::hitch_note_game_present();
+    {
+        std::lock_guard<std::mutex> lk(g->pmu);
+        g->last_window = Ref<Window>::share(window);
+        g->last_index = index;
+        g->last_present = std::chrono::steady_clock::now();
+    }
     {
         const uint64_t n = g_frame_count.load(std::memory_order_relaxed);
         g_frame_work[n & 3].store(g->reserved.load(), std::memory_order_relaxed);
@@ -797,10 +943,42 @@ void present(Window* window, int index) {
     {
         std::lock_guard<std::mutex> lk(g->qmu);
         g->queue.push_back([keep, index] {
+            auto release = on_exit([] {
+                std::lock_guard<std::mutex> l2(g->pmu);
+                --g->presents_pending;
+                g->pcv.notify_all();
+            });
+            test_throw(g_test_presents);
             present_on_render_thread(keep.get(), index);
-            std::lock_guard<std::mutex> l2(g->pmu);
-            --g->presents_pending;
-            g->pcv.notify_all();
+        });
+        g_gauge_render_queue.add(1);
+    }
+    g->qcv.notify_one();
+}
+
+// The game's last frame once more, queued like a present (the overlay is drawn on top as on every frame). Only when the game has not
+// presented for 50 ms and nothing is queued, so it never competes with the game's own frames.
+void present_again() {
+    if (!g) return;
+    Ref<Window> keep;
+    int index = -1;
+    {
+        std::lock_guard<std::mutex> lk(g->pmu);
+        if (!g->last_window || g->presents_pending > 0) return;
+        if (std::chrono::steady_clock::now() - g->last_present < std::chrono::milliseconds(50)) return;
+        keep = g->last_window;
+        index = g->last_index;
+        ++g->presents_pending;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g->qmu);
+        g->queue.push_back([keep, index] {
+            auto release = on_exit([] {
+                std::lock_guard<std::mutex> l2(g->pmu);
+                --g->presents_pending;
+                g->pcv.notify_all();
+            });
+            present_on_render_thread(keep.get(), index, true);
         });
         g_gauge_render_queue.add(1);
     }
@@ -824,6 +1002,7 @@ void release_texture_gpu(Texture* t) {
             if (!x->destroyed.load() || !x->gpu) return;   // initialized again meanwhile, or never got an image
             TexGpu* img = x->gpu;
             x->gpu = nullptr;
+            pool_texture_remade(x);
             destroy_texture_gpu(img);
         });
         g_gauge_render_queue.add(1);
@@ -875,6 +1054,17 @@ bool bring_up(gfx::Device& dev, gfx::Renderer* rend, FrameLimiter* limiter, bool
     gp->rend = rend;
     gp->limiter = limiter;
     gp->keep_aspect = keep_aspect;
+    {   // [nvn] submit_batch: auto = frame under Wine (each kernel submission walks the imported pools again, flush_batch), 1 elsewhere.
+        // frame: one kernel submission per frame, the present's; N: flush every N submissions and whenever the render thread idles.
+        std::string b = nxrt::config_get_str("nvn", "submit_batch", "auto");
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        const bool wine = nt && GetProcAddress(nt, "wine_get_version");
+        const std::string how = b == "auto" ? (wine ? "auto, Wine" : "auto, not Wine") : b;
+        if (b == "auto") b = wine ? "frame" : "1";
+        gp->frame_batch = b == "frame";
+        gp->batch_max = gp->frame_batch ? kSlots / 2 : static_cast<uint32_t>(std::clamp<int64_t>(std::atoll(b.c_str()), 1, kSlots / 2));
+        NXLOG_I(kTag, "submit_batch %s (%s)", gp->frame_batch ? "frame" : std::to_string(gp->batch_max).c_str(), how.c_str());
+    }
     g = gp;
     if (!dev.features().timeline_semaphore) {
         NXLOG_E(kTag, "the GPU has no timeline semaphores: the NVN back end cannot run");
@@ -970,6 +1160,10 @@ void tear_down() {
     for (const char* n : kCounterGauges) nxrt::gauge_unregister(n);
     Gpu* gp = g;
     run_on_render_thread([&] {
+        {
+            std::lock_guard<std::mutex> l2(gp->pmu);
+            gp->last_window = nullptr;
+        }
         wait_serial_blocking(gp->submitted);
         retire();
         replay_shutdown();
@@ -1038,6 +1232,9 @@ bool install_backend(const BackendDesc& desc) {
 }
 
 void shutdown_backend() { be::gpu::tear_down(); }
+void present_last_frame_again() {
+    if (be::gpu::active()) be::gpu::present_again();
+}
 
 bool prepare_shaders(const ShaderPrepareOptions& o, ShaderPrepareResult* r) {
     ShaderPrepareResult local;

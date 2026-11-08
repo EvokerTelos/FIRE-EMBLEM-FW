@@ -12,6 +12,7 @@
 
 #include "nxrt/config.h"
 #include "nxrt/frame_limiter.h"
+#include "nxrt/game.h"
 #include "nxrt/ftrace.h"
 #include "nxrt/log.h"
 
@@ -145,8 +146,10 @@ struct LowLatency::Impl {
     }
 };
 
+// The default is main, except for a game that paces itself by the present interval (game::Info::present_interval_hz, Fortune's Weave): its
+// rate is held in the present (nvn_present.cpp), and its frame hook only pumps play mode.
 bool pace_in_main() {
-    static const bool v = config_get_str("latency", "pace", "main") != "present";
+    static const bool v = config_get_str("latency", "pace", game::info().present_interval_hz > 0 ? "present" : "main") != "present";
     return v;
 }
 void pace_note_present() { g_presents.fetch_add(1, std::memory_order_relaxed); }
@@ -292,10 +295,7 @@ void LowLatency::sim_begin() {
     {   // [latency] gpu_frames_ahead (lowlat.h): the GPU's own queue is bounded too, right before the input is sampled
         static const int gpu_back = static_cast<int>(std::clamp<int64_t>(config_get_int("latency", "gpu_frames_ahead", 1), -1, 3));
         const uint64_t lp = s.last_present_ns.load(std::memory_order_relaxed);
-        // Not while the limiter runs a loading screen unpaced ([display] unpaced_loading: light frames only): the game's loading advances
-        // once per frame, and waiting for the GPU to finish the last frame was a quarter of a light frame. The present backpressure
-        // ([nvn] present_ahead) and the swapchain still bound how far the game runs ahead.
-        if (gpu_back >= 0 && s.paced && s.live_on && lp && FrameLimiter::now_ns() - lp < 250000000ull && !frame_limiter_unpaced())
+        if (gpu_back >= 0 && s.paced && s.live_on && lp && FrameLimiter::now_ns() - lp < 250000000ull)
             if (auto fn = g_gpu_wait_fn.load()) fn(gpu_back, 50ull * 1000 * 1000);
     }
     VkSwapchainKHR sc;

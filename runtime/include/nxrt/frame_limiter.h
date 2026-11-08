@@ -20,6 +20,12 @@ public:
     // 0 = unlimited (begin_frame never waits; it still records frame times). Safe to call from any thread.
     void set_target_fps(double fps);
     double target_fps() const;
+    // The game's own frame rate (0 = none): the pace its console vsync would give it (the NVN window's present interval, nvn_present.cpp).
+    // A game that steps its logic by a fixed amount per frame runs at its speed only at this rate, so the limiter waits for the lower of
+    // the two rates whatever the target, the display's refresh rate and vsync. Safe to call from any thread.
+    void set_game_fps(double fps);
+    double game_fps() const;
+    double effective_fps() const;       // the rate begin_frame paces to: the lower of target_fps and game_fps that is set (0 = none)
 
     // A function that runs at the very start of every begin_frame(), on the thread that calls it (the presenting thread). Play mode uses it to
     // apply present-mode changes at a point where nothing else touches the swapchain. nullptr removes it. Safe to call from any thread.
@@ -76,4 +82,9 @@ double suggest_vrr_cap(double refresh_hz);
 // advances once per frame, so pacing it at 60 Hz stretches boot and loads. The NVN replay sets it ([display] unpaced_loading, default on).
 void frame_limiter_set_unpaced(bool on);
 bool frame_limiter_unpaced();
+
+// The display rate the game's present interval counts in (nvn_present.cpp: its frame rate is hz / interval). 0 (default): [nvn]
+// present_interval_hz. A game module that raises the game's own display rate sets it (fefw's fps120: 120). Safe from any thread.
+void set_present_interval_hz(double hz);
+double present_interval_hz_override();
 }  // namespace nxrt

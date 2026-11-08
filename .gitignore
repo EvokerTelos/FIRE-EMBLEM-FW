@@ -10,15 +10,24 @@ bc7_cache/
 *.nca
 *.nsp
 *.xci
+*.nsz
+*.xcz
 *.keys
 exefs/
 romfs/
+*.spv
 *.exe
+*.dll
+*.lib
 *.pdb
 *.map
 *.log
-pkp.ini
+*.log.prev
+fefw.ini
+controls.ini
+pipeline_cache.bin
 pipeline_keys.bin
+save/
 # tool output
 node_modules/
 target/
@@ -27,4 +36,5 @@ obj/
 .vs/
 .venv/
 __pycache__/
-/refs/
+/export/
+/saves/

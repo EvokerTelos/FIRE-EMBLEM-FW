@@ -205,11 +205,11 @@ void expect_decode_matches_library(const Built& bt, const PreparedTexture& d) {
 }
 
 // Each BC7 slice must be the library's transcode of the same ASTC slice (placement of every slice in the output). The
-// options are the defaults of the back end: quality 3 (the config default), all threads, no perceptual weights.
+// options are the defaults of the back end: [nvn] bc7_quality (bc7_fast_preset), all threads, no perceptual weights.
 void expect_bc7_matches_library(const Built& bt, const PreparedTexture& out) {
     const FormatInfo* fmt = bt.L.fmt;
     a2b_options opt{};
-    opt.quality = 3;
+    opt.quality = bc7_fast_preset();
     opt.threads = 0;
     opt.perceptual = 0;
     opt.allow_opaque_mode6 = 0;
@@ -323,14 +323,11 @@ NXTEST(sparse_texture_prepares_from_mapped_tiles) {
 NXTEST(untile_cube_and_cube_array) {
     no_cache();
     const TextureBuilderInfo cube = make_info(NVN_TEXTURE_TARGET_CUBEMAP, 64, 64, 0, 4, NVN_FORMAT_RGBA8);
-    // NVN's cube-map array depth is the layer-face count, 6 per cube (layout 1d15fa0): two cubes are depth 12.
+    // a cube array's depth counts layer-faces, 6 per cube (nvn_texture_layout.cpp; Pokopia sets 6 * cubes): two cubes = 12
     const TextureBuilderInfo cube_array = make_info(NVN_TEXTURE_TARGET_CUBEMAP_ARRAY, 40, 40, 12, 3, NVN_FORMAT_RGBA8);
     for (const TextureBuilderInfo& info : {cube, cube_array}) {
         Built bt;
-        if (!begin_block_linear(bt, info)) {
-            CHECK_MSG(false, "layout");
-            continue;
-        }
+        REQUIRE(begin_block_linear(bt, info));   // without a layout the rest would read an empty image
         CHECK_EQ(bt.L.layers, info.target == NVN_TEXTURE_TARGET_CUBEMAP ? 6u : 12u);
         fill_random(bt.lin, 77);
         finish_block_linear(bt, info);
@@ -881,11 +878,11 @@ NXTEST(failures_return_false_without_crashing) {
         CHECK(!prepare_texture(*t, TexCaps(), out));
         CHECK(!out.error.empty());
     }
-    // layouts that do not exist
+    // layouts that do not exist (a BUFFER target has one now: a single tight row, nvn_texture_layout.cpp)
     const TextureBuilderInfo bad[] = {
         make_info(NVN_TEXTURE_TARGET_2D, 16, 16, 1, 1, NVN_FORMAT_NONE),
         make_info(NVN_TEXTURE_TARGET_3D, 33, 33, 0, 1, NVN_FORMAT_RGBA8),
-        make_info(NVN_TEXTURE_TARGET_BUFFER, 0, 1, 1, 1, NVN_FORMAT_RGBA8),   // a buffer texture has a layout (Switch 2 start-up) but needs a width
+        make_info(NVN_TEXTURE_TARGET_BUFFER, 0, 1, 1, 1, NVN_FORMAT_RGBA8),
         make_info(NVN_TEXTURE_TARGET_2D, 0, 16, 1, 1, NVN_FORMAT_RGBA8),
         make_info(NVN_TEXTURE_TARGET_2D_ARRAY, 16, 16, 0, 1, NVN_FORMAT_RGBA8),
     };
@@ -972,7 +969,11 @@ NXTEST(astc_quality_setting_parses) {
     config_set("gfx", "astc_quality", "high");
     CHECK(astc_quality() == AstcQuality::High);
     config_set("gfx", "astc_quality", "nonsense");
-    CHECK(astc_quality() == AstcQuality::High);
+    CHECK(astc_quality() == astc_quality_default());
+    config_set("gfx", "astc_quality", "");
+    CHECK(astc_quality() == astc_quality_default());
+    // the default follows the encoder: high with bc7e's ISPC build, fast with its C++ build
+    CHECK(astc_quality_default() == (a2b_bc7_encoder(nullptr) == A2B_ENCODER_CPP ? AstcQuality::Fast : AstcQuality::High));
     config_set("gfx", "astc_quality", "high");
 }
 

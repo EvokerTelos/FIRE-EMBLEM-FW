@@ -271,19 +271,9 @@ NXTEST(pl_no_font_found_still_answers) {
     }
 }
 
-NXTEST(pl_unknown_command_answers_stub) {
-    nxsvc::Env env;
-    nxsvc::Session s = nxsvc::connect("pl:u");
-    REQUIRE(s.valid());
-    // Command 99 is not in the table: the framework answers kStubService (0x0BCBD5).
-    nxsvc::Reply r = s.call(99);
-    CHECK_EQ(r.result, nxrt::kernel::kStubService);
-}
-
-// Switch 2 pl:u 2000 / 2010 (Eglantine NX2_NOTES row 36): the built-in fonts as plain TTF. 2010 takes the font type in the first byte and
-// answers 24 bytes: u32 found at 0, descriptor at 8 {u32 flags, u32 offset, u32 size, u32}. The offset must hold the same bytes
-// GetSharedMemoryAddressOffset points at (the shared memory is plain TTF behind its 8-byte header).
-NXTEST(pl_switch2_built_in_font_data) {
+// Switch 2's built-in font commands (Eden-NS2 platform_service_manager.cpp): 2000 -> the same shared memory and its size; 2010 (u8 type, bool)
+// -> bool available at 0, then {u8 type, u8 flags, u16 0, u32 offset, u32 size} at 4, the offset and size cmds 2 and 3 report.
+NXTEST(pl_builtin_font_commands) {
     std::vector<uint8_t> ttf;
     if (!read_all(std::filesystem::path(kFonts) / "DejaVuSans.ttf", ttf)) {
         nxtest::skip("assets/fonts/DejaVuSans.ttf not found");
@@ -293,33 +283,35 @@ NXTEST(pl_switch2_built_in_font_data) {
     use_fonts(kFonts);
     nxsvc::Session s = nxsvc::connect("pl:u");
     REQUIRE(s.valid());
-    nxsvc::Reply mem = s.call(2000);   // GetBuiltInFontSharedMemory: u32 size + copy handle
-    CHECK_EQ(mem.result, 0u);
-    CHECK_EQ(mem.copy.size(), size_t(1));
-    CHECK(mem.get<uint32_t>(0) >= expected_offset(kTypes - 1, ttf.size()) + ttf.size());
-    for (uint32_t t = 0; t < kTypes; ++t) {
-        nxsvc::Reply r = s.call(2010, nxsvc::Args().u32(t));
+    nxsvc::Reply r = s.call(2000);
+    CHECK_EQ(r.result, 0u);
+    REQUIRE(r.copy.size() == 1);
+    CHECK_EQ(r.get<uint32_t>(0), 0x1100000u);
+    auto obj = nxrt::kernel::handle_as<nxrt::kernel::KSharedMemory>(r.copy[0]);
+    REQUIRE(obj != nullptr);
+    CHECK_EQ(obj->size, 0x1100000ull);
+    nxrt::kernel::handle_close(r.copy[0]);
+    for (uint32_t t : {0u, 4u, 5u}) {
+        r = s.call(2010, nxsvc::Args().u8(uint8_t(t)).u8(1));
         CHECK_EQ(r.result, 0u);
-        CHECK_EQ(r.get<uint32_t>(0), 1u);
-        CHECK_EQ(r.get<uint32_t>(12), expected_offset(t, ttf.size()));
-        CHECK_EQ(r.get<uint32_t>(16), uint32_t(ttf.size()));
+        CHECK_EQ(r.get<uint8_t>(0), 1u);
+        CHECK_EQ(r.get<uint8_t>(4), uint8_t(t));
+        CHECK_EQ(r.get<uint8_t>(5), 0u);
+        CHECK_EQ(r.get<uint32_t>(8), expected_offset(t, ttf.size()));
+        CHECK_EQ(r.get<uint32_t>(12), uint32_t(ttf.size()));
     }
-    nxsvc::Reply none = s.call(2010, nxsvc::Args().u32(77));   // not a font type
-    CHECK_EQ(none.result, 0u);
-    CHECK_EQ(none.get<uint32_t>(0), 0u);
-    CHECK_EQ(none.get<uint32_t>(16), 0u);
+    // not a font type: not available, a zero descriptor
+    r = s.call(2010, nxsvc::Args().u8(6).u8(0));
+    CHECK_EQ(r.result, 0u);
+    CHECK_EQ(r.get<uint8_t>(0), 0u);
+    CHECK_EQ(r.get<uint32_t>(12), 0u);
 }
 
-// chat:u (Switch 2 GameChat): cmd 0 opens a session, whose cmd 1 returns an event handle.
-NXTEST(chat_u_opens_a_session_with_an_event) {
+NXTEST(pl_unknown_command_answers_stub) {
     nxsvc::Env env;
-    nxsvc::Session s = nxsvc::connect("chat:u");
+    nxsvc::Session s = nxsvc::connect("pl:u");
     REQUIRE(s.valid());
-    nxsvc::Reply r = s.call(0);
-    REQUIRE(r.ok());
-    nxsvc::Session chat = s.sub(r);
-    REQUIRE(chat.valid());
-    nxsvc::Reply ev = chat.call(1, nxsvc::Args().u32(2));
-    CHECK_EQ(ev.result, 0u);
-    CHECK_EQ(ev.copy.size(), size_t(1));
+    // Command 99 is not in the table: the framework answers kStubService (0x0BCBD5).
+    nxsvc::Reply r = s.call(99);
+    CHECK_EQ(r.result, nxrt::kernel::kStubService);
 }

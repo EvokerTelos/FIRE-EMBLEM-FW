@@ -4,6 +4,17 @@
 #ifndef NXRECOMP_NEON_H
 #define NXRECOMP_NEON_H
 
+/* x86-64 hosts: the single-precision vector forms (v_f3v, v_f3e, v_f1v) run the whole register through the host's packed SSE
+ * instructions, which give the IEEE result of the scalar ones in every lane, and hand the instruction to the element-by-element
+ * code (the *_ref functions, out of line) when a result lane is a NaN, so the Arm NaN rules stay exact. The fused forms need FMA3
+ * (-mfma); without it they stay element by element. NX_NO_SIMD turns all of this off. */
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(__SSE2__) && !defined(NX_NO_SIMD)
+#include <immintrin.h>
+#define NX_X86_SIMD 1
+#endif
+#define NX_HOT static inline __attribute__((always_inline))
+#define NX_SLOW static __attribute__((noinline, cold))
+
 static inline uint64_t vget(const V128 *v, int sz, int i) {
     switch (sz) {
     case 0: return v->b[i];
@@ -78,7 +89,7 @@ static inline double f3d(int op, double acc, double a, double b, uint64_t *mask,
 }
 
 /* Floating-point "three same": n elements, upper part of the destination cleared. */
-static inline void v_f3v(V128 *d, const V128 *pn, const V128 *pm, int op, int dbl, int n) {
+NX_SLOW void v_f3v_ref(V128 *d, const V128 *pn, const V128 *pm, int op, int dbl, int n) {
     V128 a = *pn, b = *pm, acc = *d, r;
     r.d[0] = 0; r.d[1] = 0;
     if (op == F_ADDP) {
@@ -105,16 +116,95 @@ static inline void v_f3v(V128 *d, const V128 *pn, const V128 *pm, int op, int db
     *d = r;
 }
 /* Same, with the second operand taken from one element of vm. */
-static inline void v_f3e(V128 *d, const V128 *pn, const V128 *pm, int idx, int op, int dbl, int n) {
+NX_SLOW void v_f3e_ref(V128 *d, const V128 *pn, const V128 *pm, int idx, int op, int dbl, int n) {
     V128 b;
     for (int i = 0; i < 4; i++) { if (dbl) b.df[i & 1] = pm->df[idx]; else b.f[i] = pm->f[idx]; }
-    v_f3v(d, pn, &b, op, dbl, n);
+    v_f3v_ref(d, pn, &b, op, dbl, n);
+}
+
+#ifdef NX_X86_SIMD
+/* Elements 0..n-1 (n = 1, 2, 4) of a single-precision register; the other lanes read as zero. */
+NX_HOT __m128 nx_ldps(const V128 *p, int n) {
+    if (n == 4) return _mm_loadu_ps(p->f);
+    if (n == 2) return _mm_castpd_ps(_mm_load_sd(p->df));
+    return _mm_load_ss(p->f);
+}
+/* Writes lanes 0..n-1 of r to d and clears the rest, in one store. */
+NX_HOT void nx_stps(V128 *d, __m128 r, int n) {
+    if (n == 2) r = _mm_castpd_ps(_mm_move_sd(_mm_setzero_pd(), _mm_castps_pd(r)));
+    else if (n == 1) r = _mm_move_ss(_mm_setzero_ps(), r);
+    _mm_storeu_ps(d->f, r);
+}
+NX_HOT int nx_lanes(int n) { return (1 << n) - 1; }
+NX_HOT int nx_nanps(__m128 r, int n) { return _mm_movemask_ps(_mm_cmpunord_ps(r, r)) & nx_lanes(n); }
+NX_HOT __m128 nx_signps(void) { return _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u)); }
+
+/* The packed form of f3s on lanes 0..n-1 of a and b (acc: the destination's old value, for the accumulating forms). Returns 1 when it
+ * wrote d, 0 when the element-by-element code must run instead: a NaN result (or, for the max/min family, a NaN operand), a form
+ * without a packed equivalent. */
+NX_HOT int v_f3s_fast(V128 *d, __m128 a, __m128 b, const V128 *acc, int op, int n) {
+    const __m128 sign = nx_signps();
+    __m128 r;
+    switch (op) {
+    case F_ADD: r = _mm_add_ps(a, b); break;
+    case F_SUB: r = _mm_sub_ps(a, b); break;
+    case F_MUL: r = _mm_mul_ps(a, b); break;
+    case F_DIV: r = _mm_div_ps(a, b); break;
+    case F_ABD:
+        r = _mm_sub_ps(a, b);
+        if (__builtin_expect(nx_nanps(r, n), 0)) return 0;
+        nx_stps(d, _mm_andnot_ps(sign, r), n);
+        return 1;
+#ifdef __FMA__
+    case F_MLA: r = _mm_fmadd_ps(a, b, nx_ldps(acc, n)); break;
+    case F_MLS: r = _mm_fnmadd_ps(a, b, nx_ldps(acc, n)); break;       /* fma(-a, b, acc): the negation is exact */
+    case F_RECPS: r = _mm_fnmadd_ps(a, b, _mm_set1_ps(2.0f)); break;   /* inf * 0 gives a NaN here: the element code returns 2.0 */
+    case F_RSQRTS:                                                     /* fp_rsqrts32's main case: |a| >= 2 * FLT_MIN, a halved */
+        if ((_mm_movemask_ps(_mm_cmpge_ps(_mm_andnot_ps(sign, a), _mm_set1_ps(2.0f * 1.17549435e-38f))) & nx_lanes(n)) != nx_lanes(n)) return 0;
+        r = _mm_fmadd_ps(_mm_mul_ps(_mm_xor_ps(a, sign), _mm_set1_ps(0.5f)), b, _mm_set1_ps(1.5f));
+        break;
+#endif
+    case F_MAX: case F_MIN: case F_MAXNM: case F_MINNM: {             /* without NaN operands: the larger / smaller, +0 > -0 */
+        if (_mm_movemask_ps(_mm_cmpunord_ps(a, b)) & nx_lanes(n)) return 0;
+        const __m128 z = _mm_castsi128_ps(_mm_cmpeq_epi32(_mm_castps_si128(_mm_andnot_ps(sign, _mm_or_ps(a, b))), _mm_setzero_si128()));
+        const int mx = op == F_MAX || op == F_MAXNM;
+        const __m128 zr = mx ? _mm_and_ps(a, b) : _mm_or_ps(a, b), nr = mx ? _mm_max_ps(a, b) : _mm_min_ps(a, b);
+        nx_stps(d, _mm_or_ps(_mm_and_ps(z, zr), _mm_andnot_ps(z, nr)), n);
+        return 1;
+    }
+    case F_CMEQ: nx_stps(d, _mm_cmpeq_ps(a, b), n); return 1;
+    case F_CMGE: nx_stps(d, _mm_cmpge_ps(a, b), n); return 1;
+    case F_CMGT: nx_stps(d, _mm_cmpgt_ps(a, b), n); return 1;
+    case F_ADDP:                                                       /* pairs of a, then pairs of b */
+        if (n == 2) { a = _mm_movelh_ps(a, b); b = a; }
+        else if (n != 4) return 0;
+        r = _mm_add_ps(_mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0)), _mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1)));
+        break;
+    default: return 0;
+    }
+    if (__builtin_expect(nx_nanps(r, n), 0)) return 0;
+    nx_stps(d, r, n);
+    return 1;
+}
+#endif
+
+NX_HOT void v_f3v(V128 *d, const V128 *pn, const V128 *pm, int op, int dbl, int n) {
+#ifdef NX_X86_SIMD
+    if (!dbl && v_f3s_fast(d, nx_ldps(pn, n), nx_ldps(pm, n), d, op, n)) return;
+#endif
+    v_f3v_ref(d, pn, pm, op, dbl, n);
+}
+NX_HOT void v_f3e(V128 *d, const V128 *pn, const V128 *pm, int idx, int op, int dbl, int n) {
+#ifdef NX_X86_SIMD
+    if (!dbl && v_f3s_fast(d, nx_ldps(pn, n), _mm_set1_ps(pm->f[idx]), d, op, n)) return;
+#endif
+    v_f3e_ref(d, pn, pm, idx, op, dbl, n);
 }
 
 enum { F1_ABS, F1_NEG, F1_SQRT, F1_RSQRTE, F1_RECPE, F1_SCVTF, F1_UCVTF, F1_CVTZS, F1_CVTZU,
        F1_CMEQ0, F1_CMGT0, F1_CMGE0, F1_CMLT0, F1_CMLE0 };
 
-static inline void v_f1v(V128 *d, const V128 *pn, int op, int dbl, int n) {
+NX_SLOW void v_f1v_ref(V128 *d, const V128 *pn, int op, int dbl, int n) {
     V128 a = *pn, r;
     r.d[0] = 0; r.d[1] = 0;
     for (int i = 0; i < n; i++) {
@@ -157,6 +247,30 @@ static inline void v_f1v(V128 *d, const V128 *pn, int op, int dbl, int n) {
         }
     }
     *d = r;
+}
+
+NX_HOT void v_f1v(V128 *d, const V128 *pn, int op, int dbl, int n) {
+#ifdef NX_X86_SIMD
+    if (!dbl) {
+        const __m128 a = nx_ldps(pn, n), zero = _mm_setzero_ps();
+        __m128 r = a;
+        int ok = 1;
+        switch (op) {
+        case F1_ABS: r = _mm_andnot_ps(nx_signps(), a); break;
+        case F1_NEG: r = _mm_xor_ps(a, nx_signps()); break;
+        case F1_SQRT: r = _mm_sqrt_ps(a); ok = !nx_nanps(r, n); break;
+        case F1_SCVTF: r = _mm_cvtepi32_ps(_mm_castps_si128(a)); break;
+        case F1_CMEQ0: r = _mm_cmpeq_ps(a, zero); break;
+        case F1_CMGT0: r = _mm_cmpgt_ps(a, zero); break;
+        case F1_CMGE0: r = _mm_cmpge_ps(a, zero); break;
+        case F1_CMLT0: r = _mm_cmplt_ps(a, zero); break;
+        case F1_CMLE0: r = _mm_cmple_ps(a, zero); break;
+        default: ok = 0; break;
+        }
+        if (__builtin_expect(ok, 1)) { nx_stps(d, r, n); return; }
+    }
+#endif
+    v_f1v_ref(d, pn, op, dbl, n);
 }
 
 /* FRINTA / FRINTM / FRINTP / FRINTZ / FRINTN / FRINTX / FRINTI on n elements; modes as in fp_frint32 (fpexact.h). */
@@ -339,20 +453,52 @@ static inline void v_bitsel(V128 *d, const V128 *pn, const V128 *pm, int kind, i
     *d = r;
 }
 
-static inline void v_dup(V128 *d, uint64_t value, int sz, int n) {
+static inline void v_dup_ref(V128 *d, uint64_t value, int sz, int n) {
     V128 r;
     r.d[0] = 0; r.d[1] = 0;
     for (int i = 0; i < n; i++) vset(&r, sz, i, value);
     *d = r;
 }
+NX_HOT void v_dup(V128 *d, uint64_t value, int sz, int n) {
+#ifdef NX_X86_SIMD
+    const uint64_t v = sz == 0 ? (uint8_t)value * 0x0101010101010101ull : sz == 1 ? (uint16_t)value * 0x0001000100010001ull
+                     : sz == 2 ? (uint32_t)value * 0x0000000100000001ull : value;
+    const int bytes = n << sz;
+    if (bytes == 16 || bytes == 8) {
+        _mm_storeu_si128((__m128i *)d, _mm_set_epi64x(bytes == 16 ? (long long)v : 0, (long long)v));
+        return;
+    }
+#endif
+    v_dup_ref(d, value, sz, n);
+}
 
-static inline void v_ext(V128 *d, const V128 *pn, const V128 *pm, int imm, int q) {
+static inline void v_ext_ref(V128 *d, const V128 *pn, const V128 *pm, int imm, int q) {
     V128 a = *pn, b = *pm, r;
     int n = q ? 16 : 8;
     r.d[0] = 0; r.d[1] = 0;
     for (int i = 0; i < n; i++) r.b[i] = (imm + i < n) ? a.b[imm + i] : b.b[imm + i - n];
     *d = r;
 }
+#ifdef NX_X86_SIMD
+#define NX_EXT_CASE(k) case k: r = _mm_or_si128(_mm_srli_si128(a, k), _mm_slli_si128(b, 16 - k)); break;
+/* Bytes imm.. of a:b (q = 1), or of the low halves of a and b taken as one 16-byte value (q = 0). The byte shifts need constant
+ * counts: the lifter's imm is one, and the switch folds once this is inlined. */
+NX_HOT void v_ext(V128 *d, const V128 *pn, const V128 *pm, int imm, int q) {
+    __m128i a = _mm_loadu_si128((const __m128i *)pn), b = _mm_loadu_si128((const __m128i *)pm), r;
+    if (!q) { a = _mm_unpacklo_epi64(a, b); b = _mm_setzero_si128(); }
+    switch (imm) {
+    case 0: r = a; break;
+    NX_EXT_CASE(1) NX_EXT_CASE(2) NX_EXT_CASE(3) NX_EXT_CASE(4) NX_EXT_CASE(5) NX_EXT_CASE(6) NX_EXT_CASE(7) NX_EXT_CASE(8)
+    NX_EXT_CASE(9) NX_EXT_CASE(10) NX_EXT_CASE(11) NX_EXT_CASE(12) NX_EXT_CASE(13) NX_EXT_CASE(14) NX_EXT_CASE(15)
+    default: v_ext_ref(d, pn, pm, imm, q); return;
+    }
+    if (!q) r = _mm_move_epi64(r);
+    _mm_storeu_si128((__m128i *)d, r);
+}
+#undef NX_EXT_CASE
+#else
+#define v_ext v_ext_ref
+#endif
 
 /* TBL / TBX with `len` consecutive table registers starting at index rn. */
 static inline void v_tbl(Ctx *c, int rd, int rn, int len, int rm, int q, int tbx) {

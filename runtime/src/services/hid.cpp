@@ -145,6 +145,8 @@ struct HidState {
     uint32_t nm_merged_types = 0;
     uint64_t nm_btn_left = 0, nm_btn_right = 0;   // NmouseButtonConfigJoy{Left,Right}Jcms (8 bytes each), stored only
     int32_t nm_x = -1, nm_y = -1;           // last sampled pointer (-1: none yet)
+    float nm_u = -1, nm_v = -1;             // last fed pointer, to see the mouse move
+    bool nm_in_use = false;                 // the mouse is "on its surface": set by mouse use, cleared by pad buttons (sample_nmouse)
     uint32_t nm_logged = 0, jcms_starts = 0, active_logs = 0;
     bool vib214_logged = false;
     std::atomic<int> resources{0};          // live IAppletResource objects
@@ -471,11 +473,36 @@ void jcms_setup(HidState& s) {
     for (uint32_t i = 0; i < 16; ++i) ring_init<JcmsState>(b, i * kJcmsRingSize);
 }
 
+// A pad input that puts a real Joy-Con 2 mouse down: A/B/X/Y or the right stick. The left stick moves the character in mouse mode,
+// so it does not count (the game's guide: only lifting the Joy-Con returns to buttons).
+bool pad_takes_over(const InputSnapshot& snap) {
+    using namespace nxrt::hid;
+    constexpr uint64_t kFace = btn(kBtnA) | btn(kBtnB) | btn(kBtnX) | btn(kBtnY);
+    constexpr int32_t kStick = 32767 * 4 / 10;
+    for (const NpadInput& p : snap.npad) {
+        if (!p.connected) continue;
+        if ((p.buttons & kFace) || std::abs(p.right.x) > kStick || std::abs(p.right.y) > kStick) return true;
+    }
+    return false;
+}
+
 // One Nmouse sample from the play layer's feed: the pointer in the pointer range, the range itself, the buttons, the wheel (120 per notch, inferred from the game clamping its sum at +-600), and "on its surface" while jc2_mouse_active().
-// Caller holds st().mu.
-void sample_nmouse(HidState& s) {
+// "On its surface" also needs the mouse in use: moving, clicking or scrolling sets it, and a pad's A/B/X/Y or right stick clears it,
+// as lifting the Joy-Con does. The game only leaves mouse controls after that bit stays clear (main 0x19c7024), so without this a
+// mouse nudged once kept the game in mouse mode for good. Caller holds st().mu.
+void sample_nmouse(HidState& s, const InputSnapshot& snap) {
     if (!s.nm_addr || !g_jc2_listed.load()) return;
-    const bool active = nxrt::hid::jc2_mouse_active();
+    const bool live = nxrt::hid::jc2_mouse_active();
+    {
+        Jc2Feed& f = feed();
+        std::lock_guard<std::mutex> lk(f.mu);
+        const bool moved = s.nm_u >= 0 && (f.m.u != s.nm_u || f.m.v != s.nm_v);
+        if (live && (moved || f.m.buttons || f.wheel_x != 0 || f.wheel_y != 0)) s.nm_in_use = true;
+        s.nm_u = f.m.u;
+        s.nm_v = f.m.v;
+    }
+    if (s.nm_in_use && pad_takes_over(snap)) s.nm_in_use = false;
+    const bool active = live && s.nm_in_use;
     NmouseInternal ns{};
     const int32_t prev_x = s.nm_x, prev_y = s.nm_y;
     float wx = 0, wy = 0;
@@ -1114,10 +1141,13 @@ void setup_hid(ipc::Service& svc) {
     // InitializeNmouse (sdk 0x75006569e0, the form Pokopia uses: 0xC000 bytes, 1920x1080).
     svc.add_cmd(3139, "InitializeNmouse", [](ipc::Request& req, ipc::Response&) -> uint32_t { return nm_initialize(req, "InitializeNmouse"); });
     // SetNmousePointerPosition (sdk 0x7500657410): s32 x @0, s32 y @4, aruid @8, NmouseHandle @0x10. The pointer is the PC mouse, which
-    // the game cannot move: accepted and logged.
+    // the game cannot move: accepted and logged (Info for the first calls: Fortune's Weave centres the pointer every frame).
     svc.add_cmd(3140, "SetNmousePointerPosition", [](ipc::Request& req, ipc::Response&) -> uint32_t {
-        NXLOG_I("hid", "SetNmousePointerPosition(%d, %d, handle %llx): the pointer is the PC mouse, not moved", req.arg<int32_t>(0),
-                req.arg<int32_t>(4), static_cast<unsigned long long>(req.arg<uint64_t>(0x10)));
+        static std::atomic<uint32_t> calls{0};
+        const LogLevel level = calls.fetch_add(1, std::memory_order_relaxed) < 3 ? LogLevel::Info : LogLevel::Debug;
+        if (log_enabled(level))
+            logf(level, "hid", "SetNmousePointerPosition(%d, %d, handle %llx): the pointer is the PC mouse, not moved", req.arg<int32_t>(0),
+                 req.arg<int32_t>(4), static_cast<unsigned long long>(req.arg<uint64_t>(0x10)));
         return 0;
     });
     // EnableNmousePointer (sdk 0x75006572b0): bool @0, aruid @8, NmouseHandle @0x10. Stored in that handle's info byte, which the client
@@ -1174,6 +1204,8 @@ void hid_reset() {
     s.nm_btn_left = s.nm_btn_right = 0;
     s.nm_x = s.nm_y = -1;
     s.nm_logged = s.jcms_starts = s.active_logs = 0;
+    s.nm_u = s.nm_v = -1;
+    s.nm_in_use = false;
     s.vib214_logged = false;
     g_jc2_listed.store(false);
     g_jc2_active.store(false);
@@ -1200,7 +1232,7 @@ void hid_sample_once() {
     if (s.touch_active) sample_touch(host, snap.touch);
     if (s.mouse_active) sample_mouse(host, snap.mouse);
     if (s.keyboard_active) sample_keyboard(host, snap.keyboard);
-    sample_nmouse(s);
+    sample_nmouse(s, snap);
 }
 
 void hid_set_background_sampling(bool enabled) {

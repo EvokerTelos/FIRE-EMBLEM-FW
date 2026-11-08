@@ -86,14 +86,17 @@ void tex_edit_note(const Texture& t);   // the texture was given edited data (up
 int tex_edit_quality();                 // [nvn] tex_edit_quality, bc7e preset 0..6 (default 1)
 
 // [gfx] astc_quality (env NXRT_GFX_ASTC_QUALITY), read at every call so a test can change it; the GPU layer reads it once per run (it applies on restart):
-//   fast         ASTC -> BC7 at the preset [nvn] bc7_quality (default 3), written to the disk cache, as before.
-//   high         (default) the same on the first use of a texture, and a background thread re-encodes it with the slow preset (kHighPreset, or
+//   fast         ASTC -> BC7 at the preset [nvn] bc7_quality (default 3; 1 with the C++ build of bc7e), written to the disk cache, as before.
+//                The default with the C++ build (a2b_bc7_encoder: A2B_ENCODER_CPP, about 3 to 4 times slower than the ISPC build).
+//   high         (default with the ISPC build) the same on the first use of a texture, and a background thread re-encodes it with the slow preset (kHighPreset; 3 with the C++ build; or
 //                [nvn] bc7_quality when that is higher) into the cache; the next start finds the high entry. Entries of the fast preset
 //                (including the BC5 / RGBA8 entries of the setup tool) stay valid and are used until the high entry exists.
 //   uncompressed ASTC -> RGBA8 for every texture (4 to 16 times the size of ASTC in video memory); the disk cache is not used.
 enum class AstcQuality { Fast, High, Uncompressed };
 AstcQuality astc_quality();
+AstcQuality astc_quality_default();   // when the key is unset or not one of the three: high, or fast with the C++ build of bc7e
 const char* astc_quality_name(AstcQuality q);
+int bc7_fast_preset();                // [nvn] bc7_quality as the transcodes use it (default 3, 1 with the C++ build of bc7e)
 constexpr int kHighPreset = 5;   // bc7e "veryslow", the preset the setup tool can pre-build with (--bc7-quality 5)
 
 // Uncompressed mode: counts a texture whose image was made as RGBA8 and logs the running video memory estimate (RGBA8 now against BC7 and ASTC).

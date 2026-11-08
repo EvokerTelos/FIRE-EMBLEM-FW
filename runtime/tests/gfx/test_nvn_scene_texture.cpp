@@ -23,6 +23,7 @@
 #endif
 #include "tegra_tiling.h"
 #include "nvn_app.h"
+#include "nvn_texdata.h"
 #include "nvn_texture_layout.h"
 NXTEST_GROUP(gfx_nvn_scene_texture)
 
@@ -857,11 +858,11 @@ NXTEST(real_astc_8x5_texture_transcoded) {
     check_clean(app);
 #ifdef NXRT_HAVE_BC7_REF
     // The expected picture is worked out here, with the encoder of this build: level 0 goes through the same a2b_transcode call and options the back end uses
-    // (quality from [nvn] bc7_quality, default 3), the BC7 blocks are decoded with the reference decoder, and the frame must equal that decode up to the
+    // (quality from [nvn] bc7_quality: default 3, 1 with the C++ build of bc7e), the BC7 blocks are decoded with the reference decoder, and the frame must equal that decode up to the
     // rounding of the GPU's own BC7 decode. A stored image would go stale with every encoder revision.
     {
         a2b_options eo{};
-        eo.quality = static_cast<int>(nxrt::config_get_int("nvn", "bc7_quality", 3));
+        eo.quality = nxrt::nvn::be::bc7_fast_preset();
         eo.threads = 0;
         eo.perceptual = 0;
         eo.allow_opaque_mode6 = 0;

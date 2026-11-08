@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Validates a decrypted game dump folder. Read-only: nothing here writes to the dump.
+//! Checks the player's own decrypted dump. Read-only: nothing here writes to the dump.
 //!
-//! Expected layout: `<dump>/base/{exefs,romfs}` and `<dump>/updates/<version>/{exefs,romfs}`.
-//! The highest valid update is used; with none, the base.
+//! Accepted layouts: a folder with `exefs/` and `romfs/` (one title version, e.g. the update), or a dump root with `base/` and
+//! `updates/<version>/`, each holding `exefs/` and `romfs/`. The newest complete candidate whose `main` is a supported build is used.
 
 use serde::Serialize;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+pub const EXEFS_FILES: [&str; 6] = ["main", "sdk", "subsdk0", "subsdk1", "subsdk2", "rtld"];
 
 #[derive(Serialize, Clone)]
 pub struct Check {
@@ -16,9 +19,8 @@ pub struct Check {
 
 #[derive(Serialize, Clone)]
 pub struct Candidate {
-    /// "base" or "update"
+    /// "folder", "base" or "update"
     pub kind: String,
-    /// Update version folder name; empty for the base.
     pub version: String,
     pub path: String,
     pub exefs: String,
@@ -40,27 +42,51 @@ pub fn fwd(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-fn check_candidate(kind: &str, version: &str, dir: &Path, files: &[String]) -> Candidate {
-    let exefs = dir.join("exefs");
-    let romfs = dir.join("romfs");
-    let mut checks = Vec::new();
-    for f in files {
-        checks.push(Check { label: format!("exefs/{}", f), ok: exefs.join(f).is_file() });
+/// The builds of main the recomp supports: `BUILDS = { '<40 hex>': '<version>', ... }` in recomp/games/fefw/config.py.
+pub fn supported_builds(repo: &Path) -> Vec<(String, String)> {
+    let text = fs::read_to_string(repo.join("recomp").join("games").join("fefw").join("config.py")).unwrap_or_default();
+    let Some(start) = text.find("BUILDS") else { return vec![] };
+    let body = &text[start..];
+    let body = &body[..body.find('}').unwrap_or(body.len())];
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let q: Vec<&str> = line.split('\'').collect();
+        if q.len() >= 4 && q[1].len() == 40 && q[1].chars().all(|c| c.is_ascii_hexdigit()) {
+            out.push((q[1].to_uppercase(), q[3].to_string()));
+        }
     }
-    checks.push(Check { label: "romfs/".to_string(), ok: romfs.is_dir() });
-    let ok = checks.iter().all(|c| c.ok);
-    Candidate {
-        kind: kind.to_string(),
-        version: version.to_string(),
-        path: fwd(dir),
-        exefs: fwd(&exefs),
-        romfs: fwd(&romfs),
-        ok,
-        checks,
-    }
+    out
 }
 
-/// Newest first: numeric versions by value, then anything non-numeric by name.
+/// Build id of an NSO (20 bytes at 0x40), upper-case hex; None if the file is missing, short or not a decrypted NSO.
+fn build_id(main: &Path) -> Option<String> {
+    let mut h = [0u8; 0x54];
+    fs::File::open(main).ok()?.read_exact(&mut h).ok()?;
+    if &h[..4] != b"NSO0" {
+        return None;
+    }
+    Some(h[0x40..0x54].iter().map(|b| format!("{:02X}", b)).collect())
+}
+
+fn check_candidate(kind: &str, version: &str, dir: &Path, builds: &[(String, String)]) -> Candidate {
+    let exefs = dir.join("exefs");
+    let romfs = dir.join("romfs");
+    let mut checks: Vec<Check> = EXEFS_FILES.iter().map(|f| Check { label: format!("exefs/{f}"), ok: exefs.join(f).is_file() }).collect();
+    checks.push(Check { label: "romfs/".into(), ok: romfs.is_dir() });
+    if exefs.join("main").is_file() {
+        let id = build_id(&exefs.join("main"));
+        checks.push(Check { label: "exefs/main is decrypted".into(), ok: id.is_some() });
+        if let Some(id) = id {
+            if !builds.is_empty() {
+                let want = builds.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>().join(" or ");
+                checks.push(Check { label: format!("supported version ({want})"), ok: builds.iter().any(|(b, _)| *b == id) });
+            }
+        }
+    }
+    let ok = checks.iter().all(|c| c.ok);
+    Candidate { kind: kind.into(), version: version.into(), path: fwd(dir), exefs: fwd(&exefs), romfs: fwd(&romfs), ok, checks }
+}
+
 fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<u64>(), b.parse::<u64>()) {
         (Ok(x), Ok(y)) => y.cmp(&x),
@@ -70,64 +96,66 @@ fn version_order(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-pub fn scan(path: &str) -> DumpReport {
+pub fn scan(path: &str, builds: &[(String, String)]) -> DumpReport {
     let root = PathBuf::from(path.trim());
-    // the exefs files and the example folder name come from the game manifest
-    let (files, example) = match crate::manifest::get() {
-        Ok(m) => (m.exefs_files(), m.dump.example_folder.clone()),
-        Err(e) => {
-            return DumpReport { path: fwd(&root), exists: root.is_dir(), errors: vec![e], candidates: Vec::new(), chosen: None };
-        }
-    };
-    let mut report = DumpReport {
-        path: fwd(&root),
-        exists: root.is_dir(),
-        errors: Vec::new(),
-        candidates: Vec::new(),
-        chosen: None,
-    };
+    let mut report = DumpReport { path: fwd(&root), exists: root.is_dir(), errors: vec![], candidates: vec![], chosen: None };
     if path.trim().is_empty() {
-        report.errors.push("No folder chosen yet.".to_string());
+        report.errors.push("No folder chosen yet.".into());
         return report;
     }
     if !report.exists {
-        report.errors.push("That folder does not exist or cannot be read.".to_string());
+        report.errors.push("That folder does not exist or cannot be read.".into());
         return report;
     }
-    let base = root.join("base");
+    if root.join("exefs").is_dir() {
+        report.candidates.push(check_candidate("folder", "", &root, builds));
+    }
     let updates = root.join("updates");
-    if !base.is_dir() && !updates.is_dir() {
-        report.errors.push(format!(
-            "This folder has no base/ or updates/ subfolder. Pick the folder that contains them (for example {}).",
-            example
-        ));
-        return report;
-    }
-
     if updates.is_dir() {
         let mut versions: Vec<String> = fs::read_dir(&updates)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter(|e| e.path().is_dir())
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect()
-            })
+            .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
             .unwrap_or_default();
         versions.sort_by(|a, b| version_order(a, b));
         for v in versions {
-            report.candidates.push(check_candidate("update", &v, &updates.join(&v), &files));
+            report.candidates.push(check_candidate("update", &v, &updates.join(&v), builds));
         }
     }
-    if base.is_dir() {
-        report.candidates.push(check_candidate("base", "", &base, &files));
+    if root.join("base").is_dir() {
+        report.candidates.push(check_candidate("base", "", &root.join("base"), builds));
     }
-
+    if report.candidates.is_empty() {
+        report.errors.push("This folder has no exefs/ folder, and no base/ or updates/ folder holding one. Pick the folder of your dump that contains exefs/ and romfs/.".into());
+        return report;
+    }
     report.chosen = report.candidates.iter().find(|c| c.ok).cloned();
     if report.chosen.is_none() {
-        report.errors.push(format!(
-            "No usable game files found. Each of base/ or an updates/<version>/ folder needs exefs/ ({}) and romfs/.",
-            files.join(", ")
-        ));
+        let wrong = report.candidates.iter().any(|c| c.checks.iter().any(|k| k.label.starts_with("supported version") && !k.ok));
+        report.errors.push(if wrong {
+            "These game files are a different version from the one this recomp supports. Dump the supported update.".into()
+        } else {
+            "No usable game files found. The folder needs exefs/ (main, sdk, subsdk0, subsdk1, subsdk2, rtld, decrypted) and romfs/.".into()
+        });
     }
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_id_of_an_nso_header() {
+        let dir = std::env::temp_dir().join(format!("fefw_dump_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut h = vec![0u8; 0x60];
+        h[..4].copy_from_slice(b"NSO0");
+        h[0x40] = 0xdb;
+        h[0x53] = 0x0e;
+        fs::write(dir.join("main"), &h).unwrap();
+        assert_eq!(build_id(&dir.join("main")).unwrap(), format!("DB{}0E", "00".repeat(18)));
+        h[0] = b'X';
+        fs::write(dir.join("main"), &h).unwrap();
+        assert_eq!(build_id(&dir.join("main")), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

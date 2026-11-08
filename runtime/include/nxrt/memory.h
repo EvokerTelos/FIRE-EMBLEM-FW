@@ -49,19 +49,25 @@ bool decommit(uint64_t addr, uint64_t size);
 bool protect(uint64_t addr, uint64_t size, Prot p);
 uint64_t alloc_kernel(uint64_t size, uint64_t align = kPage);   // committed RW memory from the kernel region (bump allocator)
 bool is_mapped(uint64_t addr, uint64_t size);                // every byte of the range is committed and accessible (VirtualQuery)
-// From the heap page table, no VirtualQuery: 1 when every page of the range is committed read-write as far as this module set it (the
-// write tracker's own read-only arming is not seen here), 0 when one is not, -1 when the range is not in the heap view (or [memory]
-// fast_query is off).
-int heap_rw_state(uint64_t addr, uint64_t size);
 
 // ---- heap section ---------------------------------------------------------------------------------------------------
-// One pagefile-backed section (SEC_RESERVE, nothing is charged until committed) with a primary view at kHeapBase.
+// One pagefile-backed section (SEC_RESERVE, nothing is charged until committed) with a primary view at kHeapBase. Under Wine
+// ([memory] heap_section = auto) it is plain private memory instead: Wine backs sections with shared files, and Linux GPU drivers
+// import only anonymous memory (VK_EXT_external_memory_host through amdgpu userptr is anonymous-only), so no pool could reach the GPU.
+// Without a section there are no alias or private views (heap_alias / heap_private_view return 0 / nullptr).
 bool heap_create(uint64_t reserve_bytes);       // 0 = use the configured size; a second call is ignored
 bool heap_exists();
+bool heap_has_section();                        // false: private memory, no other views of the heap pages
 uint64_t heap_reserved();                       // section size
 bool heap_commit(uint64_t offset, uint64_t size);     // commit [kHeapBase+offset, +size) (page granularity)
 bool heap_decommit(uint64_t offset, uint64_t size);
 uint64_t heap_committed();                      // bytes committed through heap_commit minus heap_decommit
+// The heap's own page table, without VirtualQuery (which walks every page of the run of identical pages after the address: up to 85 ms
+// on a 10 GiB heap): 1 when every page of [addr, addr + size) is in the primary view and this module left it committed read-write, 0 when
+// one is not, -1 when the table cannot say (outside the primary view, [memory] fast_query = false). heap_epoch() changes with every
+// change of the table, inside the change's ww::OsWriteScope: the write tracker reads it before and after, without holding a region lock.
+int heap_rw_pages(uint64_t addr, uint64_t size);
+uint64_t heap_epoch();
 // Another view of section pages [offset, offset+size). offset and size must be multiples of kAllocGranularity.
 // `at` == 0 picks a free range in the alias region. Returns the guest(=host) address or 0. The pages must be committed
 // (in the section) before they are touched through any view.

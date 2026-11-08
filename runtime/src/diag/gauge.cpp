@@ -375,6 +375,24 @@ void soak_note_frame() {
     hitch_on_frame(t, prev_t, n + 1);
 }
 
+size_t frame_times_recent(float* ms, size_t n) {
+    const uint64_t total = g_ring_n.load(std::memory_order_acquire);
+    if (!ms || n == 0 || total < 2) return 0;
+    const size_t k = static_cast<size_t>(std::min<uint64_t>({static_cast<uint64_t>(n), total - 1, kRing - 2}));
+    const double to_ms = 1000.0 / qpc_freq();
+    for (size_t i = 0; i < k; i++) {   // frame (total - k + i) minus the one before it
+        const uint64_t idx = total - k + i;
+        const uint64_t a = g_ring[(idx - 1) % kRing].load(std::memory_order_relaxed), b = g_ring[idx % kRing].load(std::memory_order_relaxed);
+        ms[i] = b > a ? static_cast<float>(static_cast<double>(b - a) * to_ms) : 0.f;
+    }
+    return k;
+}
+
+double hitch_phase_total_ms(int phase) {
+    if (phase < 0 || phase >= kHpCount) return 0;
+    return static_cast<double>(g_phase[phase].load(std::memory_order_relaxed)) * 1000.0 / qpc_freq();
+}
+
 uint64_t hitch_ticks() { return qpc(); }
 void hitch_phase_add(int phase, uint64_t ticks) {
     if (phase >= 0 && phase < kHpCount) g_phase[phase].fetch_add(ticks, std::memory_order_relaxed);

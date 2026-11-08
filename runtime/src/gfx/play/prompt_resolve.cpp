@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "prompt_resolve.h"
+#include "nxrt/host_device.h"
 
 #include <cctype>
 #include <vector>
@@ -114,6 +115,11 @@ std::string kbm_pack_name(const InputId& id) {
     return n.empty() ? std::string() : "kbm/" + n;
 }
 
+std::string pad_button_name(PromptStyle style, const PadSettings& pad, bool label_abxy, Btn b) {
+    if (style != PromptStyle::Xbox && style != PromptStyle::PlayStation) return {};
+    return pad_name(style, pad, label_abxy, b);
+}
+
 bool input_for_button(const Settings& s, Ctx ctx, Btn b, InputId* out) {
     const uint64_t bit = button_bit(b);
     if (!bit) return false;
@@ -175,6 +181,10 @@ PromptStyle auto_style(LastDevice last, int last_pad_kind, int connected_pad_kin
             default: return PromptStyle::Xbox;     // Xbox pads and every pad that is neither a PlayStation nor a Switch pad
         }
     };
+    // A handheld is played with its own controls: its trackpad, touchscreen and on-screen keyboard reach the game as mouse and keyboard
+    // input, which would switch the prompts to keyboard keys (the title screen showed Enter for A on a Legion Go S). There the built-in
+    // pad (Xbox layout) decides; [prompts] style keyboard still shows keys.
+    if (host_is_handheld()) return last == LastDevice::Pad ? from_kind(last_pad_kind) : connected_pad_kind >= 0 ? from_kind(connected_pad_kind) : PromptStyle::Xbox;
     switch (last) {
         case LastDevice::KeyboardMouse: return PromptStyle::Keyboard;
         case LastDevice::Pad: return from_kind(last_pad_kind);

@@ -24,7 +24,6 @@
 
 #include "nvn_decoded.h"
 #include "nvn_format.h"
-#include "nvn_small.h"
 
 namespace nxrt::nvn::be {
 
@@ -185,6 +184,10 @@ struct TexturePool : Obj {
     int64_t offset = 0;
     int count = 0;
     std::vector<Entry> entries;             // index = texture id
+    // Registrations so far and the ids of the latest ones, oldest first (changes.back() is registration `version`): the pool descriptor
+    // arrays (nvn_pipeline.cpp) write only the ids changed since they were last current. Under `lock`.
+    uint64_t version = 0;
+    std::vector<uint32_t> changes;
     std::shared_mutex lock;
 };
 
@@ -196,8 +199,18 @@ struct SamplerPool : Obj {
     int count = 0;
     std::vector<SamplerInfo> entries;
     std::vector<uint8_t> used;
+    uint64_t version = 0;                   // as TexturePool's
+    std::vector<uint32_t> changes;
     std::shared_mutex lock;
 };
+
+// Notes registration `id` in a pool's change list (caller holds the pool's lock exclusively); the list keeps the latest 4096 to 8192.
+template <class Pool>
+inline void pool_note_change(Pool& p, int id) {
+    ++p.version;
+    p.changes.push_back(static_cast<uint32_t>(id));
+    if (p.changes.size() > 8192) p.changes.erase(p.changes.begin(), p.changes.begin() + 4096);
+}
 
 // Every initialized texture is in a registry keyed by its storage range, so a flush of pool memory can mark the textures
 // that live there as CPU-written (nvn_texture_registry.cpp).
@@ -262,23 +275,7 @@ struct Program : Obj {
     uint32_t serial = 0;
     std::atomic<uint8_t> gpl_bound{0};      // 1 once a command buffer was recorded with these shaders (the shader parts are queued first); reset by SetShaders
     std::string label;
-    // On-demand translation: stages whose block the shader cache's translator is still working on. Draws and dispatches with this program
-    // bound are skipped until program_resolve_pending() fills the stages in. pending_mu guards pending, stage[], code_hash[] and linked
-    // against the replay thread's resolve (SetShaders holds it throughout; the resolve only try-locks).
-    struct PendingBlock {
-        const uint8_t* code;
-        const uint8_t* control;
-        std::string hash;
-    };
-    std::mutex pending_mu;
-    std::vector<PendingBlock> pending;
-    std::atomic<bool> has_pending{false};
-    bool missing_hard = false;              // a block with no translation that is not being translated either
-    uint32_t sample_shading = 0;            // nvnProgramSetSampleShading / ProgramBuilder (kept, not applied: pipelines do not use sample shading)
 };
-
-// Fills in the stages of `p` whose on-demand translation finished (replay thread). True while some stage is still being translated.
-bool program_resolve_pending(Program* p);
 
 // ---- synchronisation -----------------------------------------------------------------------------------------------------
 struct Sync : Obj {
@@ -309,6 +306,7 @@ struct Window : Obj {
     int crop[4] = {0, 0, 0, 0};             // x, y, w, h of the part shown (w == 0: all)
     void* native_window = nullptr;
     WindowHdrInfo hdr;                      // NVN2 colour space and HDR metadata (from the builder, then the window setters)
+    std::atomic<uint64_t> present_serial[4] = {};   // the GPU serial each texture's last present followed (NVN2 acquire syncs)
     std::mutex lock;
 };
 
@@ -321,7 +319,6 @@ struct Device : Obj {
     int depth_mode = NVN_DEPTH_MODE_NEAR_IS_MINUS_W;
     std::atomic<uint32_t> next_texture_id{1};
     std::atomic<uint32_t> debug_domain{1};
-    FastClearTables fast_clear;   // nvnDeviceRegisterFastClear* (nvn_small.h)
 };
 
 struct Queue : Obj {
@@ -330,6 +327,7 @@ struct Queue : Obj {
     Device* device = nullptr;
     int flags = 0;
     size_t command_memory = 0, compute_memory = 0, control_memory = 0;
+    std::atomic<uint64_t> last_serial{0};   // the serial of this queue's last submission (NVN2 fence syncs)
 };
 
 }  // namespace nxrt::nvn::be

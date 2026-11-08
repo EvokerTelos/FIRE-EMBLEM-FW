@@ -61,8 +61,7 @@ Statistics over all 99,012 distinct code blocks; confirmed on the 12 control sec
 | +0x40 | u32 constant data offset in the code area (0x100-aligned) | +0x40 + +0x3c ≤ code size in every block |
 | **+0x44** | **u32 code area length** (what to hash / upload) | = GPU code header code length in all 99,012 |
 | +0x4c | u32 register count (*inferred*: 0x6..0xff, typical 0x40-0x80) | |
-| +0x50 | u32 local memory bytes per thread (0, 0x200, 0x400, 0xc00, 0x1800...) | non-zero exactly when the SASS has LDL/STL (all 3 corpora, every sampled block; for graphics also the SPH's local memory low size is non-zero exactly then); was documented as shared memory until the cross-check, see nvn2_layout_xcheck.md. Compute: +0x68 = +0x50 / 32 |
-| +0x64 | u32 compute shared memory bytes (0, 0x400, 0xb00, 0xf00, 0xbc00...) | non-zero exactly when the SASS has LDS/STS/ATOMS, and every static LDS/STS/ATOMS address of the 98 compute blocks that have one ends within it. (tes/tcs: GL winding, next row) |
+| +0x50 | u32 shared memory bytes (compute; 0, 0x400, 0xc00...) | *inferred*; +0x68 = +0x50 / 32 |
 | **+0x56** | **u16 stage: 0 vs, 1 ps, 2 gs, 3 tcs, 4 tes, 5 cs** | agrees with the SPH shader type of every graphics block |
 | +0x58/+0x5c/+0x60 | u32 compute work group x, y, z (8,8,1 most common) | compute only; graphics use these for other flags |
 | +0x58/+0x5c/+0x64 (tes) | u32 GLSL input layout as GL enums: domain (GL_TRIANGLES 4, GL_QUADS 7, GL_ISOLINES 0x8e7a), spacing (GL_EQUAL 0x202, GL_FRACTIONAL_ODD 0x8e7b, GL_FRACTIONAL_EVEN 0x8e7c), winding (GL_CW 0x900, GL_CCW 0x901) | all 527 tes: 4 / 0x8e7b / 0x901 (triangles, fractional odd, ccw); the SASS reads gl_TessCoord.xy and computes z = 1 - x - y (triangle domain). gs: +0x58 = input primitive (0 points ×7, 4 triangles ×2). tcs: 4 / 0x202 / 0x901 in all 50 (*inferred* defaults). The harness's StaticGpuAccessor turns the tes values into Ryujinx's TessPatchType/TessSpacing/TessCw |
@@ -128,7 +127,6 @@ C# library `AmpereDecoder` (shared model `SassInst.cs`; `SassDecoder.Decode(lo, 
   source uses C) and is never printed on RZ or texture operands; fp32 immediates are C `%.20g` (|v| ≥ 2^63: `%.20e`), INF/NaN
   as `+INF `/`-QNAN ` (trailing space); fp16 pairs print the high half first; scalar selectors (`.H1`) sit inside `|..|`,
   packed ones (`.H0_H0`) outside; IMAD aliases MOV/SHL/IADD (SHL for 2^1..2^30 except 2^16).
-- `xcheck` (`tools/shaders/xcheck`) compares the decoder with nxnative's Ampere front end and with nvdisasm over the Pokopia, Bananza and Mario Kart World corpora (README there: results, fixes); `nvn2_layout_xcheck.md` does the same for the NVN2 control section and the SPH.
 - `sassdecode --verify <oracle> <corpus>` decodes every reference block from the corpus and compares each line with the
   oracle (whitespace normalised). `--corpus <corpus>` decodes every unique block. `--dump <code.bin> <ctrl.bin>`.
 - `Sched` = hi >> 41 (stall 105..108, yield 109, write barrier 110..112, read barrier 113..115, wait mask 116..121, reuse
@@ -137,3 +135,19 @@ C# library `AmpereDecoder` (shared model `SassInst.cs`; `SassDecoder.Decode(lo, 
 ## 7. Front end: global memory
 
 - LDG/STG/ATOMG/RED map to storage buffers through Ryujinx's GlobalToStorage: the address is traced back to a c[0] word, which in NVN2 compute is the per-program table (§3: header 0x10, then 0x10 per uniform block, then 0x10 per storage buffer {addr, size}; the runtime's `apply_nvn2_compute_table` turns the c[0] offset into the NVN binding). The front end emits each vector element's address as `(Ra + URb) + (imm + 4n)`, one constant add, because GlobalToStorage peels only one constant before looking for the c[0] base; two adds (`+imm` then `+4n`) left 7 compute shaders (cbabef05 and 6 SDF/heightmap ones) without a storage buffer, so their loads read 0 and stores were dropped.
+
+## 8. nn::gfx containers (Fire Emblem Fortune's Weave)
+
+Fortune's Weave keeps its shaders in BNSH files (nn::gfx): `romfs/Shaders/*.bfsha.zst`, `romfs/Effect/Particle/*.ptcl.zst`
+(VFXB), the SARC layout archives `*.arc.zst` and `main`. BNSH: `BNSH    `, u16 BOM 0xfeff at +0xc, u16 first block at
++0x16 (`grsc`), u32 file size at +0x1c; all pointers are u64 offsets from the BNSH start. `grsc`: +0x1c variation count,
++0x20 variations (0x40 each: source, intermediate, binary program, parent). Binary program: +0x8 six ShaderCode pointers
+(vertex, hull, domain, geometry, pixel, compute). ShaderCode: +0x8 control, +0x10 code, +0x18 u32 code size, +0x1c u32 control
+size. The control sections are this document's NVN2 ones (version 201.20) and the code is the same SPH v4 + SASS area.
+
+NVN2 compute `c[0]` with push constants: the header is `0x10 + 4 * ctrl[0xa9]` bytes (ctrl[0xa9] = 0 or 28 in Fortune's Weave;
+the extra words are application data), then the uniform, storage, texture and image descriptors as in section 7; u16 +0xba
+is the table size in all 118 compute blocks. Graphics stages read push constants from `c[0x18]`.
+
+CUDA kernels (the DLSS cubins in `subsdk0`): `extract_corpus.py --exefs` writes each kernel's `.text` as the code block and a
+kernel descriptor (magic `CUDA`, see `harness/CudaKernel.cs`) as its control file.

@@ -74,7 +74,11 @@ uint64_t thread_cpu_ticks(HANDLE h) {
 uint32_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint64_t& out) {
     out = 0;
     switch (type) {
-        case 0: out = game::info().platform == game::Platform::Switch2 ? kCoreMaskAppSwitch2 : kCoreMaskApp; return kernel::kOk;   // CoreMask
+        case 0:                                                               // CoreMask ([sched] app_cores overrides)
+            out = kernel::app_core_count() == (game::info().platform == game::Platform::Switch2 ? 6 : 3)
+                      ? (game::info().platform == game::Platform::Switch2 ? kCoreMaskAppSwitch2 : kCoreMaskApp)
+                      : (1ull << kernel::app_core_count()) - 1;
+            return kernel::kOk;
         case 1: out = kPriorityMaskApp; return kernel::kOk;                   // PriorityMask
         case 2: out = mem::kAliasBase; return kernel::kOk;                    // AliasRegionAddress
         case 3: out = mem::kAliasSize; return kernel::kOk;                    // AliasRegionSize
@@ -86,7 +90,7 @@ uint32_t get_info(uint32_t type, uint32_t handle, uint64_t sub, uint64_t& out) {
         case 9: out = 0; return kernel::kOk;                                  // ResourceLimit: no handle
         case 10: out = 0; return kernel::kOk;                                 // IdleTickCount (nxrt: no idle accounting)
         case 11: {                                                            // RandomEntropy, subtype 0..3
-            if (sub > (game::info().platform == game::Platform::Switch2 ? 7u : 3u)) return kInvalidCombination;   // Switch 1: subtypes 0..3 (Switchbrew)
+            if (sub > 7) return kInvalidCombination;
             uint64_t seed = static_cast<uint64_t>(config_get_int("process", "entropy_seed", static_cast<int64_t>(kEntropyDefaultSeed)));
             out = seed ^ (sub * kGoldenRatio64);
             return kernel::kOk;
@@ -186,7 +190,7 @@ void system_info_get(::Ctx* c) {
 // LimitableResource: 0 PhysicalMemoryMax, 1 ThreadCountMax, 2 EventCountMax, 3 TransferMemoryCountMax, 4 SessionCountMax.
 bool resource_limit(uint64_t which, uint64_t& v) {
     switch (which) {
-        case 0: v = kTotalMemoryAvailable; return true;   // chosen value
+        case 0: v = svc_total_memory(); return true;      // the same memory GetInfo TotalMemorySize reports (per platform, [memory])
         case 1: v = 0x200; return true;                   // nxrt choice
         case 2: v = 0x600; return true;                   // nxrt choice
         case 3: v = 0x80; return true;                    // nxrt choice

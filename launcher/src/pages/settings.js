@@ -1,73 +1,88 @@
 import { api, esc, icon, refreshIcons, toast, errText } from '../util.js';
 
 /*
- * Settings schema. Key names come from nx/runtime/docs/CONFIG.md.
- *   file: "controls" (controls.ini), "game" (the game's ini, named by the manifest) or "config" (the launcher's own options)
- * Types: select, toggle, size, autonum, range, sens, path.
+ * Settings schema. Every key is described in runtime/docs/CONFIG.md.
+ *   file: "game" (fefw.ini), "controls" (controls.ini, written by the game on its first start) or "config" (the launcher's own options)
+ * Types: select, toggle, size, autonum, range, path, text, number.
  */
-const sectionsFor = (game) => [
+const SECTIONS = [
   {
-    title: 'Display', icon: 'monitor', file: 'controls',
+    title: 'Picture', icon: 'monitor', file: 'game',
+    fields: [
+      { id: 'output', type: 'select', label: 'Output resolution', sec: 'fefw', key: 'output', def: 'console',
+        options: [['console', 'Console (docked 1440p)'], ['720p', '720p'], ['1080p', '1080p'], ['1440p', '1440p'], ['2160p', '2160p (4K)'], ['window', 'Window size at start']],
+        hint: 'The size the game draws its picture, UI and effects at. Applies at the next start.' },
+      { id: 'render_ratio', type: 'select', label: 'Render scale', sec: 'fefw', key: 'render_ratio', def: '0',
+        options: [['0', "Game's own (50%)"], ['0.5', '50%'], ['0.67', '67%'], ['0.75', '75%'], ['1.0', '100% (native, sharpest)']],
+        hint: '3D render size per side, as a share of the output. The upscaler fills in the rest.' },
+      { id: 'upscaler', type: 'select', label: 'Upscaler', sec: 'dlss', key: 'upscaler', def: 'taau',
+        options: [['taau', 'Built-in temporal (TAAU)'], ['fsr3', 'AMD FSR 3.1 (needs its DLLs)'], ['bilinear', 'Bilinear (no history)'], ['auto', 'Automatic']],
+        hint: "Stands in for the console's DLSS. TAAU needs no extra files." },
+      { id: 'quality', type: 'select', label: 'Quality', sec: 'fefw', key: 'quality', def: 'console',
+        options: [['console', 'As the console picks'], ['docked', 'Always docked quality']] },
+      { id: 'shadow_size', type: 'select', label: 'Shadow map size', sec: 'fefw', key: 'shadow_size', def: '0',
+        options: [['0', "Game's own"], ['2048', '2048'], ['4096', '4096'], ['8192', '8192']] },
+    ],
+  },
+  {
+    title: 'Frame rate', icon: 'gauge', file: 'game',
+    fields: [
+      { id: 'fps60', type: 'toggle', label: '60 fps gameplay', sec: 'fefw', key: 'fps60', def: '0', hint: 'The game runs at 30 on the console. Dialogue text also types twice as fast.' },
+      { id: 'fps120', type: 'toggle', label: '120 fps gameplay', sec: 'fefw', key: 'fps120', def: '0', hint: 'Wins over 60 fps. Needs a fast CPU.' },
+      { id: 'smooth_step', type: 'toggle', label: 'Exact game clock', sec: 'fefw', key: 'smooth_step', def: '0', hint: 'Keeps game time exact when frame times vary. On by default with 120 fps.' },
+      { id: 'frame_gen', type: 'select', label: 'Frame generation', sec: 'dlss', key: 'frame_gen', def: '0',
+        options: [['0', 'Off'], ['fsr3', 'AMD FSR 3 (needs amd_fidelityfx_vk.dll)']], hint: 'Keep vsync off with frame generation.' },
+      { id: 'frame_gen_dll', type: 'text', label: 'FSR 3 frame generation DLL', sec: 'dlss', key: 'frame_gen_dll', def: '', placeholder: 'path to amd_fidelityfx_vk.dll (FidelityFX SDK v1.1.4)' },
+    ],
+  },
+  {
+    title: 'Window', icon: 'monitor', file: 'controls',
     fields: [
       { id: 'window_mode', type: 'select', label: 'Window mode', sec: 'display', key: 'window_mode', def: 'windowed',
-        options: [['windowed', 'Windowed'], ['borderless', 'Borderless fullscreen'], ['exclusive', 'Exclusive fullscreen']],
-        hint: 'Set before starting; the picture size is fixed when the game starts.' },
+        options: [['windowed', 'Windowed'], ['borderless', 'Borderless fullscreen'], ['exclusive', 'Exclusive fullscreen']], hint: 'Alt+Enter switches while playing.' },
       { id: 'size', type: 'size', label: 'Window size', sec: 'display', keys: ['width', 'height'], def: ['1280', '720'] },
-      { id: 'render_scale', type: 'autonum', label: 'Render scale', sec: 'display', key: 'render_scale', def: 'auto',
-        min: 25, max: 400, numDefault: 100, unit: '%', autoLabel: 'Auto', hint: 'Auto follows the window height. 100 is 1920x1080.' },
       { id: 'fps_limit', type: 'autonum', label: 'Frame rate limit', sec: 'display', key: 'fps_limit', def: 'auto',
         min: 0, max: 1000, numDefault: 60, unit: 'fps', autoLabel: 'Auto', hint: 'Auto follows the display refresh rate. 0 is unlimited.' },
       { id: 'vsync', type: 'toggle', label: 'VSync', sec: 'display', key: 'vsync', def: '1' },
+      { id: 'fsr_dll', type: 'text', label: 'FSR 3.1 upscaler DLL folder', sec: 'upscale', key: 'fsr_dll', def: '', placeholder: 'folder with amd_fidelityfx_upscaler_vk.dll' },
     ],
   },
   {
-    title: 'Audio', icon: 'volume-2', file: 'game',
-    fields: [{ id: 'volume', type: 'range', label: 'Master volume', sec: 'audio', key: 'volume', def: '1.0' }],
-  },
-  {
-    title: 'Mouse', icon: 'mouse', file: 'controls',
+    title: 'Sound and controls', icon: 'volume-2', file: 'controls',
     fields: [
-      { id: 'sens', type: 'sens', label: 'Sensitivity', sec: 'mouse', min: 0.1, max: 20, def: '2',
-        hint: 'Source-engine scale, 2 is the default. Sets horizontal and vertical aim together.' },
-      { id: 'invert_x', type: 'toggle', label: 'Invert horizontal', sec: 'mouse', key: 'invert_x', def: '0' },
-      { id: 'invert_y', type: 'toggle', label: 'Invert vertical', sec: 'mouse', key: 'invert_y', def: '0' },
+      { id: 'volume', type: 'range', label: 'Master volume', sec: 'audio', key: 'volume', def: '1.0' },
+      { id: 'mute_unfocused', type: 'toggle', label: 'Mute when the window is in the background', sec: 'audio', key: 'mute_unfocused', def: '0' },
+      { id: 'prompt_style', type: 'select', label: 'Button prompts', sec: 'prompts', key: 'style', def: 'auto',
+        options: [['auto', 'Automatic (last device used)'], ['switch', "Switch (the game's own)"], ['xbox', 'Xbox'], ['playstation', 'PlayStation'], ['keyboard', 'Keyboard and mouse']] },
     ],
   },
   {
-    title: 'Button prompts', icon: 'gamepad-2', file: 'controls',
+    title: 'Input, saves and log', icon: 'folder', file: 'game',
     fields: [
-      { id: 'prompt_style', type: 'select', label: 'Prompt style', sec: 'prompts', key: 'style', def: 'auto',
-        options: [['auto', 'Automatic (follows the last device used)'], ['switch', 'Switch (the game\'s own)'], ['xbox', 'Xbox'], ['playstation', 'PlayStation'], ['keyboard', 'Keyboard and mouse']],
-        hint: 'Applies on the next frame, with no restart.' },
-    ],
-  },
-  {
-    title: 'Paths', icon: 'folder', file: 'game',
-    fields: [
-      { id: 'romfs', type: 'path', label: 'RomFS folder', sec: 'fs', key: 'romfs', def: '', hint: 'Set from your game files. Change it here only to override.' },
-      { id: 'save_dir', type: 'path', label: 'Save folder', sec: 'fs', key: 'save_dir', def: '', placeholder: `save/ next to ${game.exe}`, hint: `Empty: the launcher uses save/ next to ${game.exe}.` },
-      { id: 'shader_cache', type: 'path', label: 'Shader cache', sec: 'nvn', key: 'shader_cache', def: '', placeholder: `shader_cache/spirv next to ${game.exe}`, hint: 'Folder with the translated shaders (.spv and results.tsv).' },
+      { id: 'jc2_mouse', type: 'select', label: 'Joy-Con 2 mouse from the PC mouse', sec: 'input', key: 'jc2_mouse', def: 'auto', options: [['auto', 'Automatic'], ['on', 'On'], ['off', 'Off']] },
+      { id: 'save_dir', type: 'path', label: 'Save folder', sec: 'fs', key: 'save_dir', def: '', placeholder: 'save/ in the run folder' },
+      { id: 'log_level', type: 'select', label: 'Log detail', sec: 'log', key: 'level', def: 'info', options: [['error', 'Errors'], ['warn', 'Warnings'], ['info', 'Normal'], ['debug', 'Debug']] },
     ],
   },
   {
     title: 'Launcher', icon: 'wrench', file: 'config',
     fields: [
-      { id: 'game_dir', type: 'path', label: 'Game folder', sec: '', key: 'game_dir', def: '', placeholder: 'the launcher\'s own folder', hint: `The folder with ${game.exe}, ${game.ini} and controls.ini.` },
+      { id: 'repo_dir', type: 'path', label: 'Repository folder', sec: '', key: 'repo_dir', def: '', placeholder: "found from the launcher's location", hint: 'The checkout of this project that setup builds in.' },
+      { id: 'game_dir', type: 'path', label: 'Run folder', sec: '', key: 'game_dir', def: '', placeholder: '<repository>/work/play', hint: 'Holds fefw.ini, controls.ini, fefw.log and the saves.' },
+      { id: 'jobs', type: 'number', label: 'Build processes', sec: '', key: 'jobs', def: '0', min: 0, max: 256, hint: '0: one fewer than your CPU threads. Lower it if the PC runs out of memory while building.' },
       { id: 'minimize_on_play', type: 'toggle', label: 'Minimise while the game runs', sec: '', key: 'minimize_on_play', def: '0' },
     ],
   },
 ];
 
-const SOURCE_RAD = (0.022 * Math.PI) / 180; // radians per mouse count at Source sensitivity 1
 const truthy = (v) => ['1', 'true', 'yes', 'on'].includes(String(v).trim().toLowerCase());
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 const fwd = (s) => String(s).trim().replace(/\\/g, '/');
 
 export async function render(el, ctx) {
-  const game = ctx.game;
-  const SECTIONS = sectionsFor(game);
-  const [data, cfg, status] = await Promise.all([api('read_settings'), api('get_config'), api('game_status')]);
-  const files = { game: data.game, controls: data.controls, config: { 'game_dir': cfg.game_dir, 'minimize_on_play': cfg.minimize_on_play ? '1' : '0' } };
+  const [cfg, status] = await Promise.all([api('get_config'), api('game_status')]);
+  const data = await api('read_settings').catch(() => ({ game_dir: '', game: {}, controls: {}, controls_exists: false }));
+  const files = { game: data.game, controls: data.controls, config: { repo_dir: cfg.repo_dir, game_dir: cfg.game_dir, jobs: String(cfg.jobs || 0), minimize_on_play: cfg.minimize_on_play ? '1' : '0' } };
   const exists = { game: true, controls: data.controls_exists, config: true };
   const keyOf = (f, k) => (f.file === 'config' ? k : `${f.sec}.${k}`);
   const get = (f, k, def) => files[f.file][keyOf(f, k)] ?? def;
@@ -82,11 +97,9 @@ export async function render(el, ctx) {
       return v.toLowerCase() === 'auto' ? { auto: true, num: String(f.numDefault) } : { auto: false, num: v };
     },
     range: (f) => Math.round(clamp(parseFloat(get(f, f.key, f.def)) || 0, 0, 1) * 100),
-    sens: (f) => {
-      const rad = parseFloat(files.controls['mouse.yaw']);
-      return String(Number.isFinite(rad) ? Math.round((rad / SOURCE_RAD) * 100) / 100 : f.def);
-    },
     path: (f) => get(f, f.key, f.def),
+    text: (f) => get(f, f.key, f.def),
+    number: (f) => String(get(f, f.key, f.def)),
   };
   const WRITE = {
     select: (f, x) => [[f.sec, f.key, x]],
@@ -97,11 +110,9 @@ export async function render(el, ctx) {
     ],
     autonum: (f, x) => [[f.sec, f.key, x.auto ? 'auto' : String(clamp(Math.round(parseFloat(x.num)) || f.numDefault, f.min, f.max))]],
     range: (f, x) => [[f.sec, f.key, (x / 100).toFixed(2)]],
-    sens: (f, x) => {
-      const rad = (clamp(parseFloat(x) || 2, f.min, f.max) * SOURCE_RAD).toPrecision(9);
-      return [[f.sec, 'yaw', rad], [f.sec, 'pitch', rad]];
-    },
     path: (f, x) => [[f.sec, f.key, fwd(x)]],
+    text: (f, x) => [[f.sec, f.key, String(x).trim()]],
+    number: (f, x) => [[f.sec, f.key, String(clamp(parseInt(x, 10) || 0, f.min, f.max))]],
   };
 
   const all = SECTIONS.flatMap((s) => s.fields.map((f) => ({ ...f, file: s.file })));
@@ -124,7 +135,8 @@ export async function render(el, ctx) {
     size: (f, x) => `<input type="number" data-f="${f.id}" data-part="w" min="320" max="16384" value="${esc(x.w)}" ${dis(f)}><span class="unit">x</span><input type="number" data-f="${f.id}" data-part="h" min="320" max="16384" value="${esc(x.h)}" ${dis(f)}>`,
     autonum: (f, x) => `<label class="switch"><input type="checkbox" data-f="${f.id}" data-part="auto" ${x.auto ? 'checked' : ''} ${dis(f)}>${esc(f.autoLabel)}</label><input type="number" data-f="${f.id}" data-part="num" min="${f.min}" max="${f.max}" value="${esc(x.num)}" ${x.auto || !exists[f.file] ? 'disabled' : ''}><span class="unit">${esc(f.unit)}</span>`,
     range: (f, x) => `<input type="range" data-f="${f.id}" min="0" max="100" step="1" value="${x}" ${dis(f)}><span class="unit" data-readout="${f.id}" style="min-width: 3.5ch; text-align: right">${x}%</span>`,
-    sens: (f, x) => `<input type="number" data-f="${f.id}" min="${f.min}" max="${f.max}" step="0.1" value="${esc(x)}" ${dis(f)}>`,
+    text: (f, x) => `<input type="text" data-f="${f.id}" spellcheck="false" placeholder="${esc(f.placeholder || '')}" value="${esc(x)}" ${dis(f)}>`,
+    number: (f, x) => `<input type="number" data-f="${f.id}" min="${f.min}" max="${f.max}" value="${esc(x)}" ${dis(f)}>`,
     path: (f, x) => `<input type="text" data-f="${f.id}" spellcheck="false" placeholder="${esc(f.placeholder || '')}" value="${esc(x)}" ${dis(f)}><button class="btn" data-browse="${f.id}" ${dis(f)}>${icon('folder-open')}Browse</button>`,
   };
 
@@ -140,10 +152,10 @@ export async function render(el, ctx) {
       <div class="page">
         <div class="hero">
           <h1>Settings</h1>
-          <p class="dim">These edit ${esc(game.ini)} and controls.ini next to ${esc(game.exe)}. Other keys and comments in those files are left alone.</p>
+          <p class="dim">These edit fefw.ini and controls.ini in the run folder (<code>${esc(data.game_dir)}</code>). Other keys and comments in those files are left alone. Every key: runtime/docs/CONFIG.md.</p>
         </div>
         ${status.state === 'running' ? `<div class="banner warn">${icon('triangle-alert')}<div>The game is running. Most changes apply at the next start, and the game may overwrite controls.ini when it exits.</div></div>` : ''}
-        ${!data.controls_exists ? `<div class="banner info">${icon('info')}<div>controls.ini does not exist yet in <code>${esc(data.game_dir)}</code>. The game creates it on its first start, so Display, Mouse and Button prompts become editable after that. Audio, Paths and Launcher options work now.</div></div>` : ''}
+        ${!data.controls_exists ? `<div class="banner info">${icon('info')}<div>controls.ini does not exist yet in <code>${esc(data.game_dir)}</code>. The game creates it on its first start, so Window and Sound and controls become editable after that. The other options work now.</div></div>` : ''}
         ${SECTIONS.map((s) => `<div class="card"><h2>${icon(s.icon)}${esc(s.title)}</h2>${s.fields.map((f) => fieldHtml({ ...f, file: s.file })).join('')}</div>`).join('')}
         <div class="savebar">
           <span class="dim">${n ? `${n} unsaved change${n > 1 ? 's' : ''}` : 'No changes'}</span>
@@ -208,7 +220,7 @@ export async function render(el, ctx) {
     for (const f of dirtyFields()) {
       for (const [sec, key, value] of WRITE[f.type](f, model[f.id])) {
         if (f.file === 'config') {
-          cfgNew[key] = key === 'minimize_on_play' ? value === '1' : fwd(value);
+          cfgNew[key] = key === 'minimize_on_play' ? value === '1' : key === 'jobs' ? parseInt(value, 10) || 0 : fwd(value);
         } else {
           edits.push({ file: f.file, section: sec, key, value });
         }

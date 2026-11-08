@@ -145,3 +145,25 @@ dl.kv dd { margin: 0; min-width: 0; }
 progress { width: 100%; height: 10px; appearance: none; border: none; border-radius: var(--radius-md); background: var(--color-surface-sunken); overflow: hidden; }
 progress::-webkit-progress-bar { background: var(--color-surface-sunken); }
 progress::-webkit-progress-value { background: var(--color-accent); }
+
+/* setup: step checklist and the build log */
+.steps { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-2); }
+.steps li { display: flex; align-items: center; gap: var(--space-2); color: var(--color-text-dim); }
+.steps li.done { color: var(--color-ok); }
+.steps li.running { color: var(--color-warn); font-weight: var(--font-weight-medium); }
+.steps li svg { width: 16px; height: 16px; flex: none; }
+.logbox { background: var(--color-surface-sunken); border: 1px solid var(--color-border); border-radius: var(--radius-sm);
+  font-family: var(--font-mono); font-size: var(--font-size-xs); line-height: 1.45; height: 220px; overflow: auto;
+  padding: var(--space-2) var(--space-3); white-space: pre-wrap; word-break: break-all; color: var(--color-text-dim); }
+.tools { display: grid; grid-template-columns: auto 1fr; gap: var(--space-1) var(--space-3); align-items: start; font-size: var(--font-size-sm); }
+.tools .bad { color: var(--color-danger); }
+.tools .ok { color: var(--color-ok); }
+.brand img.mark { width: 28px; height: 28px; border-radius: 7px; }
+.notes { background: var(--color-surface-sunken); border: 1px solid var(--color-border); border-radius: var(--radius-sm);
+  padding: var(--space-3); max-height: 220px; overflow: auto; font-size: var(--font-size-sm); color: var(--color-text-dim); }
+.nav-item.update-pill { color: var(--color-accent); border: 1px solid var(--color-accent); margin-top: var(--space-2); }
+.notes p { margin: 0 0 var(--space-2); }
+.notes ul { margin: 0 0 var(--space-2); padding-left: var(--space-5); }
+.notes > :last-child { margin-bottom: 0; }
+.update-foot { margin-top: var(--space-4); padding-top: var(--space-4); border-top: 1px solid var(--color-border); }
+.notes code { font-family: var(--font-mono); }

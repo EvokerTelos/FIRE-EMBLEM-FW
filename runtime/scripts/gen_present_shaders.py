@@ -1,11 +1,17 @@
-# Compiles the present pass shaders (GLSL below) with glslc (Vulkan SDK) into src/gfx/nvn/present_shaders.inc (uint32 arrays).
+# Compiles the present pass shaders (GLSL below) with glslc (Vulkan SDK), or glslang (-V) when there is no glslc, into
+# src/gfx/nvn/present_shaders.inc (uint32 arrays).
 # The .inc is committed, so building the runtime does not need the SDK. Run: python -I scripts/gen_present_shaders.py
 # The present pass draws a source image (a game's window texture) stretched over the swapchain or frame image. The fragment
-# shader outputs the texel unchanged (no colour space conversion), alpha forced to 1; letterbox bars are black.
+# shader outputs the texel unchanged (no colour space conversion), alpha forced to 1; letterbox bars are black. A picture made smaller
+# (more than one source texel per destination pixel, e.g. a 3840x2160 crop on a 2560x1440 swapchain) is averaged over each pixel's
+# footprint with up to 4x4 bilinear taps; at 2:1 that is the 2x2 box one tap gave before, at 1:1 and when enlarging it is one tap.
 import os, shutil, struct, subprocess, tempfile
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 glslc = shutil.which("glslc") or r"C:\VulkanSDK\1.4.363.0\Bin\glslc.exe"
+if not os.path.exists(glslc):
+    glslc = None
+glslang = shutil.which("glslang") or shutil.which("glslangValidator")
 
 VERT = r"""#version 450
 // Full-screen triangle. v_dst is the destination position in [0,1]^2 (0,0 top left, as the image rows run).
@@ -28,15 +34,30 @@ layout(push_constant) uniform PushConstants {
 } pc;
 void main() {
     vec2 local = (v_dst - pc.pic.xy) / pc.pic.zw;
+    vec2 texel = pc.crop.xy + local * pc.crop.zw;
+    vec2 fp = abs(vec2(dFdx(texel.x), dFdy(texel.y)));   // source texels per destination pixel (before any branch)
     if (any(lessThan(local, vec2(0.0))) || any(greaterThan(local, vec2(1.0)))) {
         o_color = vec4(0.0, 0.0, 0.0, 1.0);   // letterbox bar
         return;
     }
-    if (pc.src.z > 0.5) local.y = 1.0 - local.y;   // flip: a window with the lower-left origin mode is presented upside down otherwise
-    // texel-space position inside the crop; clamped to the crop's texel centres so a linear filter never reads outside it
-    vec2 texel = pc.crop.xy + local * pc.crop.zw;
-    texel = clamp(texel, pc.crop.xy + 0.5, pc.crop.xy + pc.crop.zw - 0.5);
-    o_color = vec4(textureLod(u_src, texel / pc.src.xy, 0.0).rgb, 1.0);
+    if (pc.src.z > 0.5) {   // flip: a window with the lower-left origin mode is presented upside down otherwise
+        local.y = 1.0 - local.y;
+        texel.y = pc.crop.y + local.y * pc.crop.w;
+    }
+    // texel-space positions inside the crop are clamped to the crop's texel centres so a linear filter never reads outside it
+    vec2 lo = pc.crop.xy + 0.5, hi = pc.crop.xy + pc.crop.zw - 0.5;
+    if (fp.x <= 1.01 && fp.y <= 1.01) {
+        o_color = vec4(textureLod(u_src, clamp(texel, lo, hi) / pc.src.xy, 0.0).rgb, 1.0);
+        return;
+    }
+    ivec2 n = clamp(ivec2(ceil(fp - 0.01)), ivec2(1), ivec2(4));
+    vec3 c = vec3(0.0);
+    for (int y = 0; y < n.y; ++y)
+        for (int x = 0; x < n.x; ++x) {
+            vec2 o = ((vec2(x, y) + 0.5) / vec2(n) - 0.5) * fp;
+            c += textureLod(u_src, clamp(texel + o, lo, hi) / pc.src.xy, 0.0).rgb;
+        }
+    o_color = vec4(c / float(n.x * n.y), 1.0);
 }
 """
 
@@ -46,7 +67,11 @@ with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, name)
         with open(src, "w", newline="\n") as f:
             f.write(text)
-        spv = subprocess.run([glslc, "-O", "--target-env=vulkan1.3", "-o", "-", src], capture_output=True, check=True).stdout
+        if glslc:
+            spv = subprocess.run([glslc, "-O", "--target-env=vulkan1.3", "-o", "-", src], capture_output=True, check=True).stdout
+        else:
+            subprocess.run([glslang, "-V", "--target-env", "vulkan1.3", "-Os", "-o", src + ".spv", src], capture_output=True, check=True)
+            spv = open(src + ".spv", "rb").read()
         words = struct.unpack("<%dI" % (len(spv) // 4), spv)
         out.append("static const uint32_t %s[] = {\n" % var)
         for i in range(0, len(words), 8):

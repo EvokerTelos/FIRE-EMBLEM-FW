@@ -104,6 +104,7 @@ struct KThread : KObject {
     std::atomic<bool> aged{false};      // starvation guard (starvation_guard.cpp): the host leaves this thread ready, so its yields keep the processor
     std::atomic<uint64_t> host_affinity{0};   // the host affinity mask sched_apply (or a starvation boost) last gave the host thread
     std::atomic<int> last_proc{-1};     // host processor the thread was on at its last SVC (svc_dispatch), for the starvation line
+    int occ_group = 0;                  // [kernel] occupancy (occupancy.cpp): 0 none, 1 main, 2.. a named game pool; set before the thread starts
     // wait state, protected by the kernel lock (kernel_sync.cpp)
     bool wake = false;
     uint32_t wait_result = 0;
@@ -140,7 +141,7 @@ bool thread_join(uint32_t handle, uint32_t timeout_ms);    // host-side wait for
 void kernel_reset();                                       // tests: join/forget threads, clear handles, sync state (no thread may run guest code)
 uint64_t thread_count_running();                           // started and not yet exited
 bool thread_set_priority(KThread& t, int hos_prio);       // updates the object and the host thread
-int app_core_count();                 // application cores: 3 (Switch 1) or 6 (Switch 2)
+int app_core_count();                 // application cores: 3 (Switch 1) or 6 (Switch 2); [sched] app_cores overrides (threads.md)
 bool thread_set_core_mask(KThread& t, int ideal_core, uint64_t mask);   // console cores; false when mask has no usable core
 
 // ---- scheduling model (console cores) ----------------------------------------------------------------------------------------
@@ -151,7 +152,7 @@ struct SchedInfo {
     bool active = false;                 // false: fewer usable host processors than console cores, or [sched] console_cores = 0
     bool soft = false;                   // [sched] affinity = soft: affinity `pool`, ideal processor = the core's processor
     int cores = 3;                       // application cores of the console: 3 (Switch 1), 6 (Switch 2)
-    uint64_t host_masks[6] = {};         // host processor per console core (the first `cores` are used): the affinity (strict) or ideal processor (soft)
+    uint64_t host_masks[16] = {};        // host processor per console core (the first `cores` are used): the affinity (strict) or ideal processor (soft)
     uint64_t pool = 0;                   // host processors a guest thread may use under soft (and during a starvation boost under strict)
     int slot = -1;                       // processor slot taken (-1: shared / explicit mask)
 };
@@ -192,5 +193,9 @@ uint32_t signal_to_address(uint64_t addr, uint32_t signal_type, int32_t value, i
 uint32_t wait_synchronization(const uint32_t* handles, int32_t count, int64_t timeout_ns, int32_t* index_out);
 uint32_t cancel_synchronization(uint32_t thread_handle);
 void notify_waitable_changed();          // wake threads blocked in wait_synchronization (call after changing an object's signaled state)
+// A host function that one host thread runs while it is blocked in a kernel wait (WaitSynchronization, mutex, condition variable and address
+// waits, and SleepThread longer than 10 ms): its wait is cut into 10 ms slices and fn runs between them, without the kernel lock. The play layer gives the window's thread one,
+// so the window keeps working while the game waits on something the player must do (the software keyboard applet). fn null: off.
+void set_blocked_hook(uint32_t host_tid, void (*fn)());
 
 }  // namespace nxrt::kernel

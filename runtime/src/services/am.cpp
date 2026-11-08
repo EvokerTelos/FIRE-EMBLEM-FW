@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // appletOE and appletAE (S3c): the applet manager as the one application sees it. The application is in focus, its message
 // queue holds what the console queues for it, the notification flags it sets are real state. Library applets: the software keyboard
-// answers a text (a prompt on the PC, or a configured text); the player select answers the one user; the others end at once.
+// answers a text (the overlay's on-screen keyboard, or a configured text); the player select answers the one user; the others end at once.
 // Command ids and layouts follow the Switchbrew "Applet Manager services" page and ScarletNX's am.swipc.
 // Adapted from ScarletNX src/nx/hle/services/am.c and am.swipc (GPL-3.0-or-later): the command table, the message queue, the lock
 // accessor, the audio volumes, the save data rules and the launch parameter storage.
@@ -555,6 +555,10 @@ constexpr uint32_t kAppletIdNetConnect = 0x0F;
 // the SDK returns 0x3D1F, which the game (main 0x7101133704) treats as the player backing out, with no error shown.
 constexpr uint32_t kAppletIdMatchmake = 0x24;
 constexpr uint32_t kAppletIdPlayerSelect = 0x10;              // nn::applet::AppletId LibraryAppletPlayerSelect
+// LibraryAppletController (0x100000C): nn::hid::ShowControllerSupport (sdk 0x7500737900; Fortune's Weave at start-up). The player has the
+// PC's controls already, so it answers at once as a confirmed single player on player 1: the 12-byte ControllerSupportResultInfo
+// {s8 player count 1, 3 padding, u32 selected NpadId 0, u32 result 0 = Success} (Eden-NS2 applet_controller.cpp ConfigurationComplete).
+constexpr uint32_t kAppletIdController = 0x0C;
 // The player select's UiSettings (in data 1, 0xA0 bytes): u32 mode at 0 (nn::account::detail::StartPselApplet, sdk 0x75001844c0,
 // pushes it and pops a 0x18-byte {u64 result, Uid} answer whose result it returns). Mode 0 is ShowUserSelector; 2 is
 // EnsureNetworkServiceAccountAvailable, 10 / 11 ShowLicenseRequirementsForNetworkService (also from nn::err::ShowError for some
@@ -573,7 +577,7 @@ constexpr uint32_t kSwkbdResultOk = 0;
 constexpr uint32_t kSwkbdResultCancel = 1;
 constexpr uint32_t kTextCheckSuccess = 0;                     // SwkbdTextCheckResult: Success 0, Failure 1, Confirm 2, Silent 3
 constexpr uint32_t kTextCheckConfirm = 2;
-// SoftwareKeyboardConfig (Ryujinx, sequential layout) field offsets.
+// Keyboard config storage field offsets. The text fields, the lengths and the password mode sit at the same offsets in every version.
 constexpr size_t kCfgOkText = 0x04;            // u16[9]
 constexpr size_t kCfgHeaderText = 0x24;        // u16[65]
 constexpr size_t kCfgSubText = 0xA6;           // u16[129]
@@ -581,11 +585,18 @@ constexpr size_t kCfgGuideText = 0x1A8;        // u16[257]
 constexpr size_t kCfgMaxTextLength = 0x3AC;
 constexpr size_t kCfgMinTextLength = 0x3B0;
 constexpr size_t kCfgPasswordMode = 0x3B4;
-constexpr size_t kCfgUseUtf8 = 0x3BD;
-constexpr size_t kCfgInitialOffset = 0x3C0;
-constexpr size_t kCfgInitialLength = 0x3C4;    // UTF-16 characters
-constexpr size_t kCfgUseTextCheck = 0x3D0;
 constexpr size_t kCfgCommonSize = 0x3D4;
+// The flags and the initial string moved. Older SDKs push the application's KeyboardConfig as is (Ryujinx SoftwareKeyboardConfig,
+// natural alignment). The 0x530-byte config (library version 0x140010, Pokopia 2.0.1a) is repacked by the shim: sdk
+// nn::swkbd::ShowKeyboard(String*, const ShowKeyboardArg&, Trigger) at 0x750054e700 copies use_utf8 (arg 0x3BD) to 0x3AA, the initial
+// string offset/length (arg 0x3C0/0x3C4) to 0x3BC/0x3C0 and use_text_check (arg 0x3D0) to 0x48D. Read with the old offsets, use_utf8
+// came from a byte of the initial string offset (always 0): the text went back as UTF-16 to a game reading UTF-8, "Josh" -> "J".
+struct SwkbdCfgLayout {
+    size_t use_utf8, initial_offset, initial_length /* UTF-16 characters */, use_text_check;
+};
+constexpr size_t kCfgPackedSize = 0x530;
+constexpr SwkbdCfgLayout kCfgLayoutOld{0x3BD, 0x3C0, 0x3C4, 0x3D0};
+constexpr SwkbdCfgLayout kCfgLayoutPacked{0x3AA, 0x3BC, 0x3C0, 0x48D};
 constexpr size_t kCommonArgsLibraryVersion = 8;               // CommonArguments: version, size, library_version, theme ...
 
 std::string utf16_to_utf8(const std::u16string& s) {
@@ -664,6 +675,17 @@ std::string read_u16_text(const Bytes& b, size_t off, size_t chars) {
     return utf16_to_utf8(t);
 }
 
+// A NUL-terminated UTF-8 string of at most `bytes` bytes at `off` (control characters dropped, as in read_u16_text).
+std::string read_u8_text(const Bytes& b, size_t off, size_t bytes) {
+    std::string t;
+    for (size_t i = 0; i < bytes && off + i < b.size(); ++i) {
+        const char c = static_cast<char>(b[off + i]);
+        if (c == 0) break;
+        if (static_cast<uint8_t>(c) >= 0x20 || c == '\n') t.push_back(c);
+    }
+    return t;
+}
+
 std::atomic<bool>& prompt_flag() {
     static std::atomic<bool> on{false};
     return on;
@@ -683,7 +705,7 @@ struct AppletState {
     ServiceEvent state_event{false};                       // signalled once the applet has ended
     ServiceEvent out_event{false};                         // signalled while out_data is not empty
     ServiceEvent interactive_out_event{false};             // signalled while interactive_out is not empty
-    ServiceEvent cmd170_event{true};                       // SDK 22 accessor cmd 170's event: signalled from the start (see there)
+    ServiceEvent cmd170_event{false};                      // ILibraryAppletAccessor 170 (22.0.0+): never signalled
     bool utf8 = false;                                     // software keyboard: the config's use_utf8
     bool text_check = false;                               // software keyboard: the config's use_text_check
     std::u16string text;                                   // software keyboard: the text answered
@@ -736,6 +758,8 @@ void swkbd_answer(AppletState& a, bool ok) {
         return;
     }
     auto out = std::make_shared<Bytes>(8 + kSwkbdStringSize, uint8_t{0});
+    // The text check uses the config's encoding, like the final result: with use_utf8 the game reads UTF-8 here too (and answers in
+    // UTF-8). UTF-16 "Josh" read as UTF-8 is "J" then NULs, which the game's name check refuses.
     const uint64_t size = a.utf8 ? utf16_to_utf8(a.text).size() + 1 : (a.text.size() + 1) * 2;
     std::memcpy(out->data(), &size, 8);
     put_text(out->data() + 8, kSwkbdStringSize, a.text, a.utf8);
@@ -743,12 +767,12 @@ void swkbd_answer(AppletState& a, bool ok) {
     a.interactive_out_event.signal();
 }
 
-// Asks the PC prompt on its own thread; the answer arrives with mu() taken there.
+// Asks the on-screen keyboard on its own thread; the answer arrives with mu() taken there.
 void swkbd_prompt_async(const std::shared_ptr<AppletState>& ap) {
     swkbdui::Request r = ap->req;
     std::thread([ap, r] {
         std::string t;
-        const bool ok = swkbdui::win32_prompt(r, &t);
+        const bool ok = swkbdui::ask(r, &t);
         std::u16string u = utf8_to_utf16(t);
         std::lock_guard<std::mutex> lk(mu());
         if (ok) {
@@ -772,18 +796,19 @@ void swkbd_start(const std::shared_ptr<AppletState>& ap) {
     swkbdui::Request& r = a.req;
     r.title = profile().name;
     if (cfg && cfg->size() >= kCfgCommonSize) {
+        const SwkbdCfgLayout& l = cfg->size() == kCfgPackedSize ? kCfgLayoutPacked : kCfgLayoutOld;
         const uint32_t m = read_at<uint32_t>(*cfg, kCfgMaxTextLength, 0);
         if (m > 0 && m <= kSwkbdDefaultMaxLength) max_len = m;
         r.min_len = read_at<uint32_t>(*cfg, kCfgMinTextLength, 0);
         r.password = read_at<uint32_t>(*cfg, kCfgPasswordMode, 0) != 0;
-        a.utf8 = read_at<uint8_t>(*cfg, kCfgUseUtf8, 0) != 0;
-        a.text_check = read_at<uint8_t>(*cfg, kCfgUseTextCheck, 0) != 0;
+        a.utf8 = read_at<uint8_t>(*cfg, l.use_utf8, 0) != 0;
+        a.text_check = read_at<uint8_t>(*cfg, l.use_text_check, 0) != 0;
         r.ok_text = read_u16_text(*cfg, kCfgOkText, 9);
         r.header = read_u16_text(*cfg, kCfgHeaderText, 65);
         r.sub = read_u16_text(*cfg, kCfgSubText, 129);
         r.guide = read_u16_text(*cfg, kCfgGuideText, 257);
-        const int32_t ioff = read_at<int32_t>(*cfg, kCfgInitialOffset, 0);
-        const int32_t ilen = read_at<int32_t>(*cfg, kCfgInitialLength, 0);
+        const int32_t ioff = read_at<int32_t>(*cfg, l.initial_offset, 0);
+        const int32_t ilen = read_at<int32_t>(*cfg, l.initial_length, 0);
         if (work && ioff >= 0 && ilen > 0) r.initial = read_u16_text(*work, static_cast<size_t>(ioff), static_cast<size_t>(ilen));
     } else {
         NXLOG_W("am", "swkbd: no keyboard config among the %zu storages pushed: defaults used", a.in_data.size());
@@ -818,7 +843,8 @@ void swkbd_interactive(const std::shared_ptr<AppletState>& ap) {
         swkbd_submit(a, kSwkbdResultOk);
         return;
     }
-    const std::string why = read_u16_text(*d, 4, kSwkbdStringSize / 2);
+    // The game's message comes in the config's encoding: read as UTF-16, its UTF-8 bytes turned into CJK characters.
+    const std::string why = a.utf8 ? read_u8_text(*d, 4, kSwkbdStringSize) : read_u16_text(*d, 4, kSwkbdStringSize / 2);
     NXLOG_W("am", "swkbd: the game rejected the text (text check result %u: \"%s\")", check, why.c_str());
     if (prompt_flag().load() && !nxrt::config_has("applet", "swkbd_text")) {
         if (!why.empty()) a.req.guide = why;
@@ -847,6 +873,14 @@ void player_select_start(AppletState& a) {
         NXLOG_I("am", "player select applet 0x%x (account mode %u: network account / licence screen): offline, answering cancelled by "
                 "the player (0x27C)", a.full_id, mode);
     }
+    push_out(a, out);
+    applet_finish(a);
+}
+
+void controller_applet_start(AppletState& a) {
+    auto out = std::make_shared<Bytes>(0xC, uint8_t{0});
+    (*out)[0] = 1;
+    NXLOG_I("am", "controller support applet 0x%x: answering one player on player 1, success", a.full_id);
     push_out(a, out);
     applet_finish(a);
 }
@@ -951,6 +985,8 @@ ServicePtr make_library_applet_accessor(uint32_t full_id, uint32_t mode) {
                 player_select_start(*a);
             } else if (a->id == kAppletIdError) {
                 error_applet_start(*a);
+            } else if (a->id == kAppletIdController) {
+                controller_applet_start(*a);
             } else if (const char* why = cancelled_applet(a->id)) {
                 NXLOG_I("am", "library applet 0x%x started (%s): it ends as cancelled by the player", a->full_id, why);
                 applet_finish(*a);
@@ -1020,10 +1056,8 @@ ServicePtr make_library_applet_accessor(uint32_t full_id, uint32_t mode) {
         s.add_cmd(150, "RequestForAppletToGetForeground", ignored("RequestForAppletToGetForeground"));
         // Switch 2: one input bool, no output (sdk proxy at 0x75001bd560). Name and meaning unknown; accepted.
         s.add_cmd(90, "Cmd90", ignored("ILibraryAppletAccessor Cmd90"));
-        // SDK 22: no input, sent by nn::applet::CreateLibraryAppletHandleOnUnwinding right after CreateLibraryApplet(Ex); an error
-        // aborts the caller (FEFW's name entry, swkbd ShowKeyboard). It hands out an event: answered with nothing, the handle the SDK
-        // keeps is invalid and nn::applet::StartLibraryApplet's os::WaitAny aborts with InvalidHandle (0xe401). Meaning unknown;
-        // the event is signalled from the start so that wait never holds the applet back.
+        // 22.0.0+: an event handle, asked for by nn::applet::CreateLibraryApplet of SDK 22 right after the accessor is made (Fortune's
+        // Weave's controller support applet aborts without it). Name and meaning unknown; Eden-NS2 hands out an event it never signals.
         s.add_cmd(170, "Cmd170", [a](Request&, Response& rsp) -> uint32_t {
             rsp.out_copy.push_back(a->cmd170_event.new_handle());
             return 0;

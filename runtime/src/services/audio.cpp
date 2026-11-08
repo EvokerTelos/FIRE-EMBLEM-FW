@@ -4,11 +4,12 @@
 //   IAudioRendererManager (audren:u)  0 OpenAudioRenderer, 1 GetWorkBufferSize, 2 GetAudioDeviceService, 3 OpenAudioRendererForManualExecution,
 //                                     4 GetAudioDeviceServiceWithRevisionInfo
 //   IAudioRenderer                    0 GetSampleRate .. 13 GetVoiceDropParameter (RequestUpdate / RequestUpdateAuto run the update protocol)
-//   IAudioDevice                      0 ListAudioDeviceName .. 17 AcquireAudioInputDeviceNotification (virtual output devices), 19/20 volume auto tune
+//   IAudioDevice                      0 ListAudioDeviceName .. 21 IsActiveOutputDeviceEstimatedLowLatency (virtual output devices)
 // Adapted from Ryujinx src/Ryujinx.Horizon/Sdk/Audio/Detail/{AudioRendererManager,AudioRenderer,AudioDevice}.cs (MIT).
 // The renderer DSP runs on its own thread paced by the host clock (5 ms frames) and writes PCM to nxrt::audio::sink().
 #include <array>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 
@@ -70,7 +71,6 @@ struct AudrenState {
     std::shared_ptr<audren::AudioRendererManager> manager;
     std::array<std::shared_ptr<ServiceEvent>, 3> device_events;   // QueryAudioDeviceSystemEvent / Input / Output (never fire)
     float device_volume[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-    bool volume_auto_tune = false;                       // IAudioDevice 19/20 (Switch 2)
 
     std::shared_ptr<audren::AudioRendererManager> get_manager() {
         if (!manager) {
@@ -281,25 +281,45 @@ std::shared_ptr<Service> make_audio_device(uint32_t revision) {
         s.add_cmd(12, "QueryAudioDeviceOutputEvent", event_cmd(2));
         s.add_cmd(13, "GetActiveAudioOutputDeviceName", active_name);
         s.add_cmd(14, "ListAudioOutputDeviceName", list_names);
-        // Device change notifications: an event (copy handle) that the SDK attaches to the caller's SystemEvent. Fortune's Weave ignores
-        // an error result here and later TryWaitSystemEvent()s the never-initialised event, which aborts; so they answer with the same
-        // never-signalled output / input events as 12 / 11 (the host output device does not change under the game).
-        auto ok = [](Request&, Response&) -> uint32_t { return 0; };
-        s.add_cmd(15, "AcquireAudioOutputDeviceNotification", event_cmd(2));
-        s.add_cmd(16, "ReleaseAudioOutputDeviceNotification", ok);
-        s.add_cmd(17, "AcquireAudioInputDeviceNotification", event_cmd(1));
-        s.add_cmd(18, "ReleaseAudioInputDeviceNotification", ok);
-        // Switch 2 (SDK 22): nn::audio::SetDeviceOutputVolumeAutoTuneModeEnabled(bool) sends 19 (bool, padded, plus the applet resource
-        // user id: 12 bytes) and aborts on an error result (Fortune's Weave at boot). The console's automatic output volume tuning has no
-        // host counterpart: the flag is kept and read back by 20.
-        s.add_cmd(19, "SetDeviceOutputVolumeAutoTuneModeEnabled", [](Request& req, Response&) -> uint32_t {
-            std::lock_guard<std::mutex> lk(st().mu);
-            st().volume_auto_tune = req.arg<uint8_t>(0) != 0;
+        // 17.0.0+ device notifications (u64 id: the SDK passes its SystemEvent's address) -> an event per id, signalled when that kind of device
+        // changes, which never happens here. Ids as Eden-NS2 and the SDK's IAudioDevice proxy (methods 0-8, 10-21 in order: its
+        // AcquireAudioOutputDeviceNotification calls slot 0xA0 = 17). The SDK attaches the handle to the game's event; a failure leaves that
+        // event uninitialised and the game's later TryWaitSystemEvent on it aborts (Fortune's Weave).
+        auto notifications = std::make_shared<std::map<uint64_t, std::shared_ptr<ServiceEvent>>>();
+        auto acquire = [notifications](uint64_t kind) {
+            return [notifications, kind](Request& req, Response& rsp) -> uint32_t {
+                std::lock_guard<std::mutex> lk(st().mu);
+                auto& ev = (*notifications)[req.arg<uint64_t>(0) ^ kind];
+                if (!ev) ev = std::make_shared<ServiceEvent>(false);
+                rsp.out_copy.push_back(ev->new_handle());
+                return 0;
+            };
+        };
+        auto release = [notifications](uint64_t kind) {
+            return [notifications, kind](Request& req, Response&) -> uint32_t {
+                std::lock_guard<std::mutex> lk(st().mu);
+                notifications->erase(req.arg<uint64_t>(0) ^ kind);
+                return 0;
+            };
+        };
+        constexpr uint64_t kInput = 1ull << 63;   // keeps input and output ids apart in the one map
+        s.add_cmd(15, "AcquireAudioInputDeviceNotification", acquire(kInput));
+        s.add_cmd(16, "ReleaseAudioInputDeviceNotification", release(kInput));
+        s.add_cmd(17, "AcquireAudioOutputDeviceNotification", acquire(0));
+        s.add_cmd(18, "ReleaseAudioOutputDeviceNotification", release(0));
+        // 18.0.0+ output volume auto-tune: the flag is kept and read back, the output is not changed (Eden-NS2 audio_device.cpp does the same).
+        // The SDK aborts when 19 fails (Fortune's Weave calls it at start-up). 21 (21.0.0+): no device is a low-latency one.
+        auto auto_tune = std::make_shared<bool>(false);
+        s.add_cmd(19, "SetAudioDeviceOutputVolumeAutoTuneEnabled", [auto_tune](Request& req, Response&) -> uint32_t {
+            *auto_tune = req.arg<uint8_t>(0) != 0;
             return 0;
         });
-        s.add_cmd(20, "IsDeviceOutputVolumeAutoTuneModeEnabled", [](Request&, Response& rsp) -> uint32_t {
-            std::lock_guard<std::mutex> lk(st().mu);
-            rsp.push<uint8_t>(st().volume_auto_tune ? 1 : 0);
+        s.add_cmd(20, "IsAudioDeviceOutputVolumeAutoTuneEnabled", [auto_tune](Request&, Response& rsp) -> uint32_t {
+            rsp.push<uint8_t>(*auto_tune ? 1 : 0);
+            return 0;
+        });
+        s.add_cmd(21, "IsActiveOutputDeviceEstimatedLowLatency", [](Request&, Response& rsp) -> uint32_t {
+            rsp.push<uint8_t>(0);
             return 0;
         });
         (void)revision;
@@ -378,8 +398,7 @@ std::shared_ptr<Service> make_audren() {
 // asks it for the renderer manager with cmd 2 instead of opening audren:u; the answer is the same IAudioRendererManager object.
 std::shared_ptr<Service> make_aud_user() {
     auto s = std::make_shared<Service>("aud:u");
-    // Commands from the SDK (sdk 20.5.25, IDA): the proxy's vtable slots +32/+40/+48/+56 send cmds 0-3. ListAudioIns / OpenAudioIn use cmd 0,
-    // ListAudioOuts / OpenAudioOut cmd 1, CreateAudioRendererManager(false) cmd 2, SetSpatialDownmixOutputMode cmd 3 (then that object's cmd 0).
+    // cmds 0/1: inferred from OpenAudioOut asking for cmd 1 (in, out, renderer in that order).
     s->add_cmd(0, "CreateAudioInManager", [](Request&, Response& rsp) -> uint32_t {
         rsp.push_object(audio_in_manager());
         return 0;
@@ -390,12 +409,6 @@ std::shared_ptr<Service> make_aud_user() {
     });
     s->add_cmd(2, "CreateAudioRendererManager", [](Request&, Response& rsp) -> uint32_t {
         rsp.push_object(make_audren());
-        return 0;
-    });
-    s->add_cmd(3, "CreateAudioOutputControl", [](Request&, Response& rsp) -> uint32_t {   // name ours; the object sets output modes
-        auto ctl = std::make_shared<Service>("aud:u output control");
-        ctl->add_cmd(0, "SetSpatialDownmixOutputMode", [](Request&, Response&) -> uint32_t { return 0; });   // the PC mixes its own output
-        rsp.push_object(ctl);
         return 0;
     });
     return s;

@@ -40,21 +40,8 @@ void tx_mark(const char* what, const Texture* t) {
 }
 
 void tev(const Texture* t, const char* what, uint64_t a, uint64_t b) {
-    // [nvn] trace_tex_events: "1" = the 128x128 6-layer 8-level textures (the old debug case), or a comma list of texture ids ("432,433")
-    static const std::string cfg = nxrt::config_get_str("nvn", "trace_tex_events", "");
-    static const std::vector<uint32_t> ids = [] {
-        std::vector<uint32_t> v;
-        if (cfg == "1") return v;
-        for (size_t i = 0; i < cfg.size();) {
-            size_t j = cfg.find(',', i);
-            if (j == std::string::npos) j = cfg.size();
-            v.push_back(static_cast<uint32_t>(std::strtoul(cfg.substr(i, j - i).c_str(), nullptr, 10)));
-            i = j + 1;
-        }
-        return v;
-    }();
-    if (cfg.empty() || cfg == "0" || !t || !t->fmt) return;
-    if (ids.empty() ? (t->b.width != 128 || t->layers != 6 || t->levels != 8) : std::find(ids.begin(), ids.end(), t->id) == ids.end()) return;
+    static const bool on = nxrt::config_get_int("nvn", "trace_tex_events", 0) != 0;
+    if (!on || !t || !t->fmt || t->b.width != 128 || t->layers != 6 || t->levels != 8) return;
     NXLOG_I("nvn.tev", "t%u %s mem %p size %llu: %llx %llx", t->id, what, static_cast<const void*>(t->mem), static_cast<unsigned long long>(t->storage_size),
             static_cast<unsigned long long>(a), static_cast<unsigned long long>(b));
 }

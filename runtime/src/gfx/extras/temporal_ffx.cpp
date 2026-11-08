@@ -12,7 +12,6 @@
 #include "nxrt/gfx.h"
 #include "nxrt/log.h"
 
-#include <cstring>
 #include "../../../third_party/amd_ffx_api/api/include/ffx_api.h"
 #include "../../../third_party/amd_ffx_api/api/include/ffx_api_types.h"
 #include "../../../third_party/amd_ffx_api/api/include/vk/ffx_api_vk.h"
@@ -76,31 +75,6 @@ FfxApiResource resource(const TemporalImage& t, uint32_t state, uint32_t usage) 
     return r;
 }
 
-// The device functions the FidelityFX backend asks for: one this device does not have (an extension not enabled) comes back null, and
-// the DLL calls it anyway. Each miss is logged once; the debug-name ones get a no-op.
-VKAPI_ATTR VkResult VKAPI_CALL ffx_noop_name(VkDevice, const void*) { return VK_SUCCESS; }
-VKAPI_ATTR void VKAPI_CALL ffx_noop_label(VkCommandBuffer, const void*) {}
-VKAPI_ATTR void VKAPI_CALL ffx_noop_end(VkCommandBuffer) {}
-VKAPI_ATTR void VKAPI_CALL ffx_noop_marker(VkCommandBuffer, uint64_t, VkBuffer, VkDeviceSize, uint32_t) {}
-VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL ffx_device_proc(VkDevice device, const char* name) {
-    PFN_vkVoidFunction f = vkGetDeviceProcAddr(device, name);
-    if (f || !name) return f;
-    {   // KHR names of functions that became core (the device is Vulkan 1.3; the extension itself is not enabled)
-        const size_t n = std::strlen(name);
-        if (n > 3 && std::strcmp(name + n - 3, "KHR") == 0) {
-            const std::string core(name, n - 3);
-            if ((f = vkGetDeviceProcAddr(device, core.c_str()))) return f;
-        }
-    }
-    if (std::strcmp(name, "vkCmdWriteBufferMarkerAMD") == 0 || std::strcmp(name, "vkCmdWriteBufferMarker2AMD") == 0)
-        return reinterpret_cast<PFN_vkVoidFunction>(&ffx_noop_marker);
-    if (std::strcmp(name, "vkSetDebugUtilsObjectNameEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&ffx_noop_name);
-    if (std::strcmp(name, "vkCmdBeginDebugUtilsLabelEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&ffx_noop_label);
-    if (std::strcmp(name, "vkCmdEndDebugUtilsLabelEXT") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&ffx_noop_end);
-    NXLOG_W(kTag, "FidelityFX asked for %s: not on this device", name);
-    return nullptr;
-}
-
 class Ffx final : public TemporalBackend {
 public:
     const char* name() const override { return version_.empty() ? "FSR 3" : version_.c_str(); }
@@ -112,12 +86,6 @@ public:
             NXLOG_W(kTag, "no FidelityFX DLL: put amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll (FSR SDK v2.4.0, signedbin) in "
                           "upscalers\\fsr3 next to the executable, or name one in [upscale] fsr_dll");
             return false;
-        }
-        {   // the single-DLL FidelityFX API (SDK 1.1.x, amd_fidelityfx_vk.dll, as games ship it) reads only the older backend descriptor:
-            // handed the newer one first it calls through a null pointer instead of returning an error
-            std::wstring lower = path;
-            for (wchar_t& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
-            legacy_ = lower.size() >= 21 && lower.compare(lower.size() - 21, 21, L"amd_fidelityfx_vk.dll") == 0;
         }
         mod_ = LoadLibraryW(path.c_str());
         if (!mod_) {
@@ -186,7 +154,7 @@ private:
         be.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
         be.deviceContext.vkDevice = dev_->device();
         be.deviceContext.vkPhysicalDevice = dev_->physical();
-        be.deviceContext.vkDeviceProcAddr = ffx_device_proc;
+        be.deviceContext.vkDeviceProcAddr = vkGetDeviceProcAddr;
         ffxCreateContextDescUpscale cd = {};
         cd.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
         cd.header.pNext = &be.header;
@@ -194,13 +162,13 @@ private:
         cd.maxRenderSize = {render.width, render.height};
         cd.maxUpscaleSize = {out.width, out.height};
         cd.fpMessage = &on_message;
-        ffxReturnCode_t r = legacy_ ? FFX_API_RETURN_ERROR : create_(&ctx_, &cd.header, nullptr);
-        if (r != FFX_API_RETURN_OK) {   // the v1.1.x DLL knows only the older backend descriptor
+        ffxReturnCode_t r = create_(&ctx_, &cd.header, nullptr);
+        if (r != FFX_API_RETURN_OK) {   // the v1.1.4 DLL knows only the older backend descriptor
             ffxCreateBackendVKDesc_DEPRECATED old = {};
             old.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK_DEPRECATED;
             old.vkDevice = dev_->device();
             old.vkPhysicalDevice = dev_->physical();
-            old.vkDeviceProcAddr = ffx_device_proc;
+            old.vkDeviceProcAddr = vkGetDeviceProcAddr;
             cd.header.pNext = &old.header;
             ctx_ = nullptr;
             r = create_(&ctx_, &cd.header, nullptr);
@@ -229,7 +197,6 @@ private:
     VkExtent2D max_render_ = {}, max_out_ = {};
     std::string version_;
     bool failed_ = false;
-    bool legacy_ = false;
 };
 
 }  // namespace
