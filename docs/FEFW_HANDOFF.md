@@ -14,27 +14,24 @@ Commits: author EvokerTelos <lepatoh@gmail.com>, AI disclosure + Co-Authored-By 
 - Screen is mostly black: shader translation is the current work (stage 4).
 - On-demand translator built: `tools\shaders\build\bin\Release\net10.0\spirv_harness.exe` (fefw_shaders_setup.ps1;
   Ryubing at `refs\ryubing`, staged to `tools\shaders\third_party\ryubing`, patches in `tools\shaders\harness\translator\*.patch`).
-- Cache `work\shader_cache\spirv\results.tsv` after the first run: 638 blocks, 375 ok, 227 exception, 36 unsupported.
+- Cache `work\shader_cache\spirv\results.tsv`: 638 blocks, 602 ok, 36 unsupported, 0 exception (was 375 ok / 227 exception
+  before the c[24] fix). The menu frame and the save indicator draw.
 
 ## Dev loop
 `powershell -ExecutionPolicy Bypass -File fefw_test.ps1 [-Seconds 90] [-DumpShaders] [-Lift]`
 Logs: `nxrt.log` (repo root, runtime log incl. crash reports with guest/host stacks), `work\logs\run_err.txt`, `work\logs\build.txt`.
 Delete `work\shader_cache\spirv` to force re-translation after translator changes (or only the affected rows/.spv).
 
-## Task 1 (next): 227 fragment shaders throw in the translator
-`IndexOutOfRangeException @ Ryujinx.Graphics.Shader.Translation.ResourceManager.GetConstantBufferBinding(Int32 slot)`;
-`_cbSlotToBindingMap` has 18 entries (hardware c0..c17). All 227 are fragment stage. Example block: `740f64bad0b3435a`.
-Hypotheses: an LDC with a register-indexed or out-of-range cbuf slot on Ampere (NVN2), or an Ampere decode issue
-(see `ampere-uniform-registers.patch`, `tools\shaders\ampere\decoder`). Steps:
-1. `fefw_test.ps1 -Seconds 60 -DumpShaders` -> `work\shader_dump\{manifest.tsv,code_*.bin,ctrl_*.bin}`.
-2. `dotnet tools\shaders\build\bin\Release\net10.0\spirv_harness.dll work\shader_dump\code_<h>.bin work\shader_dump\ctrl_<h>.bin -o x.spv`
-   and find which instruction asks for which slot (add a guard/log in a new translator patch, never edit refs\ or third_party\ directly).
-3. Fix as a `.patch` + `<ShaderPatch>` entry in `tools\shaders\harness\translator\Ryujinx.Graphics.Shader.csproj`, rebuild
-   (`dotnet build tools\shaders\harness\SpirvHarness.csproj -c Release`), batch-check the dump
-   (`spirv_harness.dll --batch work\shader_dump --out work\shader_batch --jobs 8`), then clear the cache and rerun the game.
-4. Make sure the runtime binds whatever slot mapping the fix produces (`runtime/src/gfx/nvn/nvn_replay.cpp`, ubo[6][16]).
+## Done: c[24] (was task 1, 227 fragment shaders threw in GetConstantBufferBinding)
+They read constant bank 24 (`c[0x18]`), always a 3x3 matrix (std140 rows 0x0/0x10/0x20, a vec3 at 0x30 in a few) applied to the
+final colour: the NVN2 output colour transform the driver supplies; the game binds uniform indices 0..13 only (c3..c16).
+`nvn2-cbank24-color-transform.patch` gives bank 24 slot 17's binding under the name `<stage>_c24`; the runtime maps that name to
+`NvnSource::ColorTransform` and binds an identity matrix (`color_transform_buffer`, nvn_pipeline.cpp). For HDR, fill it with
+the gamut matrix. Workflow that worked: `sassdecode --dump code ctrl` (tools\shaders\ampere\decoder\tool) to read the SASS, then
+the harness on the single block, then `--batch` on the dump. When a patch replaces a whole file, also move it from the
+`<Compile Include="$(ShaderSrc)...">` Exclude list to a `$(PatchedDir)` Compile item in the csproj.
 
-## Task 2: 36 unsupported
+## Task 1 (next, was task 2): 36 unsupported
 Mostly `TEX.SCR.B` / `TXQ.B` bindless texture forms, plus `IMAD.WIDE.U32` carry out, `TEX.SCR.F16.RN`, `ATOMS.CAS`, `.UNKNOWN_f60`.
 
 ## Later
