@@ -206,6 +206,7 @@ namespace SpirvHarness
                     r.Error = $"{e.GetType().Name}: {e.Message}";
                     string frame = e.StackTrace?.Split('\n').FirstOrDefault(l => l.Contains("Ryujinx.Graphics.Shader"))?.Trim();
                     if (frame != null) r.Error += $" @ {Regex.Replace(frame, @" in (/|[A-Za-z]:\\).*", "")}";
+                    if (Environment.GetEnvironmentVariable("NX_HARNESS_STACK") == "1") Console.Error.WriteLine(e);   // whole stack on stderr
                 }
                 lock (gpu.Messages) r.Messages = gpu.Messages.Distinct().ToList();
                 r.Queries = string.Join(',', gpu.DrawTimeQueries);
@@ -280,6 +281,7 @@ namespace SpirvHarness
                     r.Error = $"{e.GetType().Name}: {e.Message}";
                     string frame = e.StackTrace?.Split('\n').FirstOrDefault(l => l.Contains("Ryujinx.Graphics.Shader"))?.Trim();
                     if (frame != null) r.Error += $" @ {Regex.Replace(frame, @" in (/|[A-Za-z]:\\).*", "")}";
+                    if (Environment.GetEnvironmentVariable("NX_HARNESS_STACK") == "1") Console.Error.WriteLine(e);   // whole stack on stderr
                 }
                 if (prog != null && prog.Unsupported.Count > 0)
                 {

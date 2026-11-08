@@ -1777,7 +1777,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
         static (Op rd2, Op rd, Op ra, Op rb, int bank, int handle, string dim, int mask) TexOperands(SassInst i) => TexOperands(i, out _, false);
 
         /// The same, optionally accepting the predicate destination after Rd (bit 81: the residency result of a sparse access).
-        static (Op rd2, Op rd, Op ra, Op rb, int bank, int handle, string dim, int mask) TexOperands(SassInst i, out Op pred, bool allowPred)
+        static (Op rd2, Op rd, Op ra, Op rb, int bank, int handle, string dim, int mask) TexOperands(SassInst i, out Op pred, bool allowPred, bool allowBindless = false)
         {
             IReadOnlyList<Op> o = i.Operands;
             int k = 0;
@@ -1797,7 +1797,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
             List<Op> rest = o.Skip(k).ToList();
             List<Op> imms = rest.Where(x => x.Kind == OperandKind.Imm).ToList();
             string dim = rest.FirstOrDefault(x => x.Kind == OperandKind.Other)?.Text;
-            if (imms.Count < 2) throw Unsup("bindless or unknown handle form");
+            if (Has(i, "B"))
+            {
+                // Bindless (.B): no bank/handle immediates, only the optional mask; the handle is a register parameter.
+                if (!allowBindless) throw Unsup("bindless form");
+                if (imms.Count > 1) throw Unsup("bindless handle form");
+                return (regs[0], regs[1], regs[2], regs.Count > 3 ? regs[3] : null, -1, -1, dim, imms.Count > 0 ? (int)imms[0].ImmBits & 0xf : 0xf);
+            }
+            if (imms.Count < 2) throw Unsup("unknown handle form");
             int mask = imms.Count > 2 ? (int)imms[2].ImmBits & 0xf : 0xf;
             return (regs[0], regs[1], regs[2], regs.Count > 3 ? regs[3] : null, (int)imms[0].ImmBits, (int)imms[1].ImmBits, dim, mask);
         }
@@ -1821,13 +1828,14 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
         static void EmitTexAmpere(EmitterContext ctx, SassInst i, bool fetch)
         {
-            (Op rd2, Op rd, Op ra, Op rb, int bank, int handle, string dim, int mask) = TexOperands(i);
+            (Op rd2, Op rd, Op ra, Op rb, int bank, int handle, string dim, int mask) = TexOperands(i, out _, false, allowBindless: true);
             if (rd.Reg >= 255 && rd2.Reg >= 255) return;
             foreach (string m in i.Mods)
             {
-                if (m is not ("SCR" or "LZ" or "LL" or "LB" or "DC" or "AOFFI" or "NODEP" or "MS" or "NDV" or "EF" or "EL" or "LU" or "EU" or "NA")) throw Unsup($"modifier {m}");
+                if (m is not ("SCR" or "B" or "LZ" or "LL" or "LB" or "DC" or "AOFFI" or "NODEP" or "MS" or "NDV" or "EF" or "EL" or "LU" or "EU" or "NA")) throw Unsup($"modifier {m}");
             }
             bool scr = Has(i, "SCR");
+            bool bindless = Has(i, "B");
             (SamplerType type, bool array) = DimOf(dim);
             bool lz = Has(i, "LZ"), ll = Has(i, "LL"), bias = Has(i, "LB"), dc = Has(i, "DC"), aoffi = Has(i, "AOFFI"), ms = Has(i, "MS");
             TextureFlags flags = fetch ? TextureFlags.IntCoords : TextureFlags.None;
@@ -1841,6 +1849,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 // Same split as Maxwell TEX/TLD: Ra = [array index, coords...], Rb = [lod|bias, offset, dc, ms sample].
                 if (array) raList.Add("arr");
                 for (int c = 0; c < coords; c++) raList.Add("c" + c);
+                if (bindless) rbList.Add("h");   // Maxwell TEX.B: the handle is Rb's first register (inferred for Ampere)
                 if (ll || bias) rbList.Add("lod");
                 if (aoffi) rbList.Add("off");
                 if (dc) rbList.Add("dc");
@@ -1853,9 +1862,13 @@ namespace Ryujinx.Graphics.Shader.Instructions
                 // Fetch from an array follows the same rule: TLD.SCR ARRAY_2D is Ra = [array index, x], Rb = [y]
                 // (0cd3176a: "MOV R34, 0x3; MOV R35, R27(x); TLD.SCR.LZ R35, R2, R34, R20(y), ARRAY_2D"; Rb+1 is never
                 // written before it). Reading x from Rb fetched texel (y, 0) for every pixel: one value per screen row.
+                // Bindless (.SCR.B): the handle follows the coordinates (FEFW: 2D "Ra = [x, y], Rb = [handle]"; 2D AOFFI
+                // "Rb = [handle, offsets]" with the handle register shared by the neighbouring taps; CUBE.LZ "Ra = [x, y],
+                // Rb = [z, handle]" where the same register is TXQ.B's handle, e8d64471 / 23b2a51d / 019668ba).
                 List<string> all = new();
                 if (array) all.Add("arr");
                 for (int c = 0; c < coords; c++) all.Add("c" + c);
+                if (bindless) all.Add("h");
                 if (dc) all.Add("dc");
                 if (ll || bias) all.Add("lod");
                 if (aoffi) all.Add("off");
@@ -1871,14 +1884,18 @@ namespace Ryujinx.Graphics.Shader.Instructions
             for (int k = 0; k < raN; k++) p[raList[k]] = ra.Reg >= 255 ? Const(0) : ctx.Copy(Gpr(ra.Reg + k));
             for (int k = 0; k < rbN; k++) p[rbList[k]] = rb.Reg >= 255 ? Const(0) : ctx.Copy(Gpr(rb.Reg + k));
 
-            // 1D fetch from a buffer texture (texelFetch on samplerBuffer).
+            // 1D fetch from a buffer texture (texelFetch on samplerBuffer). Bindless: the type is unknown, so a 1D fetch is
+            // taken as a buffer, as Ryujinx's Maxwell TLD.B does.
             if (fetch && type == SamplerType.Texture1D && !array && !ll && !aoffi && !ms &&
-                ctx.TranslatorContext.GpuAccessor.QuerySamplerType(handle, CbufSlotOf(ctx, bank)) == SamplerType.TextureBuffer)
+                (bindless || ctx.TranslatorContext.GpuAccessor.QuerySamplerType(handle, CbufSlotOf(ctx, bank)) == SamplerType.TextureBuffer))
             {
                 type = SamplerType.TextureBuffer;
             }
 
             List<IrOperand> sources = new();
+            // Bindless: the handle is the first source; Ryujinx's BindlessElimination / BindlessToArray turn it into a bound
+            // texture when it comes from a constant buffer, else they drop the sample (results 0) and log it.
+            if (bindless) { sources.Add(p["h"]); flags |= TextureFlags.Bindless; }
             for (int c = 0; c < coords; c++) sources.Add(p["c" + c]);
             bool is1DTo2D = false;
             if (Sample1DAs2D && (type & SamplerType.Mask) == SamplerType.Texture1D)
@@ -1904,7 +1921,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             if (ms) { sources.Add(p["ms"]); type |= SamplerType.Multisample; }
             if (Has(i, "NDV") && !fetch) { /* no derivatives across the quad: plain sample on the host */ }
 
-            SetBindingPair binding = ctx.ResourceManager.GetTextureOrImageBinding(Instruction.TextureSample, type, TextureFormat.Unknown, flags, CbufSlotOf(ctx, bank), handle);
+            SetBindingPair binding = bindless ? default : ctx.ResourceManager.GetTextureOrImageBinding(Instruction.TextureSample, type, TextureFormat.Unknown, flags, CbufSlotOf(ctx, bank), handle);
             ctx.TextureSample(type, flags, binding, mask, TexDests(rd, rd2, mask), sources.ToArray());
         }
 
@@ -2049,6 +2066,28 @@ namespace Ryujinx.Graphics.Shader.Instructions
         {
             // TXQ Rd2, Rd, Ra(lod), TEX_HEADER_DIMENSION, bank, handle, mask
             IReadOnlyList<Op> o = i.Operands;
+            if (Has(i, "B"))
+            {
+                // TXQ.B Rd2, Rd, Ra, TEX_HEADER_DIMENSION[, mask]: Ra = [handle, lod], as Maxwell TXQ.B (23b2a51d: "MOV R25, RZ;
+                // MOV R24, R114; TXQ.B RZ, R25, R24" with R114 the handle its TEX.B use). The type is unknown: 3D when the depth
+                // is asked for, else 2D (Ryujinx's Maxwell rule).
+                if (o.Count < 4 || o[3].Text != "TEX_HEADER_DIMENSION") throw Unsup(o.Count > 3 ? "TXQ.B " + o[3].Text : "TXQ.B form");
+                foreach (string m in i.Mods) if (m is not ("B" or "NODEP")) throw Unsup($"modifier {m}");
+                Op brd2 = o[0], brd = o[1], bra = o[2];
+                int bmask = o.Count > 4 && o[4].Kind == OperandKind.Imm ? (int)o[4].ImmBits & 0xf : 0xf;
+                if (brd.Reg >= 255 && brd2.Reg >= 255) return;
+                SamplerType btype = (bmask & 4) != 0 ? SamplerType.Texture3D : SamplerType.Texture2D;
+                IrOperand bhandle = bra.Reg >= 255 ? Const(0) : ctx.Copy(Gpr(bra.Reg));
+                IrOperand blod = bra.Reg >= 254 ? Const(0) : ctx.Copy(Gpr(bra.Reg + 1));
+                IrOperand[] bdests = TexDests(brd, brd2, bmask);
+                int bn = 0;
+                for (int c = 0; c < 4; c++)
+                {
+                    if ((bmask & (1 << c)) == 0) continue;
+                    ctx.Copy(bdests[bn++], ctx.TextureQuerySize(btype, TextureFlags.Bindless, default, c, [bhandle, blod]));
+                }
+                return;
+            }
             if (o.Count < 6 || o[3].Text != "TEX_HEADER_DIMENSION") throw Unsup(o.Count > 3 ? o[3].Text : "form");
             Op rd2 = o[0], rd = o[1], ra = o[2];
             int bank = (int)o[4].ImmBits, handle = (int)o[5].ImmBits, mask = o.Count > 6 ? (int)o[6].ImmBits & 0xf : 0xf;

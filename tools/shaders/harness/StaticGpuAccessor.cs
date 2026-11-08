@@ -199,7 +199,14 @@ namespace SpirvHarness
         // Sizes of bindless arrays: pool sizes are draw-time state; a fixed bound makes the SPIR-V valid.
         public int QuerySamplerArrayLengthFromPool() { DrawTimeQueries.Add("poolSize"); return 4096; }
         public int QueryTextureArrayLengthFromPool() { DrawTimeQueries.Add("poolSize"); return 4096; }
-        public int QueryTextureArrayLengthFromBuffer(int slot) { DrawTimeQueries.Add("cbufSize"); return 32; }
+        // Arrays of handles in a uniform block (BindlessToArray): Ryujinx indexes them from the start of the buffer, 8 bytes per
+        // handle, so the length must reach the table's offset too (FEFW's light-probe cubemaps: c[6] + 0x340 + 8i, index 0x68 + i).
+        // 256 covers handles in the first 2 KiB; the runtime writes every element (dummy texture where the word is no handle).
+        public int QueryTextureArrayLengthFromBuffer(int slot) { DrawTimeQueries.Add("cbufSize"); return 256; }
+
+        // Bindless handles that come from memory (LDG/storage) would need the whole texture and sampler pools as descriptor arrays
+        // (Ryujinx GenerateBindlessAccess); the runtime has no pool arrays, so BindlessElimination drops those samples (result 0, logged).
+        public bool QueryHostSupportsSeparateSampler() => false;
 
         // Default graphics state: triangles, no alpha test (emulated in the shader on Vulkan), every vertex attribute
         // and render target float, origin upper left (what Ryujinx passes on Vulkan). All of it is draw-time state.
