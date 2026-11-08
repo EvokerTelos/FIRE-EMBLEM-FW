@@ -789,6 +789,26 @@ VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout) {
     return pipe;
 }
 
+// The shader preparation (gpl_prepare, compute records of programs.bin): the compute pipeline is built once into the pipeline cache and
+// destroyed, so the game's first dispatch of this shader finds the driver's compiled code. Thread-safe (VkPipelineCache is internally
+// synchronised; the module map has its own lock); nothing is kept in g_compute.
+bool prebuild_compute(const ShaderInfo* cs, const ProgLayout& layout) {
+    ensure_cache();
+    VkShaderModule m = shader_module(cs);
+    if (!m || !layout.layout) return false;
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, ubo_robustness()};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, ubo_robustness()};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = m;
+    ci.stage.pName = "main";
+    ci.layout = layout.layout;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(vkdev(), g_cache, 1, &ci, nullptr, &pipe) != VK_SUCCESS) return false;
+    vkDestroyPipeline(vkdev(), pipe, nullptr);
+    g_cache_dirty.store(true, std::memory_order_relaxed);
+    return true;
+}
+
 VkBuffer constant_data_buffer(const ShaderInfo* s, VkDeviceSize* range) {
     auto it = g_const_bufs.find(s);
     if (it == g_const_bufs.end()) {

@@ -1,7 +1,7 @@
 """programs_bin.py <programs.tsv> <programs.bin>: the program list the shader preparation reads (fefw.exe --prepare-shaders).
 
 programs.tsv is extract_corpus.py's list of BNSH programs ("vs=<h16> ps=<h16> [gs=<h16>]", the hashes the runtime's shader cache uses);
-compute-only programs are left out (they have no graphics pipeline parts). Output: "MPRPRG01", u32 count, 4 bytes zero, then count records of
+compute programs ("cs=<h16>") become {cs, 0, 0}: the preparation builds their whole pipeline into the cache. Output: "MPRPRG01", u32 count, 4 bytes zero, then count records of
 three u64 (vertex, fragment, geometry; 0 when the stage is absent), distinct programs in first-seen order."""
 import struct
 import sys
@@ -16,9 +16,12 @@ def main(src, dst):
             if len(parts) < 4:
                 continue
             st = dict(s.split('=', 1) for s in parts[3].split() if '=' in s)
-            if 'vs' not in st or 'ps' not in st:
+            if 'cs' in st:
+                key = (int(st['cs'], 16), 0, 0)
+            elif 'vs' in st and 'ps' in st:
+                key = (int(st['vs'], 16), int(st['ps'], 16), int(st.get('gs', '0'), 16))
+            else:
                 continue
-            key = (int(st['vs'], 16), int(st['ps'], 16), int(st.get('gs', '0'), 16))
             if key not in seen:
                 seen.add(key)
                 out.append(key)

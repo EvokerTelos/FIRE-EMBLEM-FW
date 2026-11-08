@@ -130,6 +130,7 @@ struct PrewarmStats {
 };
 PrewarmStats prewarm_stats();
 VkPipeline compute_pipeline(const ShaderInfo* cs, const ProgLayout& layout);
+bool prebuild_compute(const ShaderInfo* cs, const ProgLayout& layout);   // shader preparation: into the pipeline cache only
 VkShaderModule shader_module(const ShaderInfo* s);
 // A content id of a shader module (hash of the words it was made from): two modules made from the same words have the same id, so the shader
 // parts built for the stand-in shaders of the key file are found again by the game's own. Any thread.

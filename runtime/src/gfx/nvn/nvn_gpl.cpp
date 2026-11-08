@@ -117,7 +117,9 @@ int g_fail_streak = 0;
 int g_running = 0;                         // jobs being built by the workers right now
 
 // Tells the overlay how much shader work is waiting (queued + running). Caller holds g_mu.
-void publish_backlog_locked() { nxrt::gfx::set_shader_backlog(static_cast<int>(g_exact_q.size() + g_hot_q.size() + g_pre_q.size() + g_cold_q.size() + g_up_q.size()) + g_running + g_up_running); }
+// The replacements of linked pipelines (g_up_q, gpl_upgrade) are left out: the draw already has a pipeline, nothing waits for them, and
+// counting them showed "Preparing shaders" after every new attack although the frame did not stop.
+void publish_backlog_locked() { nxrt::gfx::set_shader_backlog(static_cast<int>(g_exact_q.size() + g_hot_q.size() + g_pre_q.size() + g_cold_q.size()) + g_running); }
 
 thread_local const GraphicsKey* t_link_key = nullptr;      // the draw being linked on this thread, for the log line of a slow part
 
@@ -1104,6 +1106,22 @@ bool gpl_prepare(const PrepareOptions& o, PrepareResult* res) {
                 const size_t i = next.fetch_add(1);
                 if (i >= end) break;
                 const ProgHashes& ph = progs[i];
+                if (ph.fs == 0 && ph.gs == 0) {   // a compute program (programs_bin.py writes {cs, 0, 0}): the whole pipeline, into the cache
+                    const ShaderInfo* cs = shader_cache().load_stub(hex16(ph.vs));
+                    if (!cs) {
+                        missing.fetch_add(1);
+                    } else {
+                        mine.push_back(cs);
+                        const ShaderInfo* st6[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, cs};
+                        const ProgLayout* pl = prog_layout(st6);
+                        const bool ok = pl && prebuild_compute(cs, *pl);
+                        parts.fetch_add(1);
+                        if (ok) prepared.fetch_add(1); else failed.fetch_add(1);
+                    }
+                    done.fetch_add(1);
+                    report();
+                    continue;
+                }
                 const ShaderInfo* vs = shader_cache().load_stub(hex16(ph.vs));
                 const ShaderInfo* fs = shader_cache().load_stub(hex16(ph.fs));
                 const ShaderInfo* gs = ph.gs ? shader_cache().load_stub(hex16(ph.gs)) : nullptr;
