@@ -281,7 +281,7 @@ class Env:
 
 
 # ---------------------------------------------------------------------------------------------------- one function
-TAILS = ('return;', 'goto', '{ jt', '{ f_', '{ h_', '{ call_indirect', 'switch (', '{ nx_')
+TAILS = ('return;', 'goto', '{ jt', '{ f_', '{ h_', '{ call_indirect', 'switch (', '{ nx_', '{ if (c->x[30] == nx_lr0)')
 
 
 def lift_function(env, entry):
@@ -331,6 +331,8 @@ def lift_function(env, entry):
         out.append('  if (nx_hook_entry(c, 0x%xULL)) return;' % entry)
     if fn.has_br_fallback:
         out.append('  uint64_t jt = 0;')
+    if fn.has_br_x30:
+        out.append('  const uint64_t nx_lr0 = c->x[30];')   # entry return address, for `br x30` (a64.py)
     if pads:
         out.append('  if (rp) switch (rp) {')
         out.extend('  case 0x%xULL: goto L_%x;' % (lp, lp) for lp in pads)

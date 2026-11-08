@@ -110,6 +110,7 @@ class Fn:
     def __init__(self, entry, end, env):
         self.entry, self.end, self.env = entry, end, env
         self.has_br_fallback = False     # an unresolved `br`: the function ends in a dispatch over all its instructions
+        self.has_br_x30 = False          # a `br x30`: the function keeps its entry x30 (nx_lr0) to tell a return from a tail call
         self.targets = set()             # addresses inside the function that a goto needs a label for
 
     def jump(self, target):
@@ -216,6 +217,13 @@ class Fn:
                 if tg:                                   # a resolved jump table: a switch over exactly its targets
                     return 'switch (%s) { %s default: call_indirect(c, %s); return; }' % (
                         X(rn), ' '.join('case 0x%xULL: %s' % (t, self.jump(t)) for t in tg), X(rn))
+                if rn == 30:
+                    # `br x30` with x30 still the return address the function was entered with is a return (hand-written
+                    # assembly in FEFW main, e.g. 0x7100263e64, returns this way: as a tail call it trapped "indirect call to an
+                    # address that is not a known function"). Any other x30 (longjmp's restored one, a function pointer) keeps the
+                    # indirect call.
+                    self.has_br_x30 = True
+                    return '{ if (c->x[30] == nx_lr0) return; call_indirect(c, c->x[30]); return; }'
                 if pc in self.env.tailbr:                # an indirect tail call (vtable / function pointer): no dispatch
                     return '{ call_indirect(c, %s); return; }' % X(rn)
                 self.has_br_fallback = True
@@ -540,6 +548,10 @@ class Fn:
                         return SET(rd, sf, '(%s)%s >> %s' % ('int64_t' if sf else 'int32_t', a, amt))
                     return SET(rd, sf, 'ror%d(%s, %s)' % (size, a, amt))
                 raise Unimpl('dp2')
+            if bits(w, 20, 16) != 0:
+                # opcode2 != 0 is not RBIT/REV/CLZ: 1 = pointer authentication (PACIB x30, sp = 0xdac107fe at the top of the SDK 22
+                # setjmp, which traps when the check after it sees x30 = 0). Tier 2 lifts those (tier2/x_pac.py).
+                raise Unimpl('dp1 opcode2 %d' % bits(w, 20, 16))
             a = R(rn, sf)
             if opcode == 0:
                 return SET(rd, sf, 'rbit%d(%s)' % (size, a))
