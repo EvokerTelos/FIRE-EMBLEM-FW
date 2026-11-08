@@ -303,6 +303,7 @@ void nvnQueuePresentTexture(NVNqueue* queue, NVNwindow* window, int index) {
         NXLOG_W(kTag, "nvnQueuePresentTexture: index %d is not one of the %zu window textures; not presented", index, w->textures.size());
         return;
     }
+    if (const game::Info* g = game::current(); g && g->on_present) g->on_present();
     be::gpu::present(w, index);
 }
 
@@ -465,6 +466,8 @@ void nvnWindowSetPresentInterval(NVNwindow* window, int interval) {
     be::Window* w = be::host_of<be::Window>(window);
     if (!w) return;
     std::lock_guard<std::mutex> lk(w->lock);
+    if (w->present_interval != interval)
+        NXLOG_I(kTag, "nvnWindowSetPresentInterval: %d -> %d (the host paces by [display] fps_limit, not by this)", w->present_interval, interval);
     w->present_interval = interval;
 }
 

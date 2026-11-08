@@ -69,6 +69,9 @@ struct Info {
     const play::PromptGame* prompts = nullptr;
     const PollSleep* poll_sleeps = nullptr;
     uint32_t poll_sleep_count = 0;
+    // Called on the game's thread at every nvnQueuePresentTexture, before the present: a place for per-frame pokes of guest state (the
+    // game's frame-rate target, render scale) for games without play-mode hooks. Null: nothing.
+    void (*on_present)() = nullptr;
 };
 
 // The registered game, or nullptr. One slot per program (the function-local static is shared by every translation unit that inlines it).
