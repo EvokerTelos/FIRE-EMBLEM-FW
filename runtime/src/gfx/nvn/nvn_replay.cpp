@@ -674,8 +674,9 @@ uint32_t read_handle_word(int stage, int bank, int word) {
     return v;
 }
 
+TexResolved resolve_texture_handle(uint64_t handle);
+
 TexResolved resolve_texture(const BindingDesc& d) {
-    TexResolved r;
     const DescriptorBinding& b = d.shader->refl.bindings[d.index];
     uint64_t handle = 0;
     if (b.nvn.source == NvnSource::SamplerBinding) {
@@ -684,6 +685,19 @@ TexResolved resolve_texture(const BindingDesc& d) {
     } else if (b.nvn.source == NvnSource::HandleInUniform) {
         handle = read_handle_word(d.nvn_stage, b.nvn.bank, b.nvn.word);
     }
+    return resolve_texture_handle(handle);
+}
+
+// Element k of a texture array whose handles sit in a uniform block (Ryujinx BindlessToArray: a bindless TEX whose handle is
+// LDC c[bank][index]): the 64-bit NVN handles are 8 bytes apart from the binding's word, so element k is word + 2k.
+TexResolved resolve_texture_element(const BindingDesc& d, uint32_t k) {
+    const DescriptorBinding& b = d.shader->refl.bindings[d.index];
+    if (b.nvn.source != NvnSource::HandleInUniform) return k == 0 ? resolve_texture(d) : TexResolved{};
+    return resolve_texture_handle(read_handle_word(d.nvn_stage, b.nvn.bank, b.nvn.word + 2 * static_cast<int>(k)));
+}
+
+TexResolved resolve_texture_handle(uint64_t handle) {
+    TexResolved r;
     const uint32_t tid = handle_texture_id(handle), sid = handle_sampler_id(handle);
     if (S.tpool && static_cast<int>(tid) < S.tpool->count) {
         std::shared_lock<std::shared_mutex> lk(S.tpool->lock);
@@ -972,14 +986,17 @@ void prepare_textures(const ProgLayout& pl) {
         if (d.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
         const DescriptorBinding& b = d.shader->refl.bindings[d.index];
         if (b.nvn.source != NvnSource::SamplerBinding && b.nvn.source != NvnSource::HandleInUniform) continue;
-        TexResolved r = resolve_texture(d);
-        if (!r.tex) continue;
-        if (!tex_gpu(r.tex)) continue;
-        // owned by the pass; a compute dispatch runs outside every pass, so the graphics attachments do not own what it samples
-        if (shares_image(r.tex, S.depth_tex.get()) || (d.nvn_stage != kCompute && is_color_feedback(r.tex))) continue;
-        if (r.tex->cpu_dirty.load() || tex_layout(r.tex) != tex_sampled_layout(r.tex)) {
-            need.push_back(r.tex);
-            if (r.tex->cpu_dirty.load() && ft::on()) ft::mark(b.nvn.source == NvnSource::SamplerBinding ? "tx.dirty_bind" : "tx.dirty_uniform", r.tex->id);
+        const uint32_t elems = b.count > 1 ? b.count : 1;   // texture arrays: every element (resolve_texture_element)
+        for (uint32_t elem = 0; elem < elems; ++elem) {
+            TexResolved r = elems > 1 ? resolve_texture_element(d, elem) : resolve_texture(d);
+            if (!r.tex) continue;
+            if (!tex_gpu(r.tex)) continue;
+            // owned by the pass; a compute dispatch runs outside every pass, so the graphics attachments do not own what it samples
+            if (shares_image(r.tex, S.depth_tex.get()) || (d.nvn_stage != kCompute && is_color_feedback(r.tex))) continue;
+            if (r.tex->cpu_dirty.load() || tex_layout(r.tex) != tex_sampled_layout(r.tex)) {
+                need.push_back(r.tex);
+                if (r.tex->cpu_dirty.load() && ft::on()) ft::mark(b.nvn.source == NvnSource::SamplerBinding ? "tx.dirty_bind" : "tx.dirty_uniform", r.tex->id);
+            }
         }
     }
     if (need.empty() && need_storage.empty()) return;
@@ -1417,7 +1434,9 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
     std::vector<VkBufferView> tinfo;
     const size_t nb = pl.bindings.size();
     binfo.reserve(nb);
-    iinfo.reserve(nb);
+    size_t nimg = 0;   // texture arrays take one image info per element: reserve them all, the writes keep pointers into the vector
+    for (const BindingDesc& d : pl.bindings) nimg += std::max<uint32_t>(1, d.shader->refl.bindings[d.index].count);
+    iinfo.reserve(nimg);
     tinfo.reserve(nb);
     uint64_t key = 1469598103934665603ull + set;
     auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ull; };
@@ -1542,8 +1561,14 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
             w.pBufferInfo = &binfo.back();
             mix(reinterpret_cast<uint64_t>(bi.buffer)); mix(bi.offset); mix(bi.range);
         } else if (d.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+          // An array (b.count > 1) gets every element written; elements whose handle resolves to nothing get the dummy texture.
+          const uint32_t elems = b.count > 1 ? b.count : 1;
+          const size_t first_ii = iinfo.size();
+          for (uint32_t elem = 0; elem < elems; ++elem) {
             VkDescriptorImageInfo ii = {dummy_sampler(), dummy_view(view_type_for(b), b.image.depth), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            TexResolved r = resolve_texture(d);
+            TexResolved r = elems > 1 ? resolve_texture_element(d, elem) : resolve_texture(d);
+            // array elements are not seen by samples_depth_target / feedback_prepare: the depth target gets the dummy there
+            if (elems > 1 && r.tex && shares_image(r.tex, S.depth_tex.get())) r.tex = nullptr;
             if (r.tex) {
                 const auto fb = g_fb_use.find(r.tex);
                 if (fb != g_fb_use.end()) r.tex = fb->second;      // a feedback draw samples the copy made before it
@@ -1594,10 +1619,12 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
                 }
             }
             iinfo.push_back(ii);
-            w.pImageInfo = &iinfo.back();
             mix(reinterpret_cast<uint64_t>(ii.imageView));
             mix(reinterpret_cast<uint64_t>(ii.sampler));
             mix(static_cast<uint64_t>(ii.imageLayout));
+          }
+          w.descriptorCount = elems;
+          w.pImageInfo = &iinfo[first_ii];
         } else if (d.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
             const VkFormat shader_fmt = image_format_vk(b.image.format);
             VkDescriptorImageInfo ii = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL};
