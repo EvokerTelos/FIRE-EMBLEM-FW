@@ -683,6 +683,7 @@ struct AppletState {
     ServiceEvent state_event{false};                       // signalled once the applet has ended
     ServiceEvent out_event{false};                         // signalled while out_data is not empty
     ServiceEvent interactive_out_event{false};             // signalled while interactive_out is not empty
+    ServiceEvent cmd170_event{true};                       // SDK 22 accessor cmd 170's event: signalled from the start (see there)
     bool utf8 = false;                                     // software keyboard: the config's use_utf8
     bool text_check = false;                               // software keyboard: the config's use_text_check
     std::u16string text;                                   // software keyboard: the text answered
@@ -1019,6 +1020,14 @@ ServicePtr make_library_applet_accessor(uint32_t full_id, uint32_t mode) {
         s.add_cmd(150, "RequestForAppletToGetForeground", ignored("RequestForAppletToGetForeground"));
         // Switch 2: one input bool, no output (sdk proxy at 0x75001bd560). Name and meaning unknown; accepted.
         s.add_cmd(90, "Cmd90", ignored("ILibraryAppletAccessor Cmd90"));
+        // SDK 22: no input, sent by nn::applet::CreateLibraryAppletHandleOnUnwinding right after CreateLibraryApplet(Ex); an error
+        // aborts the caller (FEFW's name entry, swkbd ShowKeyboard). It hands out an event: answered with nothing, the handle the SDK
+        // keeps is invalid and nn::applet::StartLibraryApplet's os::WaitAny aborts with InvalidHandle (0xe401). Meaning unknown;
+        // the event is signalled from the start so that wait never holds the applet back.
+        s.add_cmd(170, "Cmd170", [a](Request&, Response& rsp) -> uint32_t {
+            rsp.out_copy.push_back(a->cmd170_event.new_handle());
+            return 0;
+        });
     });
 }
 
