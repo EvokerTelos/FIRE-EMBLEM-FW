@@ -3185,7 +3185,11 @@ void do_copy_texture_texture(const P_CopyTexTex& p) {
     const VkImageAspectFlags sa = tex_aspect(s), da = tex_aspect(d);
     const bool same_size = sr.w == dr.w && sr.h == dr.h && sr.d == dr.d;
     const bool same_fmt = tex_vk_format(s) == tex_vk_format(d);
-    if (same_size && same_fmt) {
+    // NVN_COPY_FLAGS_MIRROR_{X,Y,Z}_BIT: the copy mirrors the region on that axis (Fortune's Weave copies the custom avatar's portrait with
+    // MIRROR_Y; without it the portrait and the map icon are upside down). vkCmdBlitImage mirrors when a destination offset pair is reversed.
+    const uint32_t mirror = p.flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT);
+    if (mirror) log_once("copy-mirror", "CopyTextureToTexture with mirror flags: done as a mirrored blit");
+    if (same_size && same_fmt && !mirror) {
         VkImageCopy c = {};
         c.srcSubresource = {sa, ss.level, ss.layer, 1};
         c.dstSubresource = {da, ds.level, ds.layer, 1};
@@ -3202,6 +3206,9 @@ void do_copy_texture_texture(const P_CopyTexTex& p) {
         b.srcOffsets[1] = {sr.x + sr.w, sr.y + sr.h, sr.z + std::max(1, sr.d)};
         b.dstOffsets[0] = {dr.x, dr.y, dr.z};
         b.dstOffsets[1] = {dr.x + dr.w, dr.y + dr.h, dr.z + std::max(1, dr.d)};
+        if (mirror & NVN_COPY_FLAGS_MIRROR_X_BIT) std::swap(b.dstOffsets[0].x, b.dstOffsets[1].x);
+        if (mirror & NVN_COPY_FLAGS_MIRROR_Y_BIT) std::swap(b.dstOffsets[0].y, b.dstOffsets[1].y);
+        if ((mirror & NVN_COPY_FLAGS_MIRROR_Z_BIT) && d->b.target == NVN_TEXTURE_TARGET_3D) std::swap(b.dstOffsets[0].z, b.dstOffsets[1].z);
         const bool linear = (p.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) || (tex_scale(s) != tex_scale(d) && !tex_is_depth(s) && !tex_is_depth(d));
         vkCmdBlitImage(F->cb, tex_image(s), sl, tex_image(d), dl, 1, &b, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }

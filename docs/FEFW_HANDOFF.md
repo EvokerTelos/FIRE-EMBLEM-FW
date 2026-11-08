@@ -95,8 +95,9 @@ extents at 0x90/0x98 relative to .rodata, segments LZ4).
 
 ## Next for "4K 60 fps, max quality"
 - Perf headroom at 4K (above). DLSS: the TaskDLSS path is now a same-size copy; FSR/TAA-style AA would be the quality step.
-- Remaining visual issues: some falling-leaf particles are black (layer t500, fs 67a08fc6 / c2bc1273 / b1918ad5); the unit portrait
-  ("T", the custom avatar) may be drawn upside down (user report; not confirmed: the map icon shows the same orientation).
+- Remaining visual issues: some falling-leaf particles are black (layer t500, fs 67a08fc6 / c2bc1273 / b1918ad5).
+- Fixed: the custom avatar's portrait and map icon were upside down: the game fills them with CopyTextureToTexture and
+  NVN_COPY_FLAGS_MIRROR_Y_BIT, which the runtime ignored (now a mirrored blit, nvn_replay.cpp do_copy_texture_texture).
 - AV1 movies: decode (dav1d or Media Foundation, the AV1 extension is installed) and feed nvnNativeImage textures; until then
   `NXRT_MEDIA_MOVIE_SKIP=1` and PLUS skips the scenes waiting for them.
 
