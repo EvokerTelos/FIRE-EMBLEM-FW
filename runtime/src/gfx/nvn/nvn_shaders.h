@@ -67,6 +67,7 @@ struct ShaderControl {
     // NVN2 compute only: the slot counts of the program's c[0] resource table (bytes +0xb1 uniform blocks, +0xb2 storage
     // buffers, +0xb3 textures, +0xb6 images). See apply_nvn2_compute_table.
     uint8_t c0_ubos = 0, c0_ssbos = 0, c0_textures = 0, c0_images = 0;
+    uint16_t c0_table_size = 0;   // u16 +0xba: the table's size, header included (the header is 0x10 or 0x80 bytes)
 };
 
 ShaderControl read_control(const uint8_t* control);

@@ -58,6 +58,20 @@ Fixed on the way: PAC register forms and `br x30` returns in the lifter (setjmp 
 names, ILibraryAppletAccessor cmd 170. Symbolize sdk addresses with the .dynsym of game\dump\exefs\sdk (NSO header: dynstr/dynsym
 extents at 0x90/0x98 relative to .rodata, segments LZ4).
 
+## Overexposed 3D (battle map white, characters cyan): where it stands (paused 2026-11-07)
+Gameplay is reached now (tutorial battle map). Frame trace (`NXRT_NVN_TRACE_SEC=165`, PNGs + stats of every target): the G-buffer
+albedo (t439) and normals are right; the lit HDR scene has mean ~15 (max ~50) and the tonemap (fs aa98bfc2 -> t504) saturates it.
+Cause: auto-exposure. Compute 98acab99 reads a luminance histogram from the storage buffer at c[0]+0x90, takes the 10..90 % percentile
+mean and writes the exposure image t54 (R16F 3x1, log2 values) that the lighting reads; 4393e0d5 and 09b66614 also use that buffer.
+- Those NVN2 compute blocks have a 0x80-byte c[0] table header (not 0x10): table size u16 +0xba = header + slots. The runtime fix is
+  in apply_nvn2_compute_table but gated by env NXRT_TEST_C0HDR=1: with it the buffers bind, t54 goes to about -13.6 (its lower
+  clamp, i.e. "the scene is dark") and the lighting saturates at 65000. Next: find who writes the histogram (buffer 7a4cf14600, 1 KiB,
+  all zero in the trace; probably a per-pixel luminance pass earlier in the frame) and why it stays empty; check SULD/SUST formats on
+  t54 (the shader reads its previous value back).
+- Fixed: square 2D images of 6n layers are created cube-compatible (texture 138, RG8 cube, was the dummy for ~20 lighting shaders).
+- The crash report now prints the page state and write-watch bits; a write-watch race (guard vs release on overlapping regions) is
+  fixed (the intermittent 265 s / boot crash).
+
 ## Task 1 (next): bindless samples that read 0
 51 blocks (the material shaders with TXQ.B, and 1e1e3f3b) have bindless samples Ryujinx cannot resolve, so they read 0
 (translator message "Failed to find handle source for bindless access"): (a) the handle is the constant 0 (`MOV Rb, RZ` before

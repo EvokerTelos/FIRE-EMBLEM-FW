@@ -251,6 +251,7 @@ struct Shape {
     VkExtent3D base = {1, 1, 1};
     uint32_t levels = 1, layers = 1;
     bool cube = false;
+    bool cube_compat = false;                  // created CUBE_COMPATIBLE: cube targets and every square 2D image of 6n layers
     uint32_t samples = 1;                      // multisampled render target / resolve source
 };
 
@@ -270,6 +271,10 @@ Shape shape_of(const Texture& t) {
         s.samples = static_cast<uint32_t>(vk_sample_count(b.samples));
         s.levels = 1;
     }
+    // A cube sampler can meet an image made for another object over the same storage (a 2D array of 6 layers: S4f shares one image per
+    // piece of memory): such an image must be cube-compatible too, or the cube view fails and the binding gets the dummy (FEFW: texture
+    // 138, RG8 16x16x6, sampled as a cube by ~20 lighting shaders). Vulkan allows the flag on any square 2D image with 6n layers.
+    s.cube_compat = s.cube || (s.type == VK_IMAGE_TYPE_2D && s.samples == 1 && s.layers >= 6 && s.layers % 6 == 0 && s.base.width == s.base.height);
     return s;
 }
 
@@ -297,7 +302,7 @@ gfx::ImageDesc make_desc(const Shape& s, VkFormat fmt, VkImageUsageFlags usage, 
 
 VkImageCreateFlags base_flags(const Shape& s, VkFormat fmt) {
     VkImageCreateFlags f = 0;
-    if (s.cube) f |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    if (s.cube_compat) f |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (s.type == VK_IMAGE_TYPE_3D) f |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;   // 2D views of the slices
     if (srgb_partner(fmt) != VK_FORMAT_UNDEFINED || bit_alias_class(fmt)) f |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     return f;
@@ -513,7 +518,7 @@ TexGpu* create_texture_gpu(Texture* t, float want_scale) {
     g->base = s.base;
     g->levels = s.levels;
     g->layers = s.layers;
-    g->cube = s.cube;
+    g->cube = s.cube_compat;
     auto fail = [&](const std::string& why) -> TexGpu* {
         NXLOG_E(kTag, "texture %u: no image (%s): the texture is not usable on the GPU", t->id, why.c_str());
         g->failed = true;

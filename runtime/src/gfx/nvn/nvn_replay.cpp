@@ -1555,6 +1555,9 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set) {
                 }
                 default:
                     note_unsupported("shader buffer binding of an unknown NVN source");
+                    if (first_time_key("unknown-src " + d.shader->hash + " " + b.name))
+                        NXLOG_W(kTag, "buffer binding with no NVN meaning (source %d, bank %d, c0 offset %d): shader %s binding %s (set %u binding %u) gets a dummy buffer",
+                                static_cast<int>(b.nvn.source), b.nvn.bank, b.nvn.c0_offset, d.shader->hash.c_str(), b.name.c_str(), d.set, d.binding);
                     break;
             }
             binfo.push_back(bi);

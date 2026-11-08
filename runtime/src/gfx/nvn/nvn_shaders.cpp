@@ -181,6 +181,7 @@ ShaderControl read_control(const uint8_t* control) {
             c.c0_ssbos = control[0xb2];
             c.c0_textures = control[0xb3];
             c.c0_images = control[0xb6];
+            c.c0_table_size = *reinterpret_cast<const uint16_t*>(control + 0xba);
         }
         return c;
     }
@@ -811,7 +812,15 @@ namespace {
 // and 0034791c (2 ubos, 30 textures from 0x30 by GLSLC binding, image at 0x120).
 void apply_nvn2_compute_table(ShaderReflection& refl, const ShaderControl& c) {
     if (!c.nvn2 || c.stage != 5) return;
-    const int ub0 = 0x10, sb0 = ub0 + 0x10 * c.c0_ubos, tex0 = sb0 + 0x10 * c.c0_ssbos;
+    // The header is 0x10 bytes in every Pokopia block but 0x80 in some Fortune's Weave ones (09b66614: 1 ubo, 1 ssbo, 1 image, table
+    // 0xa8, storage buffer read at 0x90, image at 0xa0; 98acab99: 3 textures, table 0xc0): the slots end where the table ends, so the
+    // header is the size less the slots. A size smaller than the slots (or 0) keeps 0x10.
+    const int slots = 0x10 * (c.c0_ubos + c.c0_ssbos) + 8 * (c.c0_textures + c.c0_images);
+    // NOT on by default yet (env NXRT_TEST_C0HDR=1): with it the auto-exposure compute (98acab99, histogram in the storage buffer at
+    // 0x90) gets its buffers and drives the exposure image (t54, R16F 3x1) to its lower clamp (-13.6), and the lighting saturates at the
+    // fp16 maximum; without it the buffers are dummies and the scene stays overexposed (mean ~15). See docs/FEFW_HANDOFF.md.
+    const int ub0 = (std::getenv("NXRT_TEST_C0HDR") && c.c0_table_size >= slots + 0x10) ? c.c0_table_size - slots : 0x10;
+    const int sb0 = ub0 + 0x10 * c.c0_ubos, tex0 = sb0 + 0x10 * c.c0_ssbos;
     const int img0 = tex0 + 8 * c.c0_textures, end = img0 + 8 * c.c0_images;
     for (DescriptorBinding& b : refl.bindings) {
         NvnMeaning& m = b.nvn;
